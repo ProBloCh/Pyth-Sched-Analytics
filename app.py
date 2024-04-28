@@ -113,7 +113,7 @@ def dependency_clustering(nodes_df, G):
     # Clustering with the optimal number of clusters found
     best_clustering = AgglomerativeClustering(n_clusters=best_n_clusters, linkage='complete', metric='precomputed')
     nodes_df['DependencyCluster'] = best_clustering.fit_predict(distance_matrix)
-    print(f"Using {best_n_clusters} clusters based on the best silhouette score.")
+    #print(f"Using {best_n_clusters} clusters based on the best silhouette score.")
 
     return nodes_df
 
