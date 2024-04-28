@@ -7,11 +7,115 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import AgglomerativeClustering
 import networkx as nx
+from sklearn.metrics import silhouette_score
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes and origins
+
+def detect_repeating_patterns(nodes_df):
+    if 'TaskType' not in nodes_df.columns:
+        print("No 'TaskType' column found in nodes data. Skipping pattern detection.")
+        return []
+
+    # Advanced pattern detection: considering multiple attributes
+    nodes_df['pattern_id'] = pd.factorize(nodes_df['TaskType'] + '_' +
+                                          nodes_df['Duration'].astype(str) + '_' +
+                                          nodes_df['Resources'].astype(str))[0]
+    pattern_records = [group_df for _, group_df in nodes_df.groupby('pattern_id') if len(group_df) > 1]
+    return pattern_records
+
+
+def create_templates_from_patterns(pattern_records):
+    templates = {}
+    for index, pattern_df in enumerate(pattern_records):
+        # Creating a template with detailed statistics
+        template = {
+            'average_duration': pattern_df['Duration'].mean(),
+            'duration_variance': pattern_df['Duration'].var(),
+            'most_common_resources': pattern_df['Resources'].mode().tolist(),
+            'dependency_links': pattern_df['Dependencies'].mode().tolist(),
+            'task_frequency': len(pattern_df)
+        }
+        templates[f"Template_{index}"] = template
+    return templates
+
+def calculate_critical_path(G):
+    # Calculate the critical path in the graph
+    critical_path = nx.dag_longest_path(G, weight='duration')
+    critical_path_length = nx.dag_longest_path_length(G, weight='duration')
+    return critical_path, critical_path_length
+
+def define_work_packages(nodes_df, G):
+    work_packages = {}
+    
+    if 'Cluster' in nodes_df.columns:
+        for cluster in nodes_df['Cluster'].unique():
+            cluster_nodes = nodes_df[nodes_df['Cluster'] == cluster]
+            tasks = cluster_nodes['ID'].tolist()
+
+            # Ensure the subgraph is correctly referenced
+            subgraph = G.subgraph(tasks)
+            sub_critical_path = nx.dag_longest_path(subgraph, weight='duration')
+            sub_critical_duration = nx.dag_longest_path_length(subgraph, weight='duration')
+
+            # Use 'start_date' and 'end_date' correctly
+            # Calculate the min 'start_date' and max 'end_date' from the subgraph nodes
+            if not subgraph.nodes:  # Check if the subgraph has nodes to avoid errors
+                continue
+            start_dates = [G.nodes[node]['start_date'] for node in subgraph if 'start_date' in G.nodes[node]]
+            end_dates = [G.nodes[node]['end_date'] for node in subgraph if 'end_date' in G.nodes[node]]
+
+            # Validate start_dates and end_dates are not empty
+            if not start_dates or not end_dates:
+                print(f"No valid dates for cluster {cluster}. Skipping.")
+                continue
+
+            work_packages[f'Package_{cluster}'] = {
+                'tasks': tasks,
+                'critical_path': sub_critical_path,
+                'critical_path_length': sub_critical_duration,
+                'start': min(start_dates),
+                'end': max(end_dates)
+            }
+    else:
+        print("Cluster data not found in DataFrame.")
+
+    return work_packages
+
+def dependency_clustering(nodes_df, G):
+    path_length = dict(nx.all_pairs_dijkstra_path_length(G, weight='weight'))
+    size = len(nodes_df)
+    distance_matrix = np.zeros((size, size), dtype=float)
+    ids = nodes_df['ID'].tolist()
+
+    for i, source_node in enumerate(ids):
+        for j, target_node in enumerate(ids):
+            distance = path_length.get(str(source_node), {}).get(str(target_node), np.inf)
+            distance_matrix[i, j] = distance if distance != np.inf else 1e9
+
+    # Determine the optimal number of clusters using silhouette scores
+    max_clusters = 10  # or another suitable upper limit
+    best_score = -1
+    best_n_clusters = 3
+    for n_clusters in range(3, max_clusters):
+        clustering = AgglomerativeClustering(n_clusters=n_clusters, linkage='complete', metric='precomputed')
+        labels = clustering.fit_predict(distance_matrix)
+        # Only calculate silhouette score if there are at least two clusters
+        if len(set(labels)) > 1:
+            score = silhouette_score(distance_matrix, labels, metric='precomputed')
+            print(f"Silhouette Score for {n_clusters} clusters: {score}")
+            if score > best_score:
+                best_score = score
+                best_n_clusters = n_clusters
+
+    # Clustering with the optimal number of clusters found
+    best_clustering = AgglomerativeClustering(n_clusters=best_n_clusters, linkage='complete', metric='precomputed')
+    nodes_df['DependencyCluster'] = best_clustering.fit_predict(distance_matrix)
+    print(f"Using {best_n_clusters} clusters based on the best silhouette score.")
+
+    return nodes_df
 
 def process_graph(nodes, links):
     print("Processing graph...")
@@ -52,8 +156,7 @@ def process_graph(nodes, links):
             distance = path_length.get(source_node, {}).get(target_node, np.inf)
             distance_matrix[i, j] = distance if distance != np.inf else 1e9
 
-    cluster_dep = AgglomerativeClustering(n_clusters=2, metric='precomputed', linkage='complete')
-    nodes_df['DependencyCluster'] = cluster_dep.fit_predict(distance_matrix)
+    nodes_df = dependency_clustering(nodes_df, G)
 
     print("Dependency-Based Clustering:")
     print(nodes_df['DependencyCluster'])
@@ -90,26 +193,61 @@ def process_graph(nodes, links):
     nodes_df = nodes_df.replace({np.nan: None})  # Replace NaN with None
     links_df = links_df.replace({np.nan: None})  # Replace NaN with None
 
+     # Detect repeating patterns using the graph
+    #pattern_records = detect_repeating_patterns(G, nodes_df)
+
+    # Create templates from the detected patterns
+    #templates = create_templates_from_patterns(pattern_records, G)
+
+     # Define work packages based on the clusters and the graph
+    work_packages = define_work_packages(nodes_df, G)
+
+    # Serialize work packages to be JSON compatible
+    work_packages_serialized = serialize_work_packages(work_packages)
+
     # Prepare the response data
     response_data = {
         'nodes': nodes_df.to_dict(orient='records'),
-        'links': links_df.to_dict(orient='records')
+        'links': links_df.to_dict(orient='records'),
+        'work_packages': work_packages_serialized
+        #'templates': templates  # Include templates in the response
     }
-
+    
     print("Response Data:")
     print(response_data)
 
     return response_data
 
+def serialize_work_packages(work_packages):
+    # Ensure work packages are JSON serializable (e.g., datetime conversion)
+    serialized_packages = {}
+    for key, package in work_packages.items():
+        serialized_packages[key] = {
+            'tasks': package['tasks'],
+            'critical_path': package['critical_path'],
+            'critical_path_length': package['critical_path_length'],
+            'start': package['start'].isoformat() if package['start'] else None,
+            'end': package['end'].isoformat() if package['end'] else None
+        }
+    return serialized_packages
+
 def preprocess_graph(nodes, links):
     G = nx.DiGraph()
-    G.add_nodes_from([str(node['ID']) for node in nodes])  # Convert node IDs to strings
-    G.add_edges_from([(str(link['source']), str(link['target'])) for link in links])  # Convert edge IDs to strings
-
-    if not nx.is_directed_acyclic_graph(G):
-        cycles = list(nx.simple_cycles(G))
-        for cycle in cycles:
-            G.remove_edge(cycle[-1], cycle[0])
+    for link in links:
+        G.add_edge(str(link['source']), str(link['target']), weight=link['duration'])
+    
+    for node in nodes:
+        G.nodes[str(node['ID'])]['start_date'] = pd.to_datetime(node['Start'], errors='coerce', exact=False)
+        G.nodes[str(node['ID'])]['duration'] = node['Duration']
+    
+    # Remove cycles if necessary
+    try:
+        if not nx.is_directed_acyclic_graph(G):
+            cycles = list(nx.simple_cycles(G))
+            for cycle in cycles:
+                G.remove_edge(cycle[-1], cycle[0])
+    except Exception as e:
+        print("Error checking cycles in graph:", e)
 
     return G
 
