@@ -135,8 +135,8 @@ def process_graph(nodes, links):
     G = preprocess_graph(nodes, links)
 
     print("Preprocessed Graph:")
-    print(G.nodes(data=True))
-    print(G.edges(data=True))
+    print(G.nodes())
+    print(G.edges())
 
     # Activity-Based Clustering
     X = nodes_df[['Duration']].values
@@ -209,6 +209,7 @@ def process_graph(nodes, links):
     print(response_data)
 
     return response_data
+
 
 def serialize_work_packages(work_packages):
     # Ensure work packages are JSON serializable (e.g., datetime conversion)
