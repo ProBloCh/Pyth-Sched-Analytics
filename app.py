@@ -135,8 +135,8 @@ def process_graph(nodes, links):
     G = preprocess_graph(nodes, links)
 
     print("Preprocessed Graph:")
-    print(G.nodes())
-    print(G.edges())
+    print(G.nodes(data=True))
+    print(G.edges(data=True))
 
     # Activity-Based Clustering
     X = nodes_df[['Duration']].values
@@ -189,17 +189,10 @@ def process_graph(nodes, links):
     print(nodes_df)
 
     # Replace NaN values with null
-    #nodes_df = nodes_df.where(pd.notnull(nodes_df), None)
     nodes_df = nodes_df.replace({np.nan: None})  # Replace NaN with None
     links_df = links_df.replace({np.nan: None})  # Replace NaN with None
 
-     # Detect repeating patterns using the graph
-    #pattern_records = detect_repeating_patterns(G, nodes_df)
-
-    # Create templates from the detected patterns
-    #templates = create_templates_from_patterns(pattern_records, G)
-
-     # Define work packages based on the clusters and the graph
+    # Define work packages based on the clusters and the graph
     work_packages = define_work_packages(nodes_df, G)
 
     # Serialize work packages to be JSON compatible
@@ -210,7 +203,6 @@ def process_graph(nodes, links):
         'nodes': nodes_df.to_dict(orient='records'),
         'links': links_df.to_dict(orient='records'),
         'work_packages': work_packages_serialized
-        #'templates': templates  # Include templates in the response
     }
     
     print("Response Data:")
@@ -235,6 +227,9 @@ def preprocess_graph(nodes, links):
     G = nx.DiGraph()
     for link in links:
         G.add_edge(str(link['source']), str(link['target']), weight=link['duration'])
+        # Add type and lag as edge attributes
+        G[str(link['source'])][str(link['target'])]['type'] = link.get('type', 'FS')
+        G[str(link['source'])][str(link['target'])]['lag'] = link.get('lag', 0)
     
     for node in nodes:
         G.nodes[str(node['ID'])]['start_date'] = pd.to_datetime(node['Start'], errors='coerce', exact=False)
