@@ -126,6 +126,17 @@ def process_graph(nodes, links):
     nodes_df = pd.DataFrame(nodes)
     links_df = pd.DataFrame(links)
 
+    # Validate required columns
+    required_node_columns = ['ID', 'Duration', 'Start', 'Finish']
+    for column in required_node_columns:
+        if column not in nodes_df.columns:
+            raise ValueError(f"Missing required column in nodes data: {column}")
+
+    required_link_columns = ['source', 'target', 'duration']
+    for column in required_link_columns:
+        if column not in links_df.columns:
+            raise ValueError(f"Missing required column in links data: {column}")
+
     print("Nodes DataFrame:")
     print(nodes_df)
     print("Links DataFrame:")
@@ -139,9 +150,10 @@ def process_graph(nodes, links):
     print(G.edges())
 
     # Activity-Based Clustering
-    X = nodes_df[['Duration']].values
-    cluster = AgglomerativeClustering(n_clusters=2, metric='euclidean', linkage='ward')
-    nodes_df['Cluster'] = cluster.fit_predict(X)
+    if 'Duration' in nodes_df.columns:
+        X = nodes_df[['Duration']].values
+        cluster = AgglomerativeClustering(n_clusters=2, metric='euclidean', linkage='ward')
+        nodes_df['Cluster'] = cluster.fit_predict(X)
 
     print("Activity-Based Clustering:")
     print(nodes_df['Cluster'])
@@ -211,6 +223,7 @@ def process_graph(nodes, links):
     return response_data
 
 
+
 def serialize_work_packages(work_packages):
     # Ensure work packages are JSON serializable (e.g., datetime conversion)
     serialized_packages = {}
@@ -226,16 +239,31 @@ def serialize_work_packages(work_packages):
 
 def preprocess_graph(nodes, links):
     G = nx.DiGraph()
+    
     for link in links:
-        G.add_edge(str(link['source']), str(link['target']), weight=link['duration'])
-        # Add type and lag as edge attributes
-        G[str(link['source'])][str(link['target'])]['type'] = link.get('type', 'FS')
-        G[str(link['source'])][str(link['target'])]['lag'] = link.get('lag', 0)
-    
+        # Ensure the necessary attributes are present and valid
+        source = str(link.get('source'))
+        target = str(link.get('target'))
+        duration = link.get('duration', 0)
+        link_type = link.get('type', 'FS')
+        lag = link.get('lag', 0)
+
+        if source and target:
+            G.add_edge(source, target, weight=duration)
+            # Add type and lag as edge attributes
+            G[source][target]['type'] = link_type
+            G[source][target]['lag'] = lag
+        else:
+            print(f"Invalid link data: {link}")
+
     for node in nodes:
-        G.nodes[str(node['ID'])]['start_date'] = pd.to_datetime(node['Start'], errors='coerce', exact=False)
-        G.nodes[str(node['ID'])]['duration'] = node['Duration']
-    
+        node_id = str(node.get('ID'))
+        if node_id:
+            G.nodes[node_id]['start_date'] = pd.to_datetime(node.get('Start'), errors='coerce', exact=False)
+            G.nodes[node_id]['duration'] = node.get('Duration', 0)
+        else:
+            print(f"Invalid node data: {node}")
+
     # Remove cycles if necessary
     try:
         if not nx.is_directed_acyclic_graph(G):
@@ -246,6 +274,7 @@ def preprocess_graph(nodes, links):
         print("Error checking cycles in graph:", e)
 
     return G
+
 
 @app.route('/graph-metrics', methods=['POST'])
 def graph_metrics():
