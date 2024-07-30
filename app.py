@@ -68,8 +68,8 @@ def define_work_packages(nodes_df, G):
                 'tasks': tasks,
                 'critical_path': sub_critical_path,
                 'critical_path_length': sub_critical_duration,
-                'start': min(start_dates),
-                'end': max(end_dates)
+                'start': min(start_dates) if start_dates else None,
+                'end': max(end_dates) if end_dates else None
             }
     else:
         logging.warning("Cluster data not found in DataFrame.")
@@ -198,49 +198,70 @@ def process_graph(nodes, links):
     if 'avgWeightedRisk' not in nodes_df.columns:
         nodes_df['avgWeightedRisk'] = 0
 
-    G = preprocess_graph(nodes, links)
-    G = make_dag(G)
+    try:
+        G = preprocess_graph(nodes, links)
+        G = make_dag(G)
+    except Exception as e:
+        logging.error(f"Error during graph preprocessing: {str(e)}")
+        return {"error": "Error during graph preprocessing"}
 
     logging.debug("Preprocessed Graph:")
     logging.debug(G.nodes(data=True))
     logging.debug(G.edges(data=True))
 
-    nodes_df, kmeans = perform_clustering(nodes_df)
+    try:
+        nodes_df, kmeans = perform_clustering(nodes_df)
+    except Exception as e:
+        logging.error(f"Error during clustering: {str(e)}")
+        return {"error": "Error during clustering"}
 
     logging.debug("Risk and Importance Clustering:")
     logging.debug(nodes_df[['ID', 'Cluster']])
 
-    nodes_df = perform_pca(nodes_df)
+    try:
+        nodes_df = perform_pca(nodes_df)
+    except Exception as e:
+        logging.error(f"Error during PCA analysis: {str(e)}")
+        return {"error": "Error during PCA analysis"}
 
     logging.debug("PCA Analysis:")
     logging.debug(nodes_df[['ID', 'pca1', 'pca2']])
 
-    nodes_df = dependency_clustering(nodes_df, G)
+    try:
+        nodes_df = dependency_clustering(nodes_df, G)
+    except Exception as e:
+        logging.error(f"Error during dependency-based clustering: {str(e)}")
+        return {"error": "Error during dependency-based clustering"}
 
     logging.debug("Dependency-Based Clustering:")
     logging.debug(nodes_df['DependencyCluster'])
 
-    communities = nx.algorithms.community.greedy_modularity_communities(G)
-    node_community_dict = {}
-    for community_group, nodes in enumerate(communities):
-        for node in nodes:
-            node_community_dict[node] = community_group
-    nodes_df['CommunityGroup'] = nodes_df['ID'].apply(lambda x: node_community_dict.get(x))
+    try:
+        communities = nx.algorithms.community.greedy_modularity_communities(G)
+        node_community_dict = {node: community_group for community_group, nodes in enumerate(communities) for node in nodes}
+        nodes_df['CommunityGroup'] = nodes_df['ID'].apply(lambda x: node_community_dict.get(x))
+    except Exception as e:
+        logging.error(f"Error during community detection: {str(e)}")
+        return {"error": "Error during community detection"}
 
     logging.debug("Community Detection:")
     logging.debug(nodes_df['CommunityGroup'])
 
-    clust = nx.clustering(G)
-    close_cent = nx.closeness_centrality(G)
-    dcent1 = nx.algorithms.degree_centrality(G)
-    pr = nx.pagerank(G, alpha=0.9)
+    try:
+        clust = nx.clustering(G)
+        close_cent = nx.closeness_centrality(G)
+        dcent1 = nx.algorithms.degree_centrality(G)
+        pr = nx.pagerank(G, alpha=0.9)
 
-    for index, row in nodes_df.iterrows():
-        key = row['ID']
-        nodes_df.at[index, 'Clustering_Coefficient'] = clust.get(key, None)
-        nodes_df.at[index, 'closeness_centrality'] = close_cent.get(key, None)
-        nodes_df.at[index, 'degree_centrality'] = dcent1.get(key, None)
-        nodes_df.at[index, 'PageRank'] = pr.get(key, None)
+        for index, row in nodes_df.iterrows():
+            key = row['ID']
+            nodes_df.at[index, 'Clustering_Coefficient'] = clust.get(key, None)
+            nodes_df.at[index, 'closeness_centrality'] = close_cent.get(key, None)
+            nodes_df.at[index, 'degree_centrality'] = dcent1.get(key, None)
+            nodes_df.at[index, 'PageRank'] = pr.get(key, None)
+    except Exception as e:
+        logging.error(f"Error during metric calculation: {str(e)}")
+        return {"error": "Error during metric calculation"}
 
     logging.debug("Calculated Metrics:")
     logging.debug(nodes_df)
@@ -248,13 +269,20 @@ def process_graph(nodes, links):
     nodes_df = nodes_df.replace({np.nan: None})
     links_df = links_df.replace({np.nan: None})
 
-    work_packages = define_work_packages(nodes_df, G)
+    try:
+        work_packages = define_work_packages(nodes_df, G)
+    except Exception as e:
+        logging.error(f"Error during work package definition: {str(e)}")
+        return {"error": "Error during work package definition"}
 
-    critical_nodes = identify_critical_activities_and_milestones(G)
-
-    reduced_dag = create_reduced_dag(G, critical_nodes)
-    reduced_nodes = list(reduced_dag.nodes)
-    reduced_links = [{'source': u, 'target': v, 'weight': d['weight']} for u, v, d in reduced_dag.edges(data=True)]
+    try:
+        critical_nodes = identify_critical_activities_and_milestones(G)
+        reduced_dag = create_reduced_dag(G, critical_nodes)
+        reduced_nodes = list(reduced_dag.nodes)
+        reduced_links = [{'source': u, 'target': v, 'weight': d['weight']} for u, v, d in reduced_dag.edges(data=True)]
+    except Exception as e:
+        logging.error(f"Error during reduced DAG creation: {str(e)}")
+        return {"error": "Error during reduced DAG creation"}
 
     work_packages_serialized = serialize_work_packages(work_packages)
 
@@ -272,6 +300,7 @@ def process_graph(nodes, links):
     logging.debug(response_data)
 
     return response_data
+
 
 def serialize_work_packages(work_packages):
     serialized_packages = {}
@@ -333,6 +362,7 @@ def graph_metrics():
     except Exception as e:
         logging.error(f"An error occurred while processing the graph: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/health', methods=['GET'])
 def health_check():
