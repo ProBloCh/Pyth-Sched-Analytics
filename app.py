@@ -288,13 +288,14 @@ def serialize_work_packages(work_packages):
 def preprocess_graph(nodes, links):
     G = nx.DiGraph()
     for link in links:
-        G.add_edge(str(link['source']), str(link['target']), weight=link.get('duration', 0))
+        G.add_edge(str(link['source']), str(link['target']), weight=link.get('duration', 1))
+        # Add type and lag as edge attributes
         G[str(link['source'])][str(link['target'])]['type'] = link.get('type', 'FS')
         G[str(link['source'])][str(link['target'])]['lag'] = link.get('lag', 0)
     
     for node in nodes:
         G.nodes[str(node['ID'])]['start_date'] = pd.to_datetime(node['Start'], errors='coerce', exact=False)
-        G.nodes[str(node['ID'])]['duration'] = node.get('Duration', 0)
+        G.nodes[str(node['ID'])]['duration'] = node['Duration']
         G.nodes[str(node['ID'])]['Milestone'] = int(node.get('Milestone', 0)) == 1
         G.nodes[str(node['ID'])]['isImportanceOutlier'] = str(node.get('isImportanceOutlier', 'false')).lower() == 'true'
         G.nodes[str(node['ID'])]['isOnCriticalPath'] = str(node.get('isOnCriticalPath', 'false')).lower() == 'true'
