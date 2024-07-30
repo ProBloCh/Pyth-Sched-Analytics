@@ -117,10 +117,11 @@ def identify_critical_activities_and_milestones(G):
     ]
     return set(critical_activities)
 
-def create_reduced_dag(G, critical_nodes):
-    reduced_dag = G.subgraph(critical_nodes).copy()
-    reduced_dag = make_dag(reduced_dag)
-    return reduced_dag
+# Commented out reduced graph creation for now
+# def create_reduced_dag(G, critical_nodes):
+#     reduced_dag = G.subgraph(critical_nodes).copy()
+#     reduced_dag = make_dag(reduced_dag)
+#     return reduced_dag
 
 def make_dag(G):
     try:
@@ -275,14 +276,15 @@ def process_graph(nodes, links):
         logging.error(f"Error during work package definition: {str(e)}")
         return {"error": "Error during work package definition"}
 
-    try:
-        critical_nodes = identify_critical_activities_and_milestones(G)
-        reduced_dag = create_reduced_dag(G, critical_nodes)
-        reduced_nodes = list(reduced_dag.nodes)
-        reduced_links = [{'source': u, 'target': v, 'weight': d['weight']} for u, v, d in reduced_dag.edges(data=True)]
-    except Exception as e:
-        logging.error(f"Error during reduced DAG creation: {str(e)}")
-        return {"error": "Error during reduced DAG creation"}
+    # Commented out reduced graph creation for now
+    # try:
+    #     critical_nodes = identify_critical_activities_and_milestones(G)
+    #     reduced_dag = create_reduced_dag(G, critical_nodes)
+    #     reduced_nodes = list(reduced_dag.nodes)
+    #     reduced_links = [{'source': u, 'target': v, 'weight': d['weight']} for u, v, d in reduced_dag.edges(data=True)]
+    # except Exception as e:
+    #     logging.error(f"Error during reduced DAG creation: {str(e)}")
+    #     return {"error": "Error during reduced DAG creation"}
 
     work_packages_serialized = serialize_work_packages(work_packages)
 
@@ -290,17 +292,16 @@ def process_graph(nodes, links):
         'nodes': nodes_df.to_dict(orient='records'),
         'links': links_df.to_dict(orient='records'),
         'work_packages': work_packages_serialized,
-        'reduced_graph': {
-            'nodes': reduced_nodes,
-            'links': reduced_links
-        }
+        # 'reduced_graph': {
+        #     'nodes': reduced_nodes,
+        #     'links': reduced_links
+        # }
     }
     
     logging.debug("Response Data:")
     logging.debug(response_data)
 
     return response_data
-
 
 def serialize_work_packages(work_packages):
     serialized_packages = {}
@@ -362,7 +363,6 @@ def graph_metrics():
     except Exception as e:
         logging.error(f"An error occurred while processing the graph: {str(e)}")
         return jsonify({'error': str(e)}), 500
-
 
 @app.route('/health', methods=['GET'])
 def health_check():
