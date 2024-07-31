@@ -155,7 +155,7 @@ def make_dag(G):
     return G
 
 def perform_clustering(nodes_df):
-    features = nodes_df[['importanceScore', 'avgWeightedRisk']].values
+    features = nodes_df[['importanceScore', 'riskScore']].values
 
     max_clusters = 10
     best_score = -1
