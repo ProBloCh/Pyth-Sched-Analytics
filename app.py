@@ -109,10 +109,10 @@ def identify_critical_activities_and_milestones(G):
     critical_activities = [
         node for node in G.nodes if (
             G.nodes[node].get('Milestone') == 1 or
-            G.nodes[node].get('isImportanceOutlier', False) or
-            G.nodes[node].get('isOnCriticalPath', False) or
-            G.nodes[node].get('isOnOutlierPath', False) or
-            G.nodes[node].get('isRiskOutlier', False)
+            G.nodes[node].get('isImportanceOutlier', True) or
+            G.nodes[node].get('isOnCriticalPath', True) or
+            G.nodes[node].get('isOnOutlierPath', True) or
+            G.nodes[node].get('isRiskOutlier', True)
         )
     ]
     return set(critical_activities)
@@ -285,6 +285,8 @@ def process_graph(nodes, links):
     # except Exception as e:
     #     logging.error(f"Error during reduced DAG creation: {str(e)}")
     #     return {"error": "Error during reduced DAG creation"}
+    
+    #     Need to uncomment after fixing
 
     work_packages_serialized = serialize_work_packages(work_packages)
 
