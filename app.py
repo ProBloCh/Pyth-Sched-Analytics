@@ -175,7 +175,7 @@ def perform_clustering(nodes_df):
     return nodes_df, kmeans
 
 def perform_pca(nodes_df):
-    features = nodes_df[['importanceScore', 'avgWeightedRisk']].values
+    features = nodes_df[['importanceScore', 'riskScore']].values
     pca = PCA(n_components=2)
     pca_result = pca.fit_transform(features)
     nodes_df['pca1'] = pca_result[:, 0]
