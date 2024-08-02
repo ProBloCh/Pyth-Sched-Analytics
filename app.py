@@ -103,6 +103,7 @@ def dependency_clustering(nodes_df, G):
     best_clustering = AgglomerativeClustering(n_clusters=best_n_clusters, linkage='complete', metric='precomputed')
     nodes_df['DependencyCluster'] = best_clustering.fit_predict(distance_matrix)
 
+    logging.info(f"dependency_clustering completed: {nodes_df}")
     return nodes_df
 
 def identify_critical_activities_and_milestones(G):
