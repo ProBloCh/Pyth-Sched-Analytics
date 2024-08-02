@@ -125,7 +125,6 @@ def identify_critical_activities_and_milestones(G):
 #     return reduced_dag
 
 def make_dag(G):
-    # Log the initial state of the graph
     logging.info("Initial Graph Nodes:")
     logging.info(G.nodes(data=True))
     
@@ -133,18 +132,29 @@ def make_dag(G):
     logging.info(G.edges(data=True))
 
     try:
-        removed_edges = set()
         while True:
             try:
+                # Detect cycles in the graph
                 cycles = list(nx.find_cycle(G, orientation='original'))
+                
                 if not cycles:
                     logging.info("No cycles detected in the graph.")
                     break
 
-                # Log the detected cycles
-                logging.info(f"Detected cycles: {cycles}")
+                # Log the detected cycle
+                logging.info(f"Detected cycle: {cycles}")
 
-                
+                # Remove the first edge in the detected cycle
+                source, target = cycles[0][0], cycles[0][1]
+                if G.has_edge(source, target):
+                    G.remove_edge(source, target)
+                    logging.info(f"Removed edge to break cycle: {source} -> {target}")
+                else:
+                    logging.error(f"Attempted to remove a non-existent edge: {source} -> {target}")
+
+                # After removing an edge, continue to detect if any more cycles remain
+                continue
+
             except nx.NetworkXNoCycle:
                 logging.info("No more cycles detected in the graph.")
                 break
@@ -153,7 +163,6 @@ def make_dag(G):
         logging.error(f"Error during cycle removal: {str(e)}")
         raise
 
-    # Log the graph after cycle removal
     logging.info("Graph after cycle removal Nodes:")
     logging.info(G.nodes(data=True))
     
@@ -182,7 +191,6 @@ def make_dag(G):
             logging.info(f"Added end milestone edge: {node} -> {end_milestone}")
 
     return G
-
 
 
 def perform_clustering(nodes_df):
