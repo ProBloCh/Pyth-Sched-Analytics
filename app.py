@@ -126,8 +126,13 @@ def identify_critical_activities_and_milestones(G):
 
 def make_dag(G):
     try:
-        cycles = list(nx.find_cycle(G, orientation='original'))
-        while cycles:
+        while True:
+            try:
+                cycles = list(nx.find_cycle(G, orientation='original'))
+            except nx.NetworkXNoCycle:
+                logging.info("No cycles detected in the graph.")
+                break
+
             for cycle in cycles:
                 source, target = cycle[-1][0], cycle[-1][1]
                 if G.has_edge(source, target):
@@ -135,23 +140,16 @@ def make_dag(G):
                     logging.info(f"Removed cycle edge: {source} -> {target}")
                 else:
                     logging.error(f"Attempted to remove a non-existent edge: {source} -> {target}")
-            cycles = list(nx.find_cycle(G, orientation='original'))
-    except nx.NetworkXNoCycle:
-        logging.info("No cycles detected in the graph.")
-        pass
     except Exception as e:
         logging.error(f"Error during cycle removal: {str(e)}")
         raise
 
-    # Handling milestones
     start_milestones = [node for node in G.nodes if G.nodes[node].get('Milestone') == 1 and G.in_degree(node) == 0]
     end_milestones = [node for node in G.nodes if G.nodes[node].get('Milestone') == 1 and G.out_degree(node) == 0]
 
     if not start_milestones:
-        logging.error("No start milestone found")
         raise ValueError("No start milestone found")
     if not end_milestones:
-        logging.error("No end milestone found")
         raise ValueError("No end milestone found")
 
     start_milestone = start_milestones[0]
@@ -167,8 +165,8 @@ def make_dag(G):
             G.add_edge(node, end_milestone)
             logging.info(f"Added end milestone edge: {node} -> {end_milestone}")
 
-    logging.info("DAG creation completed.")
     return G
+
 
 def perform_clustering(nodes_df):
     features = nodes_df[['importanceScore', 'riskScore']].values
