@@ -128,17 +128,29 @@ def make_dag(G):
         cycles = list(nx.find_cycle(G, orientation='original'))
         while cycles:
             for cycle in cycles:
-                G.remove_edge(cycle[-1][0], cycle[-1][1])
+                source, target = cycle[-1][0], cycle[-1][1]
+                if G.has_edge(source, target):
+                    G.remove_edge(source, target)
+                    logging.info(f"Removed cycle edge: {source} -> {target}")
+                else:
+                    logging.error(f"Attempted to remove a non-existent edge: {source} -> {target}")
             cycles = list(nx.find_cycle(G, orientation='original'))
     except nx.NetworkXNoCycle:
+        logging.info("No cycles detected in the graph.")
         pass
+    except Exception as e:
+        logging.error(f"Error during cycle removal: {str(e)}")
+        raise
 
+    # Handling milestones
     start_milestones = [node for node in G.nodes if G.nodes[node].get('Milestone') == 1 and G.in_degree(node) == 0]
     end_milestones = [node for node in G.nodes if G.nodes[node].get('Milestone') == 1 and G.out_degree(node) == 0]
 
     if not start_milestones:
+        logging.error("No start milestone found")
         raise ValueError("No start milestone found")
     if not end_milestones:
+        logging.error("No end milestone found")
         raise ValueError("No end milestone found")
 
     start_milestone = start_milestones[0]
@@ -147,11 +159,14 @@ def make_dag(G):
     for node in G.nodes:
         if G.in_degree(node) == 0 and node != start_milestone:
             G.add_edge(start_milestone, node)
+            logging.info(f"Added start milestone edge: {start_milestone} -> {node}")
 
     for node in G.nodes:
         if G.out_degree(node) == 0 and node != end_milestone:
             G.add_edge(node, end_milestone)
+            logging.info(f"Added end milestone edge: {node} -> {end_milestone}")
 
+    logging.info("DAG creation completed.")
     return G
 
 def perform_clustering(nodes_df):
@@ -319,21 +334,33 @@ def serialize_work_packages(work_packages):
 
 def preprocess_graph(nodes, links):
     G = nx.DiGraph()
+    logging.info("Starting to preprocess graph...")
+    
     for link in links:
-        G.add_edge(str(link['source']), str(link['target']), weight=link.get('duration', 1))
+        source = str(link['source'])
+        target = str(link['target'])
+        if G.has_edge(source, target):
+            logging.warning(f"Duplicate edge found and skipped: {source} -> {target}")
+            continue
+        
+        G.add_edge(source, target, weight=link.get('duration', 1))
+        logging.info(f"Edge added: {source} -> {target} with weight {link.get('duration', 1)}")
+        
         # Add type and lag as edge attributes
-        G[str(link['source'])][str(link['target'])]['type'] = link.get('type', 'FS')
-        G[str(link['source'])][str(link['target'])]['lag'] = link.get('lag', 0)
+        G[source][target]['type'] = link.get('type', 'FS')
+        G[source][target]['lag'] = link.get('lag', 0)
     
     for node in nodes:
-        G.nodes[str(node['ID'])]['start_date'] = pd.to_datetime(node['Start'], errors='coerce', exact=False)
-        G.nodes[str(node['ID'])]['duration'] = node['Duration']
-        G.nodes[str(node['ID'])]['Milestone'] = int(node.get('Milestone', 0)) == 1
-        G.nodes[str(node['ID'])]['isImportanceOutlier'] = str(node.get('isImportanceOutlier', 'false')).lower() == 'true'
-        G.nodes[str(node['ID'])]['isOnCriticalPath'] = str(node.get('isOnCriticalPath', 'false')).lower() == 'true'
-        G.nodes[str(node['ID'])]['isOnOutlierPath'] = str(node.get('isOnOutlierPath', 'false')).lower() == 'true'
-        G.nodes[str(node['ID'])]['isRiskOutlier'] = str(node.get('isRiskOutlier', 'false')).lower() == 'true'
+        node_id = str(node['ID'])
+        G.nodes[node_id]['start_date'] = pd.to_datetime(node['Start'], errors='coerce', exact=False)
+        G.nodes[node_id]['duration'] = node['Duration']
+        G.nodes[node_id]['Milestone'] = int(node.get('Milestone', 0)) == 1
+        G.nodes[node_id]['isImportanceOutlier'] = str(node.get('isImportanceOutlier', 'false')).lower() == 'true'
+        G.nodes[node_id]['isOnCriticalPath'] = str(node.get('isOnCriticalPath', 'false')).lower() == 'true'
+        G.nodes[node_id]['isOnOutlierPath'] = str(node.get('isOnOutlierPath', 'false')).lower() == 'true'
+        G.nodes[node_id]['isRiskOutlier'] = str(node.get('isRiskOutlier', 'false')).lower() == 'true'
     
+    logging.info("Graph preprocessing completed.")
     return G
 
 @app.route('/graph-metrics', methods=['POST'])
