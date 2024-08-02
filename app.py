@@ -144,18 +144,7 @@ def make_dag(G):
                 # Log the detected cycles
                 logging.info(f"Detected cycles: {cycles}")
 
-                for cycle in cycles:
-                    source, target = cycle[-1][0], cycle[-1][1]
-                    edge = (source, target)
-                    if edge not in removed_edges:
-                        if G.has_edge(source, target):
-                            G.remove_edge(source, target)
-                            removed_edges.add(edge)
-                            logging.info(f"Removed cycle edge: {source} -> {target}")
-                        else:
-                            logging.error(f"Attempted to remove a non-existent edge: {source} -> {target}")
-                    else:
-                        logging.debug(f"Edge {source} -> {target} was already removed, skipping.")
+                
             except nx.NetworkXNoCycle:
                 logging.info("No more cycles detected in the graph.")
                 break
