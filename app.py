@@ -125,6 +125,13 @@ def identify_critical_activities_and_milestones(G):
 #     return reduced_dag
 
 def make_dag(G):
+    # Log the initial state of the graph
+    logging.info("Initial Graph Nodes:")
+    logging.info(G.nodes(data=True))
+    
+    logging.info("Initial Graph Edges:")
+    logging.info(G.edges(data=True))
+
     try:
         removed_edges = set()
         while True:
@@ -150,6 +157,13 @@ def make_dag(G):
     except Exception as e:
         logging.error(f"Error during cycle removal: {str(e)}")
         raise
+
+    # Log the graph after cycle removal
+    logging.info("Graph after cycle removal Nodes:")
+    logging.info(G.nodes(data=True))
+    
+    logging.info("Graph after cycle removal Edges:")
+    logging.info(G.edges(data=True))
 
     start_milestones = [node for node in G.nodes if G.nodes[node].get('Milestone') == 1 and G.in_degree(node) == 0]
     end_milestones = [node for node in G.nodes if G.nodes[node].get('Milestone') == 1 and G.out_degree(node) == 0]
