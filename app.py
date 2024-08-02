@@ -216,7 +216,7 @@ def process_graph(nodes, links):
 
     try:
         G = preprocess_graph(nodes, links)
-        G = make_dag(G)
+        # G = make_dag(G)
     except Exception as e:
         logging.error(f"Error during graph preprocessing: {str(e)}")
         return {"error": "Error during graph preprocessing"}
