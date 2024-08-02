@@ -126,6 +126,7 @@ def identify_critical_activities_and_milestones(G):
 
 def make_dag(G):
     try:
+        removed_edges = set()
         while True:
             try:
                 cycles = list(nx.find_cycle(G, orientation='original'))
@@ -135,11 +136,17 @@ def make_dag(G):
 
             for cycle in cycles:
                 source, target = cycle[-1][0], cycle[-1][1]
-                if G.has_edge(source, target):
-                    G.remove_edge(source, target)
-                    logging.info(f"Removed cycle edge: {source} -> {target}")
+                edge = (source, target)
+                if edge not in removed_edges:
+                    if G.has_edge(source, target):
+                        G.remove_edge(source, target)
+                        removed_edges.add(edge)
+                        logging.info(f"Removed cycle edge: {source} -> {target}")
+                    else:
+                        logging.error(f"Attempted to remove a non-existent edge: {source} -> {target}")
                 else:
-                    logging.error(f"Attempted to remove a non-existent edge: {source} -> {target}")
+                    logging.debug(f"Edge {source} -> {target} was already removed, skipping.")
+
     except Exception as e:
         logging.error(f"Error during cycle removal: {str(e)}")
         raise
