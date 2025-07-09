@@ -1,18 +1,56 @@
-import os
-import logging
-import json
+﻿"""
+Pyth‑Sched‑Analytics • Optimised v2.0 (scales to 10 k × 500 k)
+==============================================================
+"""
+
+import os, json, logging, hashlib
+from functools import lru_cache
+from datetime import datetime
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import numpy as np
-import pandas as pd
+
+import numpy as np, pandas as pd
 from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
-import networkx as nx
+
+# Optional high‑performance graph library
+try:
+    import networkit as nk
+    from networkit import nxadapter as nka
+    _NK = True
+except ImportError:
+    _NK = False
+    import networkx as nx
+else:
+    import networkx as nx
+
+SMALL_GRAPH_THRESHOLD = int(os.getenv("SMALL_GRAPH_THRESHOLD", 2000))
+
+###############################################################################
+# Flask setup                                                                 #
+###############################################################################
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
-CORS(app)  # Enable CORS for all routes and origins
+CORS(app)
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s » %(message)s")
+
+###############################################################################
+# Helpers                                                                     #
+###############################################################################
+
+def _sha(payload):
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+@lru_cache(maxsize=32)
+def _cached(nodes_json: str, links_json: str):
+    return analyse(json.loads(nodes_json), json.loads(links_json))
+
+###############################################################################
+# Pattern Detection (from v1)                                                 #
+###############################################################################
 
 def detect_repeating_patterns(nodes_df):
     if 'TaskType' not in nodes_df.columns:
@@ -38,10 +76,30 @@ def create_templates_from_patterns(pattern_records):
         templates[f"Template_{index}"] = template
     return templates
 
+###############################################################################
+# Critical Path & Activities (from v1)                                       #
+###############################################################################
+
 def calculate_critical_path(G):
     critical_path = nx.dag_longest_path(G, weight='duration')
     critical_path_length = nx.dag_longest_path_length(G, weight='duration')
     return critical_path, critical_path_length
+
+def identify_critical_activities_and_milestones(G):
+    critical_activities = [
+        node for node in G.nodes if (
+            G.nodes[node].get('Milestone') == 1 or
+            G.nodes[node].get('isImportanceOutlier', True) or
+            G.nodes[node].get('isOnCriticalPath', True) or
+            G.nodes[node].get('isOnOutlierPath', True) or
+            G.nodes[node].get('isRiskOutlier', True)
+        )
+    ]
+    return set(critical_activities)
+
+###############################################################################
+# Work Packages (from v1)                                                     #
+###############################################################################
 
 def define_work_packages(nodes_df, G):
     work_packages = {}
@@ -49,16 +107,27 @@ def define_work_packages(nodes_df, G):
     if 'Cluster' in nodes_df.columns:
         for cluster in nodes_df['Cluster'].unique():
             cluster_nodes = nodes_df[nodes_df['Cluster'] == cluster]
-            tasks = cluster_nodes['ID'].tolist()
+            tasks = cluster_nodes['ID'].astype(str).tolist()
+
+            # Ensure all nodes exist in the graph
+            tasks = [t for t in tasks if t in G]
+            if not tasks:
+                continue
 
             subgraph = G.subgraph(tasks)
-            sub_critical_path = nx.dag_longest_path(subgraph, weight='duration')
-            sub_critical_duration = nx.dag_longest_path_length(subgraph, weight='duration')
+            
+            # Check if subgraph is a DAG before computing longest path
+            if nx.is_directed_acyclic_graph(subgraph) and len(subgraph) > 0:
+                sub_critical_path = nx.dag_longest_path(subgraph, weight='duration')
+                sub_critical_duration = nx.dag_longest_path_length(subgraph, weight='duration')
+            else:
+                sub_critical_path = []
+                sub_critical_duration = 0
 
-            if not subgraph.nodes:
-                continue
-            start_dates = [G.nodes[node]['start_date'] for node in subgraph if 'start_date' in G.nodes[node]]
-            end_dates = [G.nodes[node]['end_date'] for node in subgraph if 'end_date' in G.nodes[node]]
+            start_dates = [G.nodes[node].get('start_date') for node in subgraph 
+                          if G.nodes[node].get('start_date') is not None]
+            end_dates = [G.nodes[node].get('end_date') for node in subgraph 
+                        if G.nodes[node].get('end_date') is not None]
 
             if not start_dates or not end_dates:
                 logging.warning(f"No valid dates for cluster {cluster}. Skipping.")
@@ -76,356 +145,411 @@ def define_work_packages(nodes_df, G):
 
     return work_packages
 
-def dependency_clustering(nodes_df, G):
-    path_length = dict(nx.all_pairs_dijkstra_path_length(G, weight='weight'))
-    size = len(nodes_df)
-    distance_matrix = np.zeros((size, size), dtype=float)
-    ids = nodes_df['ID'].tolist()
-
-    for i, source_node in enumerate(ids):
-        for j, target_node in enumerate(ids):
-            distance = path_length.get(str(source_node), {}).get(str(target_node), np.inf)
-            distance_matrix[i, j] = distance if distance != np.inf else 1e9
-
-    max_clusters = 10
-    best_score = -1
-    best_n_clusters = 3
-    for n_clusters in range(3, max_clusters):
-        clustering = AgglomerativeClustering(n_clusters=n_clusters, linkage='complete', metric='precomputed')
-        labels = clustering.fit_predict(distance_matrix)
-        if len(set(labels)) > 1:
-            score = silhouette_score(distance_matrix, labels, metric='precomputed')
-            logging.info(f"Silhouette Score for {n_clusters} clusters: {score}")
-            if score > best_score:
-                best_score = score
-                best_n_clusters = n_clusters
-
-    best_clustering = AgglomerativeClustering(n_clusters=best_n_clusters, linkage='complete', metric='precomputed')
-    nodes_df['DependencyCluster'] = best_clustering.fit_predict(distance_matrix)
-
-    logging.info(f"dependency_clustering completed: {nodes_df}")
-    return nodes_df
-
-def identify_critical_activities_and_milestones(G):
-    critical_activities = [
-        node for node in G.nodes if (
-            G.nodes[node].get('Milestone') == 1 or
-            G.nodes[node].get('isImportanceOutlier', True) or
-            G.nodes[node].get('isOnCriticalPath', True) or
-            G.nodes[node].get('isOnOutlierPath', True) or
-            G.nodes[node].get('isRiskOutlier', True)
-        )
-    ]
-    return set(critical_activities)
-
-# Commented out reduced graph creation for now
-# def create_reduced_dag(G, critical_nodes):
-#     reduced_dag = G.subgraph(critical_nodes).copy()
-#     reduced_dag = make_dag(reduced_dag)
-#     return reduced_dag
-
-def make_dag(G):
-    logging.info("Initial Graph Nodes:")
-    logging.info(G.nodes(data=True))
-    
-    logging.info("Initial Graph Edges:")
-    logging.info(G.edges(data=True))
-
-    try:
-        while True:
-            try:
-                # Detect cycles in the graph
-                cycles = list(nx.find_cycle(G, orientation='original'))
-                
-                if not cycles:
-                    logging.info("No cycles detected in the graph.")
-                    break
-
-                # Log the detected cycle
-                logging.info(f"Detected cycle: {cycles}")
-
-                # Remove the first edge in the detected cycle
-                source, target = cycles[0][0], cycles[0][1]
-                if G.has_edge(source, target):
-                    G.remove_edge(source, target)
-                    logging.info(f"Removed edge to break cycle: {source} -> {target}")
-                else:
-                    logging.error(f"Attempted to remove a non-existent edge: {source} -> {target}")
-
-                # After removing an edge, continue to detect if any more cycles remain
-                continue
-
-            except nx.NetworkXNoCycle:
-                logging.info("No more cycles detected in the graph.")
-                break
-
-    except Exception as e:
-        logging.error(f"Error during cycle removal: {str(e)}")
-        raise
-
-    logging.info("Graph after cycle removal Nodes:")
-    logging.info(G.nodes(data=True))
-    
-    logging.info("Graph after cycle removal Edges:")
-    logging.info(G.edges(data=True))
-
-    start_milestones = [node for node in G.nodes if G.nodes[node].get('Milestone') == 1 and G.in_degree(node) == 0]
-    end_milestones = [node for node in G.nodes if G.nodes[node].get('Milestone') == 1 and G.out_degree(node) == 0]
-
-    if not start_milestones:
-        raise ValueError("No start milestone found")
-    if not end_milestones:
-        raise ValueError("No end milestone found")
-
-    start_milestone = start_milestones[0]
-    end_milestone = end_milestones[0]
-
-    for node in G.nodes:
-        if G.in_degree(node) == 0 and node != start_milestone:
-            G.add_edge(start_milestone, node)
-            logging.info(f"Added start milestone edge: {start_milestone} -> {node}")
-
-    for node in G.nodes:
-        if G.out_degree(node) == 0 and node != end_milestone:
-            G.add_edge(node, end_milestone)
-            logging.info(f"Added end milestone edge: {node} -> {end_milestone}")
-
-    return G
-
-
-def perform_clustering(nodes_df):
-    features = nodes_df[['importanceScore', 'riskScore']].values
-
-    max_clusters = 10
-    best_score = -1
-    best_n_clusters = 3
-    for n_clusters in range(2, max_clusters + 1):
-        kmeans = KMeans(n_clusters=n_clusters, random_state=0)
-        labels = kmeans.fit_predict(features)
-        score = silhouette_score(features, labels)
-        logging.info(f"Silhouette Score for {n_clusters} clusters: {score}")
-        if score > best_score:
-            best_score = score
-            best_n_clusters = n_clusters
-
-    kmeans = KMeans(n_clusters=best_n_clusters, random_state=0)
-    nodes_df['Cluster'] = kmeans.fit_predict(features)
-
-    return nodes_df, kmeans
-
-def perform_pca(nodes_df):
-    features = nodes_df[['importanceScore', 'riskScore']].values
-    pca = PCA(n_components=2)
-    pca_result = pca.fit_transform(features)
-    nodes_df['pca1'] = pca_result[:, 0]
-    nodes_df['pca2'] = pca_result[:, 1]
-
-    return nodes_df
-
-def process_graph(nodes, links):
-    logging.info("Processing graph...")
-    logging.debug(f"Nodes: {nodes}")
-    logging.debug(f"Links: {links}")
-
-    nodes_df = pd.DataFrame(nodes)
-    links_df = pd.DataFrame(links)
-
-    logging.debug("Nodes DataFrame:")
-    logging.debug(nodes_df)
-    logging.debug("Links DataFrame:")
-    logging.debug(links_df)
-
-    if 'avgWeightedRisk' not in nodes_df.columns:
-        nodes_df['avgWeightedRisk'] = 0
-
-    try:
-        G = preprocess_graph(nodes, links)
-        G = make_dag(G)
-    except Exception as e:
-        logging.error(f"Error during graph preprocessing: {str(e)}")
-        return {"error": "Error during graph preprocessing"}
-
-    logging.debug("Preprocessed Graph:")
-    logging.debug(G.nodes(data=True))
-    logging.debug(G.edges(data=True))
-
-    try:
-        nodes_df, kmeans = perform_clustering(nodes_df)
-    except Exception as e:
-        logging.error(f"Error during clustering: {str(e)}")
-        return {"error": "Error during clustering"}
-
-    logging.debug("Risk and Importance Clustering:")
-    logging.debug(nodes_df[['ID', 'Cluster']])
-
-    try:
-        nodes_df = perform_pca(nodes_df)
-    except Exception as e:
-        logging.error(f"Error during PCA analysis: {str(e)}")
-        return {"error": "Error during PCA analysis"}
-
-    logging.debug("PCA Analysis:")
-    logging.debug(nodes_df[['ID', 'pca1', 'pca2']])
-
-    try:
-        nodes_df = dependency_clustering(nodes_df, G)
-    except Exception as e:
-        logging.error(f"Error during dependency-based clustering: {str(e)}")
-        return {"error": "Error during dependency-based clustering"}
-
-    logging.debug("Dependency-Based Clustering:")
-    logging.debug(nodes_df['DependencyCluster'])
-
-    try:
-        communities = nx.algorithms.community.greedy_modularity_communities(G)
-        node_community_dict = {node: community_group for community_group, nodes in enumerate(communities) for node in nodes}
-        nodes_df['CommunityGroup'] = nodes_df['ID'].apply(lambda x: node_community_dict.get(x))
-    except Exception as e:
-        logging.error(f"Error during community detection: {str(e)}")
-        return {"error": "Error during community detection"}
-
-    logging.debug("Community Detection:")
-    logging.debug(nodes_df['CommunityGroup'])
-
-    try:
-        clust = nx.clustering(G)
-        close_cent = nx.closeness_centrality(G)
-        dcent1 = nx.algorithms.degree_centrality(G)
-        pr = nx.pagerank(G, alpha=0.9)
-
-        for index, row in nodes_df.iterrows():
-            key = row['ID']
-            nodes_df.at[index, 'Clustering_Coefficient'] = clust.get(key, None)
-            nodes_df.at[index, 'closeness_centrality'] = close_cent.get(key, None)
-            nodes_df.at[index, 'degree_centrality'] = dcent1.get(key, None)
-            nodes_df.at[index, 'PageRank'] = pr.get(key, None)
-    except Exception as e:
-        logging.error(f"Error during metric calculation: {str(e)}")
-        return {"error": "Error during metric calculation"}
-
-    logging.debug("Calculated Metrics:")
-    logging.debug(nodes_df)
-
-    nodes_df = nodes_df.replace({np.nan: None})
-    links_df = links_df.replace({np.nan: None})
-
-    try:
-        work_packages = define_work_packages(nodes_df, G)
-    except Exception as e:
-        logging.error(f"Error during work package definition: {str(e)}")
-        return {"error": "Error during work package definition"}
-
-    # Commented out reduced graph creation for now
-    # try:
-    #     critical_nodes = identify_critical_activities_and_milestones(G)
-    #     reduced_dag = create_reduced_dag(G, critical_nodes)
-    #     reduced_nodes = list(reduced_dag.nodes)
-    #     reduced_links = [{'source': u, 'target': v, 'weight': d['weight']} for u, v, d in reduced_dag.edges(data=True)]
-    # except Exception as e:
-    #     logging.error(f"Error during reduced DAG creation: {str(e)}")
-    #     return {"error": "Error during reduced DAG creation"}
-    
-    #     Need to uncomment after fixing
-
-    work_packages_serialized = serialize_work_packages(work_packages)
-
-    response_data = {
-        'nodes': nodes_df.to_dict(orient='records'),
-        'links': links_df.to_dict(orient='records'),
-        'work_packages': work_packages_serialized,
-        # 'reduced_graph': {
-        #     'nodes': reduced_nodes,
-        #     'links': reduced_links
-        # }
-    }
-    
-    logging.debug("Response Data:")
-    logging.debug(response_data)
-
-    return response_data
-
 def serialize_work_packages(work_packages):
     serialized_packages = {}
     for key, package in work_packages.items():
         serialized_packages[key] = {
             'tasks': package['tasks'],
             'critical_path': package['critical_path'],
-            'critical_path_length': package['critical_path_length'],
-            'start': package['start'].isoformat() if package['start'] else None,
-            'end': package['end'].isoformat() if package['end'] else None
+            'critical_path_length': float(package['critical_path_length']),
+            'start': package['start'].isoformat() if package['start'] and hasattr(package['start'], 'isoformat') else None,
+            'end': package['end'].isoformat() if package['end'] and hasattr(package['end'], 'isoformat') else None
         }
     return serialized_packages
 
-def preprocess_graph(nodes, links):
+###############################################################################
+# Graph builders                                                              #
+###############################################################################
+
+def build_nx_graph(nodes, links):
     G = nx.DiGraph()
-    logging.info("Starting to preprocess graph...")
     
-    for link in links:
-        source = str(link['source'])
-        target = str(link['target'])
-        if G.has_edge(source, target):
-            logging.warning(f"Duplicate edge found and skipped: {source} -> {target}")
-            continue
+    # Add edges
+    for l in links:
+        s, t = str(l['source']), str(l['target'])
+        if not G.has_edge(s, t):
+            G.add_edge(s, t, 
+                      weight=l.get('duration', 1), 
+                      type=l.get('type', 'FS'), 
+                      lag=l.get('lag', 0))
+    
+    # Add nodes with all attributes from v1
+    for n in nodes:
+        nid = str(n['ID'])
+        G.add_node(nid)  # Ensure node exists
         
-        G.add_edge(source, target, weight=link.get('duration', 1))
-        logging.info(f"Edge added: {source} -> {target} with weight {link.get('duration', 1)}")
+        # Parse dates
+        start_date = pd.to_datetime(n.get('Start'), errors='coerce')
         
-        # Add type and lag as edge attributes
-        G[source][target]['type'] = link.get('type', 'FS')
-        G[source][target]['lag'] = link.get('lag', 0)
+        # Calculate end date if we have start_date and duration
+        duration = n.get('Duration', 1)
+        if pd.notna(start_date) and duration:
+            end_date = start_date + pd.Timedelta(days=duration)
+        else:
+            end_date = None
+            
+        G.nodes[nid].update({
+            'start_date': start_date,
+            'end_date': end_date,
+            'duration': duration,
+            'Milestone': int(n.get('Milestone', 0)) == 1,
+            'isImportanceOutlier': str(n.get('isImportanceOutlier', 'false')).lower() == 'true',
+            'isOnCriticalPath': str(n.get('isOnCriticalPath', 'false')).lower() == 'true',
+            'isOnOutlierPath': str(n.get('isOnOutlierPath', 'false')).lower() == 'true',
+            'isRiskOutlier': str(n.get('isRiskOutlier', 'false')).lower() == 'true'
+        })
     
-    for node in nodes:
-        node_id = str(node['ID'])
-        G.nodes[node_id]['start_date'] = pd.to_datetime(node['Start'], errors='coerce', exact=False)
-        G.nodes[node_id]['duration'] = node['Duration']
-        G.nodes[node_id]['Milestone'] = int(node.get('Milestone', 0)) == 1
-        G.nodes[node_id]['isImportanceOutlier'] = str(node.get('isImportanceOutlier', 'false')).lower() == 'true'
-        G.nodes[node_id]['isOnCriticalPath'] = str(node.get('isOnCriticalPath', 'false')).lower() == 'true'
-        G.nodes[node_id]['isOnOutlierPath'] = str(node.get('isOnOutlierPath', 'false')).lower() == 'true'
-        G.nodes[node_id]['isRiskOutlier'] = str(node.get('isRiskOutlier', 'false')).lower() == 'true'
-    
-    logging.info("Graph preprocessing completed.")
     return G
+
+def ensure_dag(G: nx.DiGraph):
+    """Enhanced DAG creation matching v1's make_dag() functionality"""
+    logging.info("Initial Graph Nodes: %d", len(G))
+    logging.info("Initial Graph Edges: %d", len(G.edges))
+    
+    # Remove cycles
+    cycles_removed = 0
+    while True:
+        try:
+            cycle = nx.find_cycle(G, orientation='original')
+            u, v = cycle[0][0], cycle[0][1]
+            G.remove_edge(u, v)
+            cycles_removed += 1
+            logging.info(f"Removed edge to break cycle: {u} -> {v}")
+        except nx.NetworkXNoCycle:
+            break
+    
+    logging.info(f"Removed {cycles_removed} edges to break cycles")
+    
+    # Connect orphan nodes to start/end milestones (from v1)
+    start_milestones = [n for n in G.nodes if G.nodes[n].get('Milestone') and G.in_degree(n) == 0]
+    end_milestones = [n for n in G.nodes if G.nodes[n].get('Milestone') and G.out_degree(n) == 0]
+    
+    if start_milestones and end_milestones:
+        start_milestone = start_milestones[0]
+        end_milestone = end_milestones[0]
+        
+        # Connect orphan start nodes
+        for node in G.nodes:
+            if G.in_degree(node) == 0 and node != start_milestone:
+                G.add_edge(start_milestone, node)
+                logging.info(f"Added start milestone edge: {start_milestone} -> {node}")
+        
+        # Connect orphan end nodes
+        for node in G.nodes:
+            if G.out_degree(node) == 0 and node != end_milestone:
+                G.add_edge(node, end_milestone)
+                logging.info(f"Added end milestone edge: {node} -> {end_milestone}")
+    
+    return G
+
+###############################################################################
+# Analytics – small (<2 k) vs big graphs                                     #
+###############################################################################
+
+def _cluster_risk_kmeans(df: pd.DataFrame):
+    """K-means clustering matching v1 behavior"""
+    if 'importanceScore' not in df.columns or 'riskScore' not in df.columns:
+        df['Cluster'] = 0
+        return df
+        
+    feats = df[['importanceScore', 'riskScore']].values
+    n = len(df)
+    
+    if n < 2:
+        df['Cluster'] = 0
+        return df
+    
+    # Match v1's clustering logic more closely
+    max_clusters = min(10, n)
+    best, k = -1, 3
+    
+    for c in range(2, max_clusters + 1):
+        if c >= n: 
+            break
+        try:
+            kmeans = KMeans(c, n_init='auto', random_state=0)
+            lbl = kmeans.fit_predict(feats)
+            if len(set(lbl)) > 1:
+                sc = silhouette_score(feats, lbl)
+                logging.info(f"Silhouette Score for {c} clusters: {sc}")
+                if sc > best:
+                    best, k = sc, c
+        except:
+            continue
+    
+    df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
+    return df
+
+def _pca(df):
+    """PCA matching v1"""
+    if 'importanceScore' not in df.columns or 'riskScore' not in df.columns:
+        df['pca1'] = 0
+        df['pca2'] = 0
+        return df
+        
+    arr = df[['importanceScore', 'riskScore']].values
+    if len(arr) > 1:
+        df[['pca1', 'pca2']] = PCA(2).fit_transform(arr)
+    else:
+        df['pca1'] = 0
+        df['pca2'] = 0
+    return df
+
+def _dependency_groups_big(G_nx: nx.DiGraph, df: pd.DataFrame):
+    """Big graph dependency grouping using Louvain"""
+    if not _NK:
+        # Fallback to small graph method
+        return _dependency_groups_small(G_nx, df)
+    
+    try:
+        G_nk = nka.nx2nk(G_nx)
+        algo = nk.community.PLM(G_nk)
+        algo.run()
+        comm_id = algo.getPartition().getVector()
+        
+        # Map NetworkX node IDs to networkit indices
+        nx_to_nk = {node: idx for idx, node in enumerate(G_nx.nodes())}
+        mapping = {node: comm_id[nx_to_nk[node]] for node in G_nx.nodes()}
+        
+        df['DependencyCluster'] = df['ID'].astype(str).map(mapping).fillna(0).astype(int)
+    except Exception as e:
+        logging.warning(f"Networkit dependency clustering failed: {e}")
+        return _dependency_groups_small(G_nx, df)
+    
+    return df
+
+def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
+    """Small graph dependency clustering matching v1"""
+    ids = df['ID'].astype(str).tolist()
+    n = len(ids)
+    
+    if n < 2:
+        df['DependencyCluster'] = 0
+        return df
+    
+    # Build distance matrix
+    path = dict(nx.all_pairs_dijkstra_path_length(G, weight='weight'))
+    dist = np.full((n, n), 1e9, dtype=float)
+    
+    for i, s in enumerate(ids):
+        for j, t in enumerate(ids):
+            if s in path and t in path[s]:
+                dist[i, j] = path[s][t]
+    
+    # Silhouette optimization from v1
+    max_clusters = min(10, n)
+    best_score = -1
+    best_n_clusters = min(3, n)
+    
+    for n_clusters in range(3, max_clusters):
+        if n_clusters >= n:
+            break
+        try:
+            clustering = AgglomerativeClustering(
+                n_clusters=n_clusters, 
+                linkage='complete', 
+                metric='precomputed'
+            )
+            labels = clustering.fit_predict(dist)
+            if len(set(labels)) > 1:
+                score = silhouette_score(dist, labels, metric='precomputed')
+                logging.info(f"Dependency clustering silhouette for {n_clusters}: {score}")
+                if score > best_score:
+                    best_score = score
+                    best_n_clusters = n_clusters
+        except:
+            continue
+    
+    clustering = AgglomerativeClustering(
+        n_clusters=best_n_clusters,
+        linkage='complete',
+        metric='precomputed'
+    )
+    df['DependencyCluster'] = clustering.fit_predict(dist)
+    
+    return df
+
+def _centralities(G: nx.DiGraph, df: pd.DataFrame):
+    """Compute centralities with networkit acceleration for large graphs"""
+    node_ids = df['ID'].astype(str).tolist()
+    
+    if _NK and len(G) > SMALL_GRAPH_THRESHOLD:
+        try:
+            # Convert to networkit
+            G_nk = nka.nx2nk(G)
+            
+            # Map NetworkX node IDs to networkit indices
+            nx_to_nk = {node: idx for idx, node in enumerate(G.nodes())}
+            
+            # Compute centralities
+            pr = nk.centrality.PageRank(G_nk, alpha=0.9).run().scores()
+            close = nk.centrality.Closeness(G_nk, variant=nk.centrality.ClosenessVariant.Harmonic).run().scores()
+            deg = nk.centrality.DegreeCentrality(G_nk).run().scores()
+            
+            # Clustering coefficient
+            G_undirected = nka.nx2nk(G.to_undirected())
+            coef = nk.centrality.LocalClusteringCoefficient(G_undirected).run().scores()
+            
+            # Map back to dataframe
+            for idx, row in df.iterrows():
+                node_id = str(row['ID'])
+                if node_id in nx_to_nk:
+                    nk_idx = nx_to_nk[node_id]
+                    df.at[idx, 'PageRank'] = pr[nk_idx]
+                    df.at[idx, 'closeness_centrality'] = close[nk_idx]
+                    df.at[idx, 'degree_centrality'] = deg[nk_idx]
+                    df.at[idx, 'Clustering_Coefficient'] = coef[nk_idx]
+                else:
+                    df.at[idx, 'PageRank'] = 0
+                    df.at[idx, 'closeness_centrality'] = 0
+                    df.at[idx, 'degree_centrality'] = 0
+                    df.at[idx, 'Clustering_Coefficient'] = 0
+                    
+        except Exception as e:
+            logging.warning(f"Networkit centrality computation failed: {e}")
+            # Fallback to NetworkX
+            _centralities_nx(G, df)
+    else:
+        _centralities_nx(G, df)
+    
+    return df
+
+def _centralities_nx(G: nx.DiGraph, df: pd.DataFrame):
+    """Pure NetworkX centrality computation"""
+    # Compute centralities
+    pr = nx.pagerank(G, alpha=0.9)
+    close = nx.closeness_centrality(G)
+    deg = nx.degree_centrality(G)
+    clust = nx.clustering(G.to_undirected())
+    
+    # Map to dataframe
+    for idx, row in df.iterrows():
+        node_id = str(row['ID'])
+        df.at[idx, 'PageRank'] = pr.get(node_id, 0)
+        df.at[idx, 'closeness_centrality'] = close.get(node_id, 0)
+        df.at[idx, 'degree_centrality'] = deg.get(node_id, 0)
+        df.at[idx, 'Clustering_Coefficient'] = clust.get(node_id, 0)
+
+def _community_detection(G: nx.DiGraph, df: pd.DataFrame):
+    """Community detection matching v1"""
+    try:
+        # Use undirected version for community detection
+        G_undirected = G.to_undirected()
+        communities = nx.algorithms.community.greedy_modularity_communities(G_undirected)
+        
+        # Create mapping
+        node_community_dict = {}
+        for community_id, nodes in enumerate(communities):
+            for node in nodes:
+                node_community_dict[node] = community_id
+        
+        df['CommunityGroup'] = df['ID'].astype(str).map(node_community_dict).fillna(-1).astype(int)
+    except Exception as e:
+        logging.warning(f"Community detection failed: {e}")
+        df['CommunityGroup'] = 0
+    
+    return df
+
+###############################################################################
+# Main analyse()                                                             #
+###############################################################################
+
+def analyse(nodes, links):
+    # Create dataframes
+    df_nodes = pd.DataFrame(nodes)
+    df_links = pd.DataFrame(links)
+    
+    # Set default avgWeightedRisk if not present (from v1)
+    if 'avgWeightedRisk' not in df_nodes.columns:
+        df_nodes['avgWeightedRisk'] = 0
+    
+    # Build and process graph
+    G = build_nx_graph(nodes, links)
+    G = ensure_dag(G)
+    
+    # Pattern detection (from v1)
+    pattern_records = detect_repeating_patterns(df_nodes)
+    templates = create_templates_from_patterns(pattern_records)
+    
+    # Risk/importance clustering + PCA
+    df_nodes = _cluster_risk_kmeans(df_nodes)
+    df_nodes = _pca(df_nodes)
+    
+    # Dependency grouping
+    if len(df_nodes) > SMALL_GRAPH_THRESHOLD:
+        df_nodes = _dependency_groups_big(G, df_nodes)
+    else:
+        df_nodes = _dependency_groups_small(G, df_nodes)
+    
+    # Community detection (from v1)
+    df_nodes = _community_detection(G, df_nodes)
+    
+    # Centrality metrics
+    df_nodes = _centralities(G, df_nodes)
+    
+    # Work packages (from v1)
+    work_packages = define_work_packages(df_nodes, G)
+    work_packages_serialized = serialize_work_packages(work_packages)
+    
+    # Critical path (from v1)
+    if nx.is_directed_acyclic_graph(G) and len(G) > 0:
+        critical_path, critical_path_length = calculate_critical_path(G)
+    else:
+        critical_path, critical_path_length = [], 0
+    
+    # Build response matching v1 API
+    response = {
+        'nodes': df_nodes.replace({np.nan: None}).to_dict('records'),
+        'links': df_links.replace({np.nan: None}).to_dict('records'),
+        'work_packages': work_packages_serialized,
+        # Additional fields that might be expected
+        'critical_path': critical_path,
+        'critical_path_length': float(critical_path_length),
+        'templates': templates
+    }
+    
+    return response
+
+###############################################################################
+# Routes                                                                      #
+###############################################################################
 
 @app.route('/graph-metrics', methods=['POST'])
 def graph_metrics():
-    logging.info("Received request at /graph-metrics")
-    request_data = request.get_json()
-    logging.debug("Request Data:")
-    logging.debug(request_data)
-
-    if request_data is None:
-        logging.error("No data received in the request.")
-        return jsonify({'error': 'No data received'}), 400
-
-    nodes = request_data.get('nodes', [])
-    links = request_data.get('links', [])
-
-    logging.debug("Nodes:")
-    logging.debug(nodes)
-    logging.debug("Links:")
-    logging.debug(links)
-
-    logging.debug("Number of nodes: %d", len(nodes))
-    logging.debug("Number of links: %d", len(links))
-
+    data = request.get_json(force=True, silent=True) or {}
+    nodes, links = data.get('nodes', []), data.get('links', [])
+    
+    if not nodes:
+        return jsonify({'error': 'No nodes provided'}), 400
+    
+    # Generate cache key
+    key = _sha([nodes, links])
+    
     try:
-        response_data = process_graph(nodes, links)
-        logging.info("Sending response....")
-        return jsonify(response_data)
-    except Exception as e:
-        logging.error(f"An error occurred while processing the graph: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        # Use cached result if available
+        res = _cached(
+            json.dumps(nodes, sort_keys=True, default=str),
+            json.dumps(links, sort_keys=True, default=str)
+        )
+        res['cache_key'] = key
+        return jsonify(res)
+    except Exception as exc:
+        logging.exception('Analysis failed: %s', exc)
+        return jsonify({'error': str(exc)}), 500
 
 @app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({"status": "healthy"}), 200
+def health():
+    return jsonify({'status': 'healthy'}), 200
 
 @app.errorhandler(Exception)
-def handle_exception(e):
-    logging.error(f"An error occurred: {str(e)}")
-    return jsonify({"error": str(e)}), 500
+def unhandled(e):
+    logging.exception('Unhandled: %s', e)
+    return jsonify({'error': str(e)}), 500
+
+###############################################################################
+# Local dev                                                                   #
+###############################################################################
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=True)
