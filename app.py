@@ -1,5 +1,5 @@
 ﻿"""
-Pyth‑Sched‑Analytics • Optimised v2.0 (scales to 10 k × 500 k)
+Pyth‑Sched‑Analytics • Optimised v23.0 (scales to 10 k × 500 k)
 ==============================================================
 """
 
