@@ -66,12 +66,12 @@ jobs:
       - name: Azure Login
         uses: azure/login@v2 # Updated to v2
         with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_B6A38D2446ED4D1CB4E4E128B393666F }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_65436CB7846C41FF8EB9050FBFB74AF6 }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_6EE819F7C4B9480AAA19454152E04199 }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_7450a932-75f2-4733-af66-568bdb474ebf }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_6b8edcc8-cbde-4cf1-b1cd-49c91f45ab77 }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_8e4dd1dd-06d7-47ec-8387-da9fbd6fd437 }}
 
       - name: 'Deploy to Azure Web App'
-        uses: azure/webapps-deploy@v3 # Updated to v3
+        uses: azure/webapps-deploy@v3 # Updated to v3 
         id: deploy-to-webapp
         with:
           app-name: 'Python-Sched-Analytics'

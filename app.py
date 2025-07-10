@@ -15,6 +15,10 @@ from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
 
+
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+CORS(app)  # Enable CORS for all routes and origins
 # Optional high‑performance graph library
 try:
     import networkit as nk
