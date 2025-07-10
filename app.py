@@ -50,6 +50,22 @@ CORS(app,
 def _sha(payload):
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
+def parse_date_safe(date_str):
+    """Parse date string and ensure it's timezone-naive"""
+    if date_str is None:
+        return None
+    try:
+        date = pd.to_datetime(date_str, errors='coerce')
+        if date is pd.NaT:
+            return None
+        # Remove timezone info if present
+        if hasattr(date, 'tz') and date.tz is not None:
+            date = date.tz_localize(None)
+        return date
+    except Exception as e:
+        logging.warning(f"Date parsing error for {date_str}: {e}")
+        return None
+
 @lru_cache(maxsize=32)
 def _cached(nodes_json: str, links_json: str):
     return analyse(json.loads(nodes_json), json.loads(links_json))
@@ -130,10 +146,28 @@ def define_work_packages(nodes_df, G):
                 sub_critical_path = []
                 sub_critical_duration = 0
 
-            start_dates = [G.nodes[node].get('start_date') for node in subgraph 
-                          if G.nodes[node].get('start_date') is not None]
-            end_dates = [G.nodes[node].get('end_date') for node in subgraph 
-                        if G.nodes[node].get('end_date') is not None]
+            # Get dates and ensure they're timezone-naive
+            start_dates = []
+            end_dates = []
+            
+            for node in subgraph:
+                start_date = G.nodes[node].get('start_date')
+                end_date = G.nodes[node].get('end_date')
+                
+                # Handle timezone-aware dates
+                if start_date is not None and hasattr(start_date, 'tz_localize'):
+                    if start_date.tz is not None:
+                        start_date = start_date.tz_localize(None)
+                    start_dates.append(start_date)
+                elif start_date is not None:
+                    start_dates.append(start_date)
+                    
+                if end_date is not None and hasattr(end_date, 'tz_localize'):
+                    if end_date.tz is not None:
+                        end_date = end_date.tz_localize(None)
+                    end_dates.append(end_date)
+                elif end_date is not None:
+                    end_dates.append(end_date)
 
             if not start_dates or not end_dates:
                 logging.warning(f"No valid dates for cluster {cluster}. Skipping.")
@@ -154,13 +188,42 @@ def define_work_packages(nodes_df, G):
 def serialize_work_packages(work_packages):
     serialized_packages = {}
     for key, package in work_packages.items():
-        serialized_packages[key] = {
-            'tasks': package['tasks'],
-            'critical_path': package['critical_path'],
-            'critical_path_length': float(package['critical_path_length']),
-            'start': package['start'].isoformat() if package['start'] and hasattr(package['start'], 'isoformat') else None,
-            'end': package['end'].isoformat() if package['end'] and hasattr(package['end'], 'isoformat') else None
-        }
+        try:
+            # Safely serialize dates
+            start_date = package['start']
+            end_date = package['end']
+            
+            # Convert to ISO format string, handling timezone issues
+            if start_date is not None:
+                if hasattr(start_date, 'tz') and start_date.tz is not None:
+                    start_date = start_date.tz_localize(None)
+                start_str = start_date.isoformat() if hasattr(start_date, 'isoformat') else str(start_date)
+            else:
+                start_str = None
+                
+            if end_date is not None:
+                if hasattr(end_date, 'tz') and end_date.tz is not None:
+                    end_date = end_date.tz_localize(None)
+                end_str = end_date.isoformat() if hasattr(end_date, 'isoformat') else str(end_date)
+            else:
+                end_str = None
+            
+            serialized_packages[key] = {
+                'tasks': package['tasks'],
+                'critical_path': package['critical_path'],
+                'critical_path_length': float(package['critical_path_length']),
+                'start': start_str,
+                'end': end_str
+            }
+        except Exception as e:
+            logging.warning(f"Error serializing work package {key}: {e}")
+            serialized_packages[key] = {
+                'tasks': package.get('tasks', []),
+                'critical_path': package.get('critical_path', []),
+                'critical_path_length': float(package.get('critical_path_length', 0)),
+                'start': None,
+                'end': None
+            }
     return serialized_packages
 
 ###############################################################################
@@ -184,13 +247,16 @@ def build_nx_graph(nodes, links):
         nid = str(n['ID'])
         G.add_node(nid)  # Ensure node exists
         
-        # Parse dates
-        start_date = pd.to_datetime(n.get('Start'), errors='coerce')
+        # Parse dates - handle timezone issues
+        start_date = parse_date_safe(n.get('Start'))
         
         # Calculate end date if we have start_date and duration
         duration = n.get('Duration', 1)
-        if pd.notna(start_date) and duration:
-            end_date = start_date + pd.Timedelta(days=duration)
+        if start_date is not None and duration:
+            try:
+                end_date = start_date + pd.Timedelta(days=duration)
+            except Exception:
+                end_date = None
         else:
             end_date = None
             
@@ -461,60 +527,69 @@ def _community_detection(G: nx.DiGraph, df: pd.DataFrame):
 ###############################################################################
 
 def analyse(nodes, links):
-    # Create dataframes
-    df_nodes = pd.DataFrame(nodes)
-    df_links = pd.DataFrame(links)
-    
-    # Set default avgWeightedRisk if not present (from v1)
-    if 'avgWeightedRisk' not in df_nodes.columns:
-        df_nodes['avgWeightedRisk'] = 0
-    
-    # Build and process graph
-    G = build_nx_graph(nodes, links)
-    G = ensure_dag(G)
-    
-    # Pattern detection (from v1)
-    pattern_records = detect_repeating_patterns(df_nodes)
-    templates = create_templates_from_patterns(pattern_records)
-    
-    # Risk/importance clustering + PCA
-    df_nodes = _cluster_risk_kmeans(df_nodes)
-    df_nodes = _pca(df_nodes)
-    
-    # Dependency grouping
-    if len(df_nodes) > SMALL_GRAPH_THRESHOLD:
-        df_nodes = _dependency_groups_big(G, df_nodes)
-    else:
-        df_nodes = _dependency_groups_small(G, df_nodes)
-    
-    # Community detection (from v1)
-    df_nodes = _community_detection(G, df_nodes)
-    
-    # Centrality metrics
-    df_nodes = _centralities(G, df_nodes)
-    
-    # Work packages (from v1)
-    work_packages = define_work_packages(df_nodes, G)
-    work_packages_serialized = serialize_work_packages(work_packages)
-    
-    # Critical path (from v1)
-    if nx.is_directed_acyclic_graph(G) and len(G) > 0:
-        critical_path, critical_path_length = calculate_critical_path(G)
-    else:
-        critical_path, critical_path_length = [], 0
-    
-    # Build response matching v1 API
-    response = {
-        'nodes': df_nodes.replace({np.nan: None}).to_dict('records'),
-        'links': df_links.replace({np.nan: None}).to_dict('records'),
-        'work_packages': work_packages_serialized,
-        # Additional fields that might be expected
-        'critical_path': critical_path,
-        'critical_path_length': float(critical_path_length),
-        'templates': templates
-    }
-    
-    return response
+    try:
+        # Create dataframes
+        df_nodes = pd.DataFrame(nodes)
+        df_links = pd.DataFrame(links)
+        
+        # Set default avgWeightedRisk if not present (from v1)
+        if 'avgWeightedRisk' not in df_nodes.columns:
+            df_nodes['avgWeightedRisk'] = 0
+        
+        # Build and process graph
+        G = build_nx_graph(nodes, links)
+        G = ensure_dag(G)
+        
+        # Pattern detection (from v1)
+        pattern_records = detect_repeating_patterns(df_nodes)
+        templates = create_templates_from_patterns(pattern_records)
+        
+        # Risk/importance clustering + PCA
+        df_nodes = _cluster_risk_kmeans(df_nodes)
+        df_nodes = _pca(df_nodes)
+        
+        # Dependency grouping
+        if len(df_nodes) > SMALL_GRAPH_THRESHOLD:
+            df_nodes = _dependency_groups_big(G, df_nodes)
+        else:
+            df_nodes = _dependency_groups_small(G, df_nodes)
+        
+        # Community detection (from v1)
+        df_nodes = _community_detection(G, df_nodes)
+        
+        # Centrality metrics
+        df_nodes = _centralities(G, df_nodes)
+        
+        # Work packages (from v1)
+        work_packages = define_work_packages(df_nodes, G)
+        work_packages_serialized = serialize_work_packages(work_packages)
+        
+        # Critical path (from v1)
+        if nx.is_directed_acyclic_graph(G) and len(G) > 0:
+            critical_path, critical_path_length = calculate_critical_path(G)
+        else:
+            critical_path, critical_path_length = [], 0
+        
+        # Build response matching v1 API
+        response = {
+            'nodes': df_nodes.replace({np.nan: None}).to_dict('records'),
+            'links': df_links.replace({np.nan: None}).to_dict('records'),
+            'work_packages': work_packages_serialized,
+            # Additional fields that might be expected
+            'critical_path': critical_path,
+            'critical_path_length': float(critical_path_length),
+            'templates': templates
+        }
+        
+        return response
+        
+    except Exception as e:
+        logging.exception(f"Analysis error: {str(e)}")
+        # Provide more specific error messages
+        if "tz-naive and tz-aware" in str(e):
+            raise ValueError("Timezone mismatch in date data. Please ensure all dates are in the same format.")
+        else:
+            raise
 
 ###############################################################################
 # Routes                                                                      #
@@ -551,7 +626,11 @@ def graph_metrics():
         return response
     except Exception as exc:
         logging.exception('Analysis failed: %s', exc)
-        response = jsonify({'error': str(exc)})
+        # Provide cleaner error messages
+        error_msg = str(exc)
+        if "tz-naive and tz-aware" in error_msg:
+            error_msg = "Date format inconsistency detected. Please ensure all dates are in the same timezone format."
+        response = jsonify({'error': error_msg})
         response.headers.add('Access-Control-Allow-Origin', '*')
         return response, 500
 
