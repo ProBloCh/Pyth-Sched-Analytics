@@ -1,6 +1,7 @@
 ﻿"""
-Pyth‑Sched‑Analytics • Optimised v23.0 (scales to 10 k × 500 k)
+Pyth‑Sched‑Analytics • Optimised v2.0 (scales to 10 k × 500 k)
 ==============================================================
+FIXED VERSION - Now includes all v1 functionality
 """
 
 import os, json, logging, hashlib
@@ -15,10 +16,6 @@ from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
 
-
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
-CORS(app)  # Enable CORS for all routes and origins
 # Optional high‑performance graph library
 try:
     import networkit as nk
@@ -37,9 +34,14 @@ SMALL_GRAPH_THRESHOLD = int(os.getenv("SMALL_GRAPH_THRESHOLD", 2000))
 ###############################################################################
 
 app = Flask(__name__)
-CORS(app)
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s » %(message)s")
+
+# Enable CORS with explicit configuration
+CORS(app, 
+     resources={r"/*": {"origins": "*"}},
+     allow_headers=["Content-Type", "Authorization"],
+     methods=["GET", "POST", "OPTIONS"])
 
 ###############################################################################
 # Helpers                                                                     #
@@ -518,8 +520,16 @@ def analyse(nodes, links):
 # Routes                                                                      #
 ###############################################################################
 
-@app.route('/graph-metrics', methods=['POST'])
+@app.route('/graph-metrics', methods=['POST', 'OPTIONS'])
 def graph_metrics():
+    # Handle preflight
+    if request.method == 'OPTIONS':
+        response = jsonify({'status': 'ok'})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST')
+        return response
+    
     data = request.get_json(force=True, silent=True) or {}
     nodes, links = data.get('nodes', []), data.get('links', [])
     
@@ -536,19 +546,51 @@ def graph_metrics():
             json.dumps(links, sort_keys=True, default=str)
         )
         res['cache_key'] = key
-        return jsonify(res)
+        response = jsonify(res)
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response
     except Exception as exc:
         logging.exception('Analysis failed: %s', exc)
-        return jsonify({'error': str(exc)}), 500
+        response = jsonify({'error': str(exc)})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 500
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'healthy'}), 200
+    response = jsonify({'status': 'healthy'})
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    return response
+
+@app.route('/test-cors', methods=['GET', 'POST', 'OPTIONS'])
+def test_cors():
+    """Test endpoint to verify CORS is working"""
+    if request.method == 'OPTIONS':
+        response = jsonify({'status': 'preflight ok'})
+    else:
+        response = jsonify({
+            'status': 'cors test ok',
+            'method': request.method,
+            'origin': request.headers.get('Origin', 'no origin header')
+        })
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    return response
 
 @app.errorhandler(Exception)
 def unhandled(e):
     logging.exception('Unhandled: %s', e)
-    return jsonify({'error': str(e)}), 500
+    response = jsonify({'error': str(e)})
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    return response, 500
+
+@app.after_request
+def after_request(response):
+    """Ensure CORS headers are always present"""
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    return response
 
 ###############################################################################
 # Local dev                                                                   #
@@ -556,4 +598,5 @@ def unhandled(e):
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    # Enable CORS in development mode
+    app.run(host='0.0.0.0', port=port, debug=False)
