@@ -71,7 +71,7 @@ jobs:
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_6EE819F7C4B9480AAA19454152E04199 }}
 
       - name: 'Deploy to Azure Web App'
-        uses: azure/webapps-deploy@v3 # Updated to v3 
+        uses: azure/webapps-deploy@v3 # Updated to v3
         id: deploy-to-webapp
         with:
           app-name: 'Python-Sched-Analytics'

@@ -102,7 +102,7 @@ def identify_critical_activities_and_milestones(G):
     return set(critical_activities)
 
 ###############################################################################
-# Work Packages (from v1)                                                     # 
+# Work Packages (from v1)                                                     #
 ###############################################################################
 
 def define_work_packages(nodes_df, G):
