@@ -30,5 +30,5 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # Use gunicorn instead of python directly (production-ready) 
-# Matches your Azure deployment: 2 workers, 2 threads
+# Matches your Azure deployment: 2 workers, 2 threads 
 CMD ["gunicorn", "--workers", "2", "--threads", "2", "--bind", "0.0.0.0:8000", "--timeout", "120", "app:app"]

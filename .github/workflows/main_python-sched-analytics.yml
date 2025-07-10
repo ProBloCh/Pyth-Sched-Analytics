@@ -17,10 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python version
-        uses: actions/setup-python@v1
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Create and start virtual environment
         run: |
@@ -62,7 +63,7 @@ jobs:
         run: unzip release.zip
 
       
-      - name: Login to Azure
+      - name: Azure Login
         uses: azure/login@v2 # Updated to v2
         with:
           client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_B6A38D2446ED4D1CB4E4E128B393666F }}
@@ -70,9 +71,9 @@ jobs:
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_6EE819F7C4B9480AAA19454152E04199 }}
 
       - name: 'Deploy to Azure Web App'
-        uses: azure/webapps-deploy@v3 # Updated to v3 
+        uses: azure/webapps-deploy@v3 # Updated to v3
         id: deploy-to-webapp
         with:
           app-name: 'Python-Sched-Analytics'
-          slot-name: 'Production'
+          slot-name: 'production'
           
