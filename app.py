@@ -348,8 +348,14 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
                     best, k = sc, c
         except:
             continue
-    
-    df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
+
+    # --- guard against asking for more clusters than we have samples ----
+    k = min(k, max(1, n))          # e.g. n=2 ⇒ k=2
+    # if all points identical silhouette may fail – fall back to a single cluster
+    try:
+        df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
+    except ValueError:
+        df['Cluster'] = 0
     return df
 
 def _pca(df):
