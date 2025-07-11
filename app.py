@@ -4,9 +4,14 @@ Pyth‑Sched‑Analytics • Optimised v2.0 (scales to 10 k × 500 k)
 FIXED VERSION - Now includes all v1 functionality
 """
 
-import os, json, logging, hashlib
+import os, json, logging, hashlib, time
 from functools import lru_cache
 from datetime import datetime
+
+# Set BLAS threads to prevent CPU contention with Gunicorn
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -28,6 +33,10 @@ else:
     import networkx as nx
 
 SMALL_GRAPH_THRESHOLD = int(os.getenv("SMALL_GRAPH_THRESHOLD", 2000))
+MAX_PATTERN_NODES = int(os.getenv("MAX_PATTERN_NODES", 1000))
+MAX_PATTERNS = int(os.getenv("MAX_PATTERNS", 10))
+CACHE_SIZE = int(os.getenv("CACHE_SIZE", 32))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 120))
 
 ###############################################################################
 # Flask setup                                                                 #
@@ -66,9 +75,18 @@ def parse_date_safe(date_str):
         logging.warning(f"Date parsing error for {date_str}: {e}")
         return None
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=CACHE_SIZE)
 def _cached(nodes_json: str, links_json: str):
     return analyse(json.loads(nodes_json), json.loads(links_json))
+
+def _hash_request(nodes, links):
+    """Create a more efficient hash of the request"""
+    # Sort nodes and links for consistent hashing
+    nodes_sorted = sorted(nodes, key=lambda x: x.get('ID', 0))
+    links_sorted = sorted(links, key=lambda x: (x.get('source', ''), x.get('target', '')))
+    return hashlib.md5(
+        f"{len(nodes)}-{len(links)}-{json.dumps(nodes_sorted[:5])}-{json.dumps(links_sorted[:5])}".encode()
+    ).hexdigest()
 
 ###############################################################################
 # Pattern Detection (from v1)                                                 #
@@ -78,11 +96,22 @@ def detect_repeating_patterns(nodes_df):
     if 'TaskType' not in nodes_df.columns:
         logging.warning("No 'TaskType' column found in nodes data. Skipping pattern detection.")
         return []
+    
+    # Limit pattern detection to first MAX_PATTERN_NODES for memory efficiency
+    if len(nodes_df) > MAX_PATTERN_NODES:
+        logging.info(f"Large graph detected ({len(nodes_df)} nodes). Sampling first {MAX_PATTERN_NODES} for pattern detection.")
+        sample_df = nodes_df.head(MAX_PATTERN_NODES)
+    else:
+        sample_df = nodes_df
 
-    nodes_df['pattern_id'] = pd.factorize(nodes_df['TaskType'] + '_' +
-                                          nodes_df['Duration'].astype(str) + '_' +
-                                          nodes_df['Resources'].astype(str))[0]
-    pattern_records = [group_df for _, group_df in nodes_df.groupby('pattern_id') if len(group_df) > 1]
+    sample_df['pattern_id'] = pd.factorize(sample_df['TaskType'] + '_' +
+                                          sample_df['Duration'].astype(str) + '_' +
+                                          sample_df['Resources'].astype(str))[0]
+    pattern_records = [group_df for _, group_df in sample_df.groupby('pattern_id') if len(group_df) > 1]
+    
+    # Limit to top MAX_PATTERNS by frequency
+    pattern_records = sorted(pattern_records, key=len, reverse=True)[:MAX_PATTERNS]
+    
     return pattern_records
 
 def create_templates_from_patterns(pattern_records):
@@ -126,62 +155,55 @@ def identify_critical_activities_and_milestones(G):
 def define_work_packages(nodes_df, G):
     work_packages = {}
     
-    if 'Cluster' in nodes_df.columns:
-        for cluster in nodes_df['Cluster'].unique():
-            cluster_nodes = nodes_df[nodes_df['Cluster'] == cluster]
-            tasks = cluster_nodes['ID'].astype(str).tolist()
-
-            # Ensure all nodes exist in the graph
-            tasks = [t for t in tasks if t in G]
-            if not tasks:
-                continue
-
-            subgraph = G.subgraph(tasks)
-            
-            # Check if subgraph is a DAG before computing longest path
-            if nx.is_directed_acyclic_graph(subgraph) and len(subgraph) > 0:
-                sub_critical_path = nx.dag_longest_path(subgraph, weight='duration')
-                sub_critical_duration = nx.dag_longest_path_length(subgraph, weight='duration')
-            else:
-                sub_critical_path = []
-                sub_critical_duration = 0
-
-            # Get dates and ensure they're timezone-naive
-            start_dates = []
-            end_dates = []
-            
-            for node in subgraph:
-                start_date = G.nodes[node].get('start_date')
-                end_date = G.nodes[node].get('end_date')
-                
-                # Handle timezone-aware dates
-                if start_date is not None and hasattr(start_date, 'tz_localize'):
-                    if start_date.tz is not None:
-                        start_date = start_date.tz_localize(None)
-                    start_dates.append(start_date)
-                elif start_date is not None:
-                    start_dates.append(start_date)
-                    
-                if end_date is not None and hasattr(end_date, 'tz_localize'):
-                    if end_date.tz is not None:
-                        end_date = end_date.tz_localize(None)
-                    end_dates.append(end_date)
-                elif end_date is not None:
-                    end_dates.append(end_date)
-
-            if not start_dates or not end_dates:
-                logging.warning(f"No valid dates for cluster {cluster}. Skipping.")
-                continue
-
-            work_packages[f'Package_{cluster}'] = {
-                'tasks': tasks,
-                'critical_path': sub_critical_path,
-                'critical_path_length': sub_critical_duration,
-                'start': min(start_dates) if start_dates else None,
-                'end': max(end_dates) if end_dates else None
-            }
-    else:
+    if 'Cluster' not in nodes_df.columns:
         logging.warning("Cluster data not found in DataFrame.")
+        return work_packages
+    
+    # Pre-extract dates from graph for efficiency
+    node_dates = {}
+    for node in G.nodes():
+        node_dates[node] = {
+            'start': G.nodes[node].get('start_date'),
+            'end': G.nodes[node].get('end_date')
+        }
+    
+    # Process each cluster
+    for cluster in nodes_df['Cluster'].unique():
+        cluster_nodes = nodes_df[nodes_df['Cluster'] == cluster]
+        tasks = cluster_nodes['ID'].astype(str).tolist()
+
+        # Ensure all nodes exist in the graph
+        tasks = [t for t in tasks if t in G]
+        if not tasks:
+            continue
+
+        subgraph = G.subgraph(tasks)
+        
+        # Check if subgraph is a DAG before computing longest path
+        if nx.is_directed_acyclic_graph(subgraph) and len(subgraph) > 0:
+            sub_critical_path = nx.dag_longest_path(subgraph, weight='duration')
+            sub_critical_duration = nx.dag_longest_path_length(subgraph, weight='duration')
+        else:
+            sub_critical_path = []
+            sub_critical_duration = 0
+
+        # Efficient date collection using pre-extracted data
+        valid_starts = [node_dates[t]['start'] for t in tasks 
+                       if t in node_dates and node_dates[t]['start'] is not None]
+        valid_ends = [node_dates[t]['end'] for t in tasks 
+                     if t in node_dates and node_dates[t]['end'] is not None]
+
+        if not valid_starts or not valid_ends:
+            logging.warning(f"No valid dates for cluster {cluster}. Skipping.")
+            continue
+
+        work_packages[f'Package_{cluster}'] = {
+            'tasks': tasks,
+            'critical_path': sub_critical_path,
+            'critical_path_length': sub_critical_duration,
+            'start': min(valid_starts),
+            'end': max(valid_ends)
+        }
 
     return work_packages
 
@@ -242,28 +264,23 @@ def build_nx_graph(nodes, links):
                       type=l.get('type', 'FS'), 
                       lag=l.get('lag', 0))
     
-    # Add nodes with all attributes from v1
-    for n in nodes:
-        nid = str(n['ID'])
+    # Vectorized date parsing for all nodes at once
+    nodes_df = pd.DataFrame(nodes)
+    nodes_df['start_date'] = pd.to_datetime(nodes_df.get('Start'), errors='coerce', utc=False).dt.tz_localize(None)
+    nodes_df['duration'] = nodes_df.get('Duration', 1).fillna(1)
+    
+    # Vectorized end date calculation
+    nodes_df['end_date'] = nodes_df['start_date'] + pd.to_timedelta(nodes_df['duration'], unit='D')
+    
+    # Add nodes with all attributes
+    for idx, n in nodes_df.iterrows():
+        nid = str(n.get('ID', idx))
         G.add_node(nid)  # Ensure node exists
         
-        # Parse dates - handle timezone issues
-        start_date = parse_date_safe(n.get('Start'))
-        
-        # Calculate end date if we have start_date and duration
-        duration = n.get('Duration', 1)
-        if start_date is not None and duration:
-            try:
-                end_date = start_date + pd.Timedelta(days=duration)
-            except Exception:
-                end_date = None
-        else:
-            end_date = None
-            
         G.nodes[nid].update({
-            'start_date': start_date,
-            'end_date': end_date,
-            'duration': duration,
+            'start_date': n['start_date'] if pd.notna(n['start_date']) else None,
+            'end_date': n['end_date'] if pd.notna(n['end_date']) else None,
+            'duration': n['duration'],
             'Milestone': int(n.get('Milestone', 0)) == 1,
             'isImportanceOutlier': str(n.get('isImportanceOutlier', 'false')).lower() == 'true',
             'isOnCriticalPath': str(n.get('isOnCriticalPath', 'false')).lower() == 'true',
@@ -319,7 +336,7 @@ def ensure_dag(G: nx.DiGraph):
 ###############################################################################
 
 def _cluster_risk_kmeans(df: pd.DataFrame):
-    """K-means clustering matching v1 behavior"""
+    """K-means clustering matching v1 behavior with optimizations"""
     if 'importanceScore' not in df.columns or 'riskScore' not in df.columns:
         df['Cluster'] = 0
         return df
@@ -331,9 +348,18 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
         df['Cluster'] = 0
         return df
     
-    # Match v1's clustering logic more closely
+    # Early exit for small datasets - skip expensive silhouette scoring
+    if n <= 15:
+        k = min(3, n)
+        try:
+            df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
+        except ValueError:  # Handles identical points or other KMeans issues
+            df['Cluster'] = 0
+        return df
+    
+    # Full silhouette optimization for larger datasets
     max_clusters = min(10, n)
-    best, k = -1, 3
+    best, k = -1, min(3, n)
     
     for c in range(2, max_clusters + 1):
         if c >= n: 
@@ -348,14 +374,14 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
                     best, k = sc, c
         except:
             continue
-
-    # --- guard against asking for more clusters than we have samples ----
-    k = min(k, max(1, n))          # e.g. n=2 ⇒ k=2
-    # if all points identical silhouette may fail – fall back to a single cluster
+    
+    # Guard against edge cases
+    k = min(k, max(1, n))
     try:
         df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
     except ValueError:
         df['Cluster'] = 0
+    
     return df
 
 def _pca(df):
@@ -397,7 +423,7 @@ def _dependency_groups_big(G_nx: nx.DiGraph, df: pd.DataFrame):
     return df
 
 def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
-    """Small graph dependency clustering matching v1"""
+    """Small graph dependency clustering with optimized distance matrix"""
     ids = df['ID'].astype(str).tolist()
     n = len(ids)
     
@@ -405,53 +431,76 @@ def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
         df['DependencyCluster'] = 0
         return df
     
-    # Build distance matrix
-    path = dict(nx.all_pairs_dijkstra_path_length(G, weight='weight'))
-    dist = np.full((n, n), 1e9, dtype=float)
-    
-    for i, s in enumerate(ids):
-        for j, t in enumerate(ids):
-            if s in path and t in path[s]:
-                dist[i, j] = path[s][t]
-    
-    # Silhouette optimization from v1
-    max_clusters = min(10, n)
-    best_score = -1
-    best_n_clusters = min(3, n)
-    
-    for n_clusters in range(3, max_clusters):
-        if n_clusters >= n:
-            break
-        try:
-            clustering = AgglomerativeClustering(
-                n_clusters=n_clusters, 
-                linkage='complete', 
-                metric='precomputed'
-            )
-            labels = clustering.fit_predict(dist)
-            if len(set(labels)) > 1:
-                score = silhouette_score(dist, labels, metric='precomputed')
-                logging.info(f"Dependency clustering silhouette for {n_clusters}: {score}")
-                if score > best_score:
-                    best_score = score
-                    best_n_clusters = n_clusters
-        except:
-            continue
-    
-    clustering = AgglomerativeClustering(
-        n_clusters=best_n_clusters,
-        linkage='complete',
-        metric='precomputed'
-    )
-    df['DependencyCluster'] = clustering.fit_predict(dist)
+    try:
+        # Optimized distance matrix building
+        dist = np.full((n, n), 1e9, dtype=float)
+        lengths = dict(nx.all_pairs_dijkstra_path_length(G, weight='weight'))
+        
+        # Vectorized assignment
+        id_to_idx = {id_val: idx for idx, id_val in enumerate(ids)}
+        for i, s in enumerate(ids):
+            if s in lengths:
+                targets = [(id_to_idx[t], l) for t, l in lengths[s].items() if t in id_to_idx]
+                if targets:
+                    indices, values = zip(*targets)
+                    dist[i, list(indices)] = list(values)
+        
+        # Check if we have any valid distances
+        if np.all(dist == 1e9):
+            logging.warning("No connected paths found. Using default clustering.")
+            df['DependencyCluster'] = 0
+            return df
+        
+        # Early exit for very small graphs
+        if n <= 5:
+            best_n_clusters = min(2, n)
+        else:
+            # Silhouette optimization
+            max_clusters = min(10, n // 2)  # At least 2 nodes per cluster
+            best_score = -1
+            best_n_clusters = min(3, n)
+            
+            for n_clusters in range(2, max_clusters + 1):
+                if n_clusters >= n:
+                    break
+                try:
+                    clustering = AgglomerativeClustering(
+                        n_clusters=n_clusters, 
+                        linkage='complete', 
+                        metric='precomputed'
+                    )
+                    labels = clustering.fit_predict(dist)
+                    if len(set(labels)) > 1:
+                        score = silhouette_score(dist, labels, metric='precomputed')
+                        logging.info(f"Dependency clustering silhouette for {n_clusters}: {score:.3f}")
+                        if score > best_score:
+                            best_score = score
+                            best_n_clusters = n_clusters
+                except Exception as e:
+                    logging.warning(f"Clustering failed for {n_clusters} clusters: {e}")
+                    continue
+        
+        # Guard against edge cases
+        best_n_clusters = min(best_n_clusters, n)
+        clustering = AgglomerativeClustering(
+            n_clusters=best_n_clusters,
+            linkage='complete',
+            metric='precomputed'
+        )
+        df['DependencyCluster'] = clustering.fit_predict(dist)
+        
+    except Exception as e:
+        logging.error(f"Dependency clustering failed: {e}")
+        df['DependencyCluster'] = 0
     
     return df
 
 def _centralities(G: nx.DiGraph, df: pd.DataFrame):
-    """Compute centralities with networkit acceleration for large graphs"""
+    """Compute centralities with networkit acceleration when available"""
     node_ids = df['ID'].astype(str).tolist()
     
-    if _NK and len(G) > SMALL_GRAPH_THRESHOLD:
+    # Use networkit for better performance if available (even for smaller graphs)
+    if _NK and len(G) > 100:  # Lowered threshold from SMALL_GRAPH_THRESHOLD
         try:
             # Convert to networkit
             G_nk = nka.nx2nk(G)
@@ -483,6 +532,7 @@ def _centralities(G: nx.DiGraph, df: pd.DataFrame):
                     df.at[idx, 'degree_centrality'] = 0
                     df.at[idx, 'Clustering_Coefficient'] = 0
                     
+            logging.info(f"Used networkit for centralities on {len(G)} nodes")
         except Exception as e:
             logging.warning(f"Networkit centrality computation failed: {e}")
             # Fallback to NetworkX
@@ -534,13 +584,35 @@ def _community_detection(G: nx.DiGraph, df: pd.DataFrame):
 
 def analyse(nodes, links):
     try:
+        # Validate input
+        if not nodes:
+            return {
+                'error': 'No nodes provided',
+                'nodes': [],
+                'links': [],
+                'work_packages': {},
+                'critical_path': [],
+                'critical_path_length': 0,
+                'templates': {}
+            }
+        
         # Create dataframes
         df_nodes = pd.DataFrame(nodes)
         df_links = pd.DataFrame(links)
         
-        # Set default avgWeightedRisk if not present (from v1)
-        if 'avgWeightedRisk' not in df_nodes.columns:
-            df_nodes['avgWeightedRisk'] = 0
+        # Ensure required columns exist with defaults
+        for col, default in [
+            ('ID', lambda: range(len(df_nodes))),
+            ('Duration', 1),
+            ('importanceScore', 5),
+            ('riskScore', 5),
+            ('avgWeightedRisk', 0),
+            ('Resources', ''),
+            ('Dependencies', ''),
+            ('TaskType', 'Task')
+        ]:
+            if col not in df_nodes.columns:
+                df_nodes[col] = default() if callable(default) else default
         
         # Build and process graph
         G = build_nx_graph(nodes, links)
@@ -603,6 +675,8 @@ def analyse(nodes, links):
 
 @app.route('/graph-metrics', methods=['POST', 'OPTIONS'])
 def graph_metrics():
+    start_time = time.time()
+    
     # Handle preflight
     if request.method == 'OPTIONS':
         response = jsonify({'status': 'ok'})
@@ -617,6 +691,9 @@ def graph_metrics():
     if not nodes:
         return jsonify({'error': 'No nodes provided'}), 400
     
+    # Log request size
+    logging.info(f"Processing graph with {len(nodes)} nodes and {len(links)} links")
+    
     # Generate cache key
     key = _sha([nodes, links])
     
@@ -627,6 +704,12 @@ def graph_metrics():
             json.dumps(links, sort_keys=True, default=str)
         )
         res['cache_key'] = key
+        
+        # Log processing time
+        elapsed = time.time() - start_time
+        logging.info(f"Graph processed in {elapsed:.2f}s (nodes: {len(nodes)}, links: {len(links)})")
+        res['processing_time'] = elapsed
+        
         response = jsonify(res)
         response.headers.add('Access-Control-Allow-Origin', '*')
         return response
