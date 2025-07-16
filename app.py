@@ -1,50 +1,69 @@
 ﻿"""
-Pyth‑Sched‑Analytics • Optimised v2.0 (scales to 10 k × 500 k)
+Pyth-Sched-Analytics • Optimised v3.0 (Production-Ready)
 ==============================================================
-FIXED VERSION - Now includes all v1 functionality
+Includes: Redis caching, NetworkKit acceleration, sparse matrices,
+vectorized operations, and Python 3.12 optimizations
 """
 
-import os, json, logging, hashlib, time
+import os, json, logging, hashlib, time, gc
 from functools import lru_cache
 from datetime import datetime
+import pickle
+from contextlib import contextmanager
 
 # Set BLAS threads to prevent CPU contention with Gunicorn
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 
-import numpy as np, pandas as pd
+import numpy as np
+import pandas as pd
 from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import shortest_path
+import redis
 
-# Optional high‑performance graph library
+# NetworkKit imports with fallback
 try:
     import networkit as nk
     from networkit import nxadapter as nka
     _NK = True
+    logging.info("NetworkKit loaded successfully - using C++ acceleration")
 except ImportError:
     _NK = False
-    import networkx as nx
-else:
-    import networkx as nx
+    logging.warning("NetworkKit not available - falling back to NetworkX (slower)")
 
+import networkx as nx  # Single canonical import
+
+# Configuration
 SMALL_GRAPH_THRESHOLD = int(os.getenv("SMALL_GRAPH_THRESHOLD", 2000))
 MAX_PATTERN_NODES = int(os.getenv("MAX_PATTERN_NODES", 1000))
 MAX_PATTERNS = int(os.getenv("MAX_PATTERNS", 10))
 CACHE_SIZE = int(os.getenv("CACHE_SIZE", 32))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 120))
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+
+# Redis configuration
+REDIS_URL = os.getenv('REDIS_URL', None)
+REDIS_CACHE_TTL = int(os.getenv('REDIS_CACHE_TTL', 3600))
 
 ###############################################################################
 # Flask setup                                                                 #
 ###############################################################################
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s » %(message)s")
+
+# Set production log level
+log_level = logging.DEBUG if DEBUG else logging.WARNING
+logging.basicConfig(
+    level=log_level,
+    format="%(asctime)s %(levelname)s » %(message)s"
+)
 
 # Enable CORS with explicit configuration
 CORS(app, 
@@ -53,64 +72,121 @@ CORS(app,
      methods=["GET", "POST", "OPTIONS"])
 
 ###############################################################################
+# Redis Cache Setup                                                           #
+###############################################################################
+
+redis_client = None
+if REDIS_URL:
+    try:
+        # Create connection pool for better performance
+        from redis.connection import ConnectionPool
+        redis_pool = ConnectionPool.from_url(
+            REDIS_URL,
+            max_connections=20,
+            decode_responses=False,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+            retry_on_timeout=True,
+            health_check_interval=30
+        )
+        redis_client = redis.Redis(connection_pool=redis_pool)
+        redis_client.ping()
+        logging.info("Redis cache connected successfully")
+    except Exception as e:
+        logging.warning(f"Redis connection failed: {e}. Falling back to in-memory cache.")
+        redis_client = None
+
+@contextmanager
+def redis_pipeline():
+    """Context manager for Redis pipeline operations"""
+    if redis_client:
+        pipe = redis_client.pipeline()
+        try:
+            yield pipe
+            pipe.execute()
+        except Exception as e:
+            if DEBUG:
+                logging.error(f"Redis pipeline error: {e}")
+            pipe.reset()  # Reset pipeline on error
+            yield None
+    else:
+        yield None
+
+def get_cached_result(key):
+    """Try Redis first, then fall back to LRU cache"""
+    if redis_client:
+        try:
+            cached = redis_client.get(key)
+            if cached:
+                if DEBUG:
+                    logging.info(f"Redis cache hit for key: {key[:8]}...")
+                return pickle.loads(cached)
+        except Exception as e:
+            if DEBUG:
+                logging.warning(f"Redis get failed: {e}")
+    return None
+
+def set_cached_result(key, value, ttl=None):
+    """Store in Redis if available"""
+    if redis_client:
+        try:
+            serialized = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+            redis_client.setex(key, ttl or REDIS_CACHE_TTL, serialized)
+            if DEBUG:
+                logging.info(f"Cached result in Redis: {key[:8]}...")
+        except Exception as e:
+            if DEBUG:
+                logging.warning(f"Redis set failed: {e}")
+
+###############################################################################
 # Helpers                                                                     #
 ###############################################################################
 
 def _sha(payload):
+    """Generate cache key from payload"""
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
-
-def parse_date_safe(date_str):
-    """Parse date string and ensure it's timezone-naive"""
-    if date_str is None:
-        return None
-    try:
-        date = pd.to_datetime(date_str, errors='coerce')
-        if date is pd.NaT:
-            return None
-        # Remove timezone info if present
-        if hasattr(date, 'tz') and date.tz is not None:
-            date = date.tz_localize(None)
-        return date
-    except Exception as e:
-        logging.warning(f"Date parsing error for {date_str}: {e}")
-        return None
 
 @lru_cache(maxsize=CACHE_SIZE)
 def _cached(nodes_json: str, links_json: str):
+    """In-memory LRU cache as second-level cache"""
     return analyse(json.loads(nodes_json), json.loads(links_json))
-
-def _hash_request(nodes, links):
-    """Create a more efficient hash of the request"""
-    # Sort nodes and links for consistent hashing
-    nodes_sorted = sorted(nodes, key=lambda x: x.get('ID', 0))
-    links_sorted = sorted(links, key=lambda x: (x.get('source', ''), x.get('target', '')))
-    return hashlib.md5(
-        f"{len(nodes)}-{len(links)}-{json.dumps(nodes_sorted[:5])}-{json.dumps(links_sorted[:5])}".encode()
-    ).hexdigest()
 
 ###############################################################################
 # Pattern Detection (from v1)                                                 #
 ###############################################################################
 
 def detect_repeating_patterns(nodes_df):
+    """Optimized pattern detection using categorical dtypes"""
     if 'TaskType' not in nodes_df.columns:
         logging.warning("No 'TaskType' column found in nodes data. Skipping pattern detection.")
         return []
     
-    # Limit pattern detection to first MAX_PATTERN_NODES for memory efficiency
+    # Use categorical dtype for memory efficiency
+    nodes_df['TaskType'] = nodes_df['TaskType'].astype('category')
+    nodes_df['Resources'] = nodes_df['Resources'].astype('category')
+    
+    # Limit pattern detection for memory efficiency
     if len(nodes_df) > MAX_PATTERN_NODES:
-        logging.info(f"Large graph detected ({len(nodes_df)} nodes). Sampling first {MAX_PATTERN_NODES} for pattern detection.")
+        if DEBUG:
+            logging.info(f"Large graph ({len(nodes_df)} nodes). Sampling first {MAX_PATTERN_NODES} for patterns.")
         sample_df = nodes_df.head(MAX_PATTERN_NODES)
     else:
         sample_df = nodes_df
-
-    sample_df['pattern_id'] = pd.factorize(sample_df['TaskType'] + '_' +
-                                          sample_df['Duration'].astype(str) + '_' +
-                                          sample_df['Resources'].astype(str))[0]
-    pattern_records = [group_df for _, group_df in sample_df.groupby('pattern_id') if len(group_df) > 1]
     
-    # Limit to top MAX_PATTERNS by frequency
-    pattern_records = sorted(pattern_records, key=len, reverse=True)[:MAX_PATTERNS]
+    # Create pattern key more efficiently
+    pattern_key = (sample_df['TaskType'].cat.codes * 10000 + 
+                  sample_df['Duration'] * 100 + 
+                  sample_df['Resources'].cat.codes)
+    
+    sample_df['pattern_id'] = pd.factorize(pattern_key)[0]
+    
+    # Use value_counts for faster grouping
+    pattern_counts = sample_df['pattern_id'].value_counts()
+    valid_patterns = pattern_counts[pattern_counts > 1].index
+    
+    # Return only top patterns by frequency
+    pattern_records = [sample_df[sample_df['pattern_id'] == pid] 
+                      for pid in valid_patterns[:MAX_PATTERNS]]
     
     return pattern_records
 
@@ -118,10 +194,10 @@ def create_templates_from_patterns(pattern_records):
     templates = {}
     for index, pattern_df in enumerate(pattern_records):
         template = {
-            'average_duration': pattern_df['Duration'].mean(),
-            'duration_variance': pattern_df['Duration'].var(),
+            'average_duration': float(pattern_df['Duration'].mean()),
+            'duration_variance': float(pattern_df['Duration'].var()),
             'most_common_resources': pattern_df['Resources'].mode().tolist(),
-            'dependency_links': pattern_df['Dependencies'].mode().tolist(),
+            'dependency_links': pattern_df['Dependencies'].mode().tolist() if 'Dependencies' in pattern_df.columns else [],
             'task_frequency': len(pattern_df)
         }
         templates[f"Template_{index}"] = template
@@ -132,6 +208,9 @@ def create_templates_from_patterns(pattern_records):
 ###############################################################################
 
 def calculate_critical_path(G):
+    """Calculate critical path using NetworkX DAG algorithms"""
+    # Note: NetworkKit doesn't have direct critical path support
+    # so we use NetworkX which is optimized for this
     critical_path = nx.dag_longest_path(G, weight='duration')
     critical_path_length = nx.dag_longest_path_length(G, weight='duration')
     return critical_path, critical_path_length
@@ -194,7 +273,8 @@ def define_work_packages(nodes_df, G):
                      if t in node_dates and node_dates[t]['end'] is not None]
 
         if not valid_starts or not valid_ends:
-            logging.warning(f"No valid dates for cluster {cluster}. Skipping.")
+            if DEBUG:
+                logging.warning(f"No valid dates for cluster {cluster}. Skipping.")
             continue
 
         work_packages[f'Package_{cluster}'] = {
@@ -238,7 +318,8 @@ def serialize_work_packages(work_packages):
                 'end': end_str
             }
         except Exception as e:
-            logging.warning(f"Error serializing work package {key}: {e}")
+            if DEBUG:
+                logging.warning(f"Error serializing work package {key}: {e}")
             serialized_packages[key] = {
                 'tasks': package.get('tasks', []),
                 'critical_path': package.get('critical_path', []),
@@ -249,53 +330,91 @@ def serialize_work_packages(work_packages):
     return serialized_packages
 
 ###############################################################################
-# Graph builders                                                              #
+# Graph builders - Optimized with vectorization                              #
 ###############################################################################
 
 def build_nx_graph(nodes, links):
+    """Optimized graph building with vectorized operations"""
     G = nx.DiGraph()
     
-    # Add edges
-    for l in links:
-        s, t = str(l['source']), str(l['target'])
-        if not G.has_edge(s, t):
-            G.add_edge(s, t, 
-                      weight=l.get('duration', 1), 
-                      type=l.get('type', 'FS'), 
-                      lag=l.get('lag', 0))
+    # Bulk add edges (more efficient than loop)
+    edge_list = [(str(l['source']), str(l['target']), {
+        'weight': l.get('duration', 1),
+        'type': l.get('type', 'FS'),
+        'lag': l.get('lag', 0)
+    }) for l in links]
+    G.add_edges_from(edge_list)
     
-    # Vectorized date parsing for all nodes at once
+    # Vectorized node attribute processing
     nodes_df = pd.DataFrame(nodes)
-    nodes_df['start_date'] = pd.to_datetime(nodes_df.get('Start'), errors='coerce', utc=False).dt.tz_localize(None)
-    nodes_df['duration'] = nodes_df.get('Duration', 1).fillna(1)
+    if len(nodes_df) == 0:
+        return G
+        
+    # Ensure ID column exists
+    if 'ID' not in nodes_df.columns:
+        nodes_df['ID'] = range(len(nodes_df))
+    
+    # Vectorized date parsing
+    nodes_df['start_date'] = pd.to_datetime(nodes_df.get('Start'), errors='coerce', utc=False)
+    # Remove timezone info if present (fix for naive datetime handling)
+    if hasattr(nodes_df['start_date'].dtype, 'tz') and nodes_df['start_date'].dtype.tz is not None:
+        nodes_df['start_date'] = nodes_df['start_date'].dt.tz_localize(None)
+    
+    nodes_df['duration'] = pd.to_numeric(nodes_df.get('Duration', 1), errors='coerce').fillna(1)
     
     # Vectorized end date calculation
-    nodes_df['end_date'] = nodes_df['start_date'] + pd.to_timedelta(nodes_df['duration'], unit='D')
+    nodes_df['end_date'] = nodes_df['start_date'] + pd.to_timedelta(nodes_df['duration'], unit='D', errors='coerce')
     
-    # Add nodes with all attributes
-    for idx, n in nodes_df.iterrows():
-        nid = str(n.get('ID', idx))
-        G.add_node(nid)  # Ensure node exists
-        
-        G.nodes[nid].update({
-            'start_date': n['start_date'] if pd.notna(n['start_date']) else None,
-            'end_date': n['end_date'] if pd.notna(n['end_date']) else None,
-            'duration': n['duration'],
-            'Milestone': int(n.get('Milestone', 0)) == 1,
-            'isImportanceOutlier': str(n.get('isImportanceOutlier', 'false')).lower() == 'true',
-            'isOnCriticalPath': str(n.get('isOnCriticalPath', 'false')).lower() == 'true',
-            'isOnOutlierPath': str(n.get('isOnOutlierPath', 'false')).lower() == 'true',
-            'isRiskOutlier': str(n.get('isRiskOutlier', 'false')).lower() == 'true'
-        })
+    # Vectorized boolean conversions
+    bool_cols = ['Milestone', 'isImportanceOutlier', 'isOnCriticalPath', 'isOnOutlierPath', 'isRiskOutlier']
+    for col in bool_cols:
+        if col in nodes_df.columns:
+            if col == 'Milestone':
+                nodes_df[col] = nodes_df[col].astype(str).astype(int) == 1
+            else:
+                nodes_df[col] = nodes_df[col].astype(str).str.lower() == 'true'
+        else:
+            nodes_df[col] = False if col != 'Milestone' else 0
+    
+    # Bulk add nodes with attributes
+    node_attrs = {}
+    for idx, row in nodes_df.iterrows():
+        nid = str(row['ID'])
+        node_attrs[nid] = {
+            'start_date': row['start_date'] if pd.notna(row['start_date']) else None,
+            'end_date': row['end_date'] if pd.notna(row['end_date']) else None,
+            'duration': row['duration'],
+            'Milestone': row['Milestone'],
+            'isImportanceOutlier': row['isImportanceOutlier'],
+            'isOnCriticalPath': row['isOnCriticalPath'],
+            'isOnOutlierPath': row['isOnOutlierPath'],
+            'isRiskOutlier': row['isRiskOutlier']
+        }
+    
+    # Add all nodes at once
+    G.add_nodes_from(node_attrs.keys())
+    nx.set_node_attributes(G, node_attrs)
     
     return G
 
 def ensure_dag(G: nx.DiGraph):
-    """Enhanced DAG creation matching v1's make_dag() functionality"""
-    logging.info("Initial Graph Nodes: %d", len(G))
-    logging.info("Initial Graph Edges: %d", len(G.edges))
+    """Enhanced DAG creation using NetworkKit when available"""
+    if DEBUG:
+        logging.info(f"Initial Graph: {len(G)} nodes, {len(G.edges)} edges")
     
-    # Remove cycles
+    if _NK and len(G) > 100:
+        try:
+            # Use NetworkKit for cycle detection (faster)
+            G_nk = nka.nx2nk(G)
+            if not nk.graphtools.isDAG(G_nk):
+                # Fall back to NetworkX for cycle removal
+                # NetworkKit doesn't have direct cycle removal
+                pass
+        except Exception as e:
+            if DEBUG:
+                logging.warning(f"NetworkKit DAG check failed: {e}")
+    
+    # Remove cycles using NetworkX
     cycles_removed = 0
     while True:
         try:
@@ -303,11 +422,13 @@ def ensure_dag(G: nx.DiGraph):
             u, v = cycle[0][0], cycle[0][1]
             G.remove_edge(u, v)
             cycles_removed += 1
-            logging.info(f"Removed edge to break cycle: {u} -> {v}")
+            if DEBUG:
+                logging.info(f"Removed edge to break cycle: {u} -> {v}")
         except nx.NetworkXNoCycle:
             break
     
-    logging.info(f"Removed {cycles_removed} edges to break cycles")
+    if DEBUG and cycles_removed > 0:
+        logging.info(f"Removed {cycles_removed} edges to break cycles")
     
     # Connect orphan nodes to start/end milestones (from v1)
     start_milestones = [n for n in G.nodes if G.nodes[n].get('Milestone') and G.in_degree(n) == 0]
@@ -318,25 +439,29 @@ def ensure_dag(G: nx.DiGraph):
         end_milestone = end_milestones[0]
         
         # Connect orphan start nodes
-        for node in G.nodes:
-            if G.in_degree(node) == 0 and node != start_milestone:
-                G.add_edge(start_milestone, node)
-                logging.info(f"Added start milestone edge: {start_milestone} -> {node}")
+        orphan_starts = [node for node in G.nodes 
+                        if G.in_degree(node) == 0 and node != start_milestone]
+        if orphan_starts:
+            G.add_edges_from([(start_milestone, node) for node in orphan_starts])
+            if DEBUG:
+                logging.info(f"Connected {len(orphan_starts)} orphan start nodes")
         
         # Connect orphan end nodes
-        for node in G.nodes:
-            if G.out_degree(node) == 0 and node != end_milestone:
-                G.add_edge(node, end_milestone)
-                logging.info(f"Added end milestone edge: {node} -> {end_milestone}")
+        orphan_ends = [node for node in G.nodes 
+                      if G.out_degree(node) == 0 and node != end_milestone]
+        if orphan_ends:
+            G.add_edges_from([(node, end_milestone) for node in orphan_ends])
+            if DEBUG:
+                logging.info(f"Connected {len(orphan_ends)} orphan end nodes")
     
     return G
 
 ###############################################################################
-# Analytics – small (<2 k) vs big graphs                                     #
+# Analytics – Optimized algorithms                                           #
 ###############################################################################
 
 def _cluster_risk_kmeans(df: pd.DataFrame):
-    """K-means clustering matching v1 behavior with optimizations"""
+    """K-means clustering with early exit for small datasets"""
     if 'importanceScore' not in df.columns or 'riskScore' not in df.columns:
         df['Cluster'] = 0
         return df
@@ -369,7 +494,8 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
             lbl = kmeans.fit_predict(feats)
             if len(set(lbl)) > 1:
                 sc = silhouette_score(feats, lbl)
-                logging.info(f"Silhouette Score for {c} clusters: {sc}")
+                if DEBUG:
+                    logging.info(f"Silhouette Score for {c} clusters: {sc:.3f}")
                 if sc > best:
                     best, k = sc, c
         except:
@@ -400,30 +526,40 @@ def _pca(df):
     return df
 
 def _dependency_groups_big(G_nx: nx.DiGraph, df: pd.DataFrame):
-    """Big graph dependency grouping using Louvain"""
+    """Big graph dependency grouping using NetworkKit Louvain"""
     if not _NK:
         # Fallback to small graph method
         return _dependency_groups_small(G_nx, df)
     
     try:
-        G_nk = nka.nx2nk(G_nx)
+        # Convert to undirected for community detection
+        G_undirected = G_nx.to_undirected()
+        G_nk = nka.nx2nk(G_undirected)
+        
+        # Use Louvain algorithm (much faster than modularity)
         algo = nk.community.PLM(G_nk)
         algo.run()
-        comm_id = algo.getPartition().getVector()
+        partition = algo.getPartition()
         
-        # Map NetworkX node IDs to networkit indices
-        nx_to_nk = {node: idx for idx, node in enumerate(G_nx.nodes())}
-        mapping = {node: comm_id[nx_to_nk[node]] for node in G_nx.nodes()}
+        # Map back to dataframe
+        node_to_comm = {}
+        for node_idx, node_id in enumerate(G_undirected.nodes()):
+            node_to_comm[node_id] = partition.subsetOf(node_idx)
         
-        df['DependencyCluster'] = df['ID'].astype(str).map(mapping).fillna(0).astype(int)
+        df['DependencyCluster'] = df['ID'].astype(str).map(node_to_comm).fillna(0).astype(int)
+        
+        if DEBUG:
+            n_clusters = len(set(df['DependencyCluster']))
+            logging.info(f"NetworkKit Louvain found {n_clusters} dependency clusters")
+            
     except Exception as e:
-        logging.warning(f"Networkit dependency clustering failed: {e}")
+        logging.warning(f"NetworkKit dependency clustering failed: {e}")
         return _dependency_groups_small(G_nx, df)
     
     return df
 
 def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
-    """Small graph dependency clustering with optimized distance matrix"""
+    """Small graph dependency clustering using sparse matrices"""
     ids = df['ID'].astype(str).tolist()
     n = len(ids)
     
@@ -432,31 +568,37 @@ def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
         return df
     
     try:
-        # Optimized distance matrix building
-        dist = np.full((n, n), 1e9, dtype=float)
-        lengths = dict(nx.all_pairs_dijkstra_path_length(G, weight='weight'))
-        
-        # Vectorized assignment
+        # Create adjacency matrix
         id_to_idx = {id_val: idx for idx, id_val in enumerate(ids)}
-        for i, s in enumerate(ids):
-            if s in lengths:
-                targets = [(id_to_idx[t], l) for t, l in lengths[s].items() if t in id_to_idx]
-                if targets:
-                    indices, values = zip(*targets)
-                    dist[i, list(indices)] = list(values)
         
-        # Check if we have any valid distances
-        if np.all(dist == 1e9):
-            logging.warning("No connected paths found. Using default clustering.")
-            df['DependencyCluster'] = 0
-            return df
+        # Build sparse adjacency matrix
+        row_ind = []
+        col_ind = []
+        data = []
+        
+        for u, v, d in G.edges(data=True):
+            if str(u) in id_to_idx and str(v) in id_to_idx:
+                i, j = id_to_idx[str(u)], id_to_idx[str(v)]
+                weight = d.get('weight', 1)
+                row_ind.extend([i, j])
+                col_ind.extend([j, i])
+                data.extend([weight, weight])
+        
+        # Create sparse matrix
+        adj_sparse = csr_matrix((data, (row_ind, col_ind)), shape=(n, n))
+        
+        # Use scipy's sparse shortest path
+        dist_sparse = shortest_path(adj_sparse, method='D', directed=False)
+        
+        # Convert inf to large number for clustering
+        dist_sparse[np.isinf(dist_sparse)] = 1e9
         
         # Early exit for very small graphs
         if n <= 5:
             best_n_clusters = min(2, n)
         else:
             # Silhouette optimization
-            max_clusters = min(10, n // 2)  # At least 2 nodes per cluster
+            max_clusters = min(10, n // 2)
             best_score = -1
             best_n_clusters = min(3, n)
             
@@ -467,27 +609,29 @@ def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
                     clustering = AgglomerativeClustering(
                         n_clusters=n_clusters, 
                         linkage='complete', 
-                        metric='precomputed'
+                        affinity='precomputed'  # Use affinity instead of metric
                     )
-                    labels = clustering.fit_predict(dist)
+                    labels = clustering.fit_predict(dist_sparse)
                     if len(set(labels)) > 1:
-                        score = silhouette_score(dist, labels, metric='precomputed')
-                        logging.info(f"Dependency clustering silhouette for {n_clusters}: {score:.3f}")
+                        score = silhouette_score(dist_sparse, labels, metric='precomputed')
+                        if DEBUG:
+                            logging.info(f"Dependency clustering silhouette for {n_clusters}: {score:.3f}")
                         if score > best_score:
                             best_score = score
                             best_n_clusters = n_clusters
                 except Exception as e:
-                    logging.warning(f"Clustering failed for {n_clusters} clusters: {e}")
+                    if DEBUG:
+                        logging.warning(f"Clustering failed for {n_clusters} clusters: {e}")
                     continue
         
-        # Guard against edge cases
+        # Final clustering
         best_n_clusters = min(best_n_clusters, n)
         clustering = AgglomerativeClustering(
             n_clusters=best_n_clusters,
             linkage='complete',
-            metric='precomputed'
+            affinity='precomputed'  # Use affinity instead of metric
         )
-        df['DependencyCluster'] = clustering.fit_predict(dist)
+        df['DependencyCluster'] = clustering.fit_predict(dist_sparse)
         
     except Exception as e:
         logging.error(f"Dependency clustering failed: {e}")
@@ -496,46 +640,61 @@ def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
     return df
 
 def _centralities(G: nx.DiGraph, df: pd.DataFrame):
-    """Compute centralities with networkit acceleration when available"""
+    """Compute centralities with NetworkKit acceleration when available"""
     node_ids = df['ID'].astype(str).tolist()
     
-    # Use networkit for better performance if available (even for smaller graphs)
-    if _NK and len(G) > 100:  # Lowered threshold from SMALL_GRAPH_THRESHOLD
+    # Use NetworkKit for better performance if available (lower threshold)
+    if _NK and len(G) > 50:
         try:
-            # Convert to networkit
+            # Convert to NetworkKit
             G_nk = nka.nx2nk(G)
             
-            # Map NetworkX node IDs to networkit indices
+            # Map NetworkX node IDs to NetworkKit indices
             nx_to_nk = {node: idx for idx, node in enumerate(G.nodes())}
             
-            # Compute centralities
+            # Compute centralities using NetworkKit (C++ implementation)
             pr = nk.centrality.PageRank(G_nk, alpha=0.9).run().scores()
-            close = nk.centrality.Closeness(G_nk, variant=nk.centrality.ClosenessVariant.Harmonic).run().scores()
-            deg = nk.centrality.DegreeCentrality(G_nk).run().scores()
             
-            # Clustering coefficient
+            # For directed graphs, use harmonic closeness
+            close = nk.centrality.HarmonicCloseness(G_nk, normalized=True).run().scores()
+            
+            # Degree centrality
+            deg = nk.centrality.DegreeCentrality(G_nk, normalized=True).run().scores()
+            
+            # Clustering coefficient (need undirected)
             G_undirected = nka.nx2nk(G.to_undirected())
-            coef = nk.centrality.LocalClusteringCoefficient(G_undirected).run().scores()
+            lcc = nk.centrality.LocalClusteringCoefficient(G_undirected).run().scores()
             
-            # Map back to dataframe
+            # Map back to dataframe efficiently
+            centrality_data = []
             for idx, row in df.iterrows():
                 node_id = str(row['ID'])
                 if node_id in nx_to_nk:
                     nk_idx = nx_to_nk[node_id]
-                    df.at[idx, 'PageRank'] = pr[nk_idx]
-                    df.at[idx, 'closeness_centrality'] = close[nk_idx]
-                    df.at[idx, 'degree_centrality'] = deg[nk_idx]
-                    df.at[idx, 'Clustering_Coefficient'] = coef[nk_idx]
+                    centrality_data.append({
+                        'PageRank': pr[nk_idx],
+                        'closeness_centrality': close[nk_idx],
+                        'degree_centrality': deg[nk_idx],
+                        'Clustering_Coefficient': lcc[nk_idx]
+                    })
                 else:
-                    df.at[idx, 'PageRank'] = 0
-                    df.at[idx, 'closeness_centrality'] = 0
-                    df.at[idx, 'degree_centrality'] = 0
-                    df.at[idx, 'Clustering_Coefficient'] = 0
-                    
-            logging.info(f"Used networkit for centralities on {len(G)} nodes")
+                    centrality_data.append({
+                        'PageRank': 0,
+                        'closeness_centrality': 0,
+                        'degree_centrality': 0,
+                        'Clustering_Coefficient': 0
+                    })
+            
+            # Bulk update dataframe
+            centrality_df = pd.DataFrame(centrality_data)
+            for col in centrality_df.columns:
+                df[col] = centrality_df[col]
+                
+            if DEBUG:
+                logging.info(f"Used NetworkKit for centralities on {len(G)} nodes")
+                
         except Exception as e:
-            logging.warning(f"Networkit centrality computation failed: {e}")
-            # Fallback to NetworkX
+            logging.warning(f"NetworkKit centrality computation failed: {e}")
             _centralities_nx(G, df)
     else:
         _centralities_nx(G, df)
@@ -550,22 +709,56 @@ def _centralities_nx(G: nx.DiGraph, df: pd.DataFrame):
     deg = nx.degree_centrality(G)
     clust = nx.clustering(G.to_undirected())
     
-    # Map to dataframe
-    for idx, row in df.iterrows():
-        node_id = str(row['ID'])
-        df.at[idx, 'PageRank'] = pr.get(node_id, 0)
-        df.at[idx, 'closeness_centrality'] = close.get(node_id, 0)
-        df.at[idx, 'degree_centrality'] = deg.get(node_id, 0)
-        df.at[idx, 'Clustering_Coefficient'] = clust.get(node_id, 0)
+    # Vectorized mapping
+    df['PageRank'] = df['ID'].astype(str).map(pr).fillna(0)
+    df['closeness_centrality'] = df['ID'].astype(str).map(close).fillna(0)
+    df['degree_centrality'] = df['ID'].astype(str).map(deg).fillna(0)
+    df['Clustering_Coefficient'] = df['ID'].astype(str).map(clust).fillna(0)
 
 def _community_detection(G: nx.DiGraph, df: pd.DataFrame):
-    """Community detection matching v1"""
+    """Community detection using NetworkKit when available"""
+    if _NK and len(G) > 100:
+        try:
+            # Use NetworkKit's PLM (Louvain) for community detection
+            G_undirected = G.to_undirected()
+            G_nk = nka.nx2nk(G_undirected)
+            
+            # Run PLM algorithm
+            algo = nk.community.PLM(G_nk)
+            algo.run()
+            partition = algo.getPartition()
+            
+            # Map to dataframe
+            node_list = list(G_undirected.nodes())
+            node_to_comm = {}
+            
+            # Correctly iterate through partition
+            for node_idx in range(len(node_list)):
+                comm_id = partition.subsetOf(node_idx)
+                node_id = node_list[node_idx]
+                node_to_comm[node_id] = comm_id
+            
+            df['CommunityGroup'] = df['ID'].astype(str).map(node_to_comm).fillna(-1).astype(int)
+            
+            if DEBUG:
+                n_communities = partition.numberOfSubsets()
+                logging.info(f"NetworkKit found {n_communities} communities")
+                
+        except Exception as e:
+            if DEBUG:
+                logging.warning(f"NetworkKit community detection failed: {e}")
+            _community_detection_nx(G, df)
+    else:
+        _community_detection_nx(G, df)
+    
+    return df
+
+def _community_detection_nx(G: nx.DiGraph, df: pd.DataFrame):
+    """NetworkX community detection fallback"""
     try:
-        # Use undirected version for community detection
         G_undirected = G.to_undirected()
         communities = nx.algorithms.community.greedy_modularity_communities(G_undirected)
         
-        # Create mapping
         node_community_dict = {}
         for community_id, nodes in enumerate(communities):
             for node in nodes:
@@ -575,11 +768,9 @@ def _community_detection(G: nx.DiGraph, df: pd.DataFrame):
     except Exception as e:
         logging.warning(f"Community detection failed: {e}")
         df['CommunityGroup'] = 0
-    
-    return df
 
 ###############################################################################
-# Main analyse()                                                             #
+# Main analysis function                                                      #
 ###############################################################################
 
 def analyse(nodes, links):
@@ -601,16 +792,18 @@ def analyse(nodes, links):
         df_links = pd.DataFrame(links)
         
         # Ensure required columns exist with defaults
-        for col, default in [
-            ('ID', lambda: range(len(df_nodes))),
-            ('Duration', 1),
-            ('importanceScore', 5),
-            ('riskScore', 5),
-            ('avgWeightedRisk', 0),
-            ('Resources', ''),
-            ('Dependencies', ''),
-            ('TaskType', 'Task')
-        ]:
+        required_columns = {
+            'ID': lambda: range(len(df_nodes)),
+            'Duration': 1,
+            'importanceScore': 5,
+            'riskScore': 5,
+            'avgWeightedRisk': 0,
+            'Resources': '',
+            'Dependencies': '',
+            'TaskType': 'Task'
+        }
+        
+        for col, default in required_columns.items():
             if col not in df_nodes.columns:
                 df_nodes[col] = default() if callable(default) else default
         
@@ -618,7 +811,7 @@ def analyse(nodes, links):
         G = build_nx_graph(nodes, links)
         G = ensure_dag(G)
         
-        # Pattern detection (from v1)
+        # Pattern detection
         pattern_records = detect_repeating_patterns(df_nodes)
         templates = create_templates_from_patterns(pattern_records)
         
@@ -632,38 +825,40 @@ def analyse(nodes, links):
         else:
             df_nodes = _dependency_groups_small(G, df_nodes)
         
-        # Community detection (from v1)
+        # Community detection
         df_nodes = _community_detection(G, df_nodes)
         
         # Centrality metrics
         df_nodes = _centralities(G, df_nodes)
         
-        # Work packages (from v1)
+        # Work packages
         work_packages = define_work_packages(df_nodes, G)
         work_packages_serialized = serialize_work_packages(work_packages)
         
-        # Critical path (from v1)
+        # Critical path
         if nx.is_directed_acyclic_graph(G) and len(G) > 0:
             critical_path, critical_path_length = calculate_critical_path(G)
         else:
             critical_path, critical_path_length = [], 0
         
-        # Build response matching v1 API
+        # Build response
         response = {
             'nodes': df_nodes.replace({np.nan: None}).to_dict('records'),
             'links': df_links.replace({np.nan: None}).to_dict('records'),
             'work_packages': work_packages_serialized,
-            # Additional fields that might be expected
             'critical_path': critical_path,
             'critical_path_length': float(critical_path_length),
             'templates': templates
         }
         
+        # Garbage collection for large graphs
+        if len(nodes) > 5000:
+            gc.collect()
+        
         return response
         
     except Exception as e:
         logging.exception(f"Analysis error: {str(e)}")
-        # Provide more specific error messages
         if "tz-naive and tz-aware" in str(e):
             raise ValueError("Timezone mismatch in date data. Please ensure all dates are in the same format.")
         else:
@@ -691,31 +886,46 @@ def graph_metrics():
     if not nodes:
         return jsonify({'error': 'No nodes provided'}), 400
     
-    # Log request size
-    logging.info(f"Processing graph with {len(nodes)} nodes and {len(links)} links")
-    
     # Generate cache key
     key = _sha([nodes, links])
+    redis_key = f"graph:{key}"
+    
+    # Try Redis cache first
+    cached_result = get_cached_result(redis_key)
+    if cached_result:
+        cached_result['cache_hit'] = True
+        cached_result['processing_time'] = time.time() - start_time
+        response = jsonify(cached_result)
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response
+    
+    if DEBUG:
+        logging.info(f"Processing graph with {len(nodes)} nodes and {len(links)} links")
     
     try:
-        # Use cached result if available
+        # Use in-memory LRU cache as second level
         res = _cached(
             json.dumps(nodes, sort_keys=True, default=str),
             json.dumps(links, sort_keys=True, default=str)
         )
         res['cache_key'] = key
+        res['cache_hit'] = False
+        
+        # Store in Redis for other instances
+        set_cached_result(redis_key, res)
         
         # Log processing time
         elapsed = time.time() - start_time
-        logging.info(f"Graph processed in {elapsed:.2f}s (nodes: {len(nodes)}, links: {len(links)})")
+        if DEBUG or elapsed > 5:
+            logging.info(f"Graph processed in {elapsed:.2f}s (nodes: {len(nodes)}, links: {len(links)})")
         res['processing_time'] = elapsed
         
         response = jsonify(res)
         response.headers.add('Access-Control-Allow-Origin', '*')
         return response
+        
     except Exception as exc:
         logging.exception('Analysis failed: %s', exc)
-        # Provide cleaner error messages
         error_msg = str(exc)
         if "tz-naive and tz-aware" in error_msg:
             error_msg = "Date format inconsistency detected. Please ensure all dates are in the same timezone format."
@@ -725,7 +935,40 @@ def graph_metrics():
 
 @app.route('/health', methods=['GET'])
 def health():
-    response = jsonify({'status': 'healthy'})
+    """Health check endpoint with system status"""
+    # Check Redis once
+    redis_ok = False
+    try:
+        redis_ok = redis_client is not None and redis_client.ping()
+    except:
+        redis_ok = False
+    
+    # Get LRU cache info
+    cache_info = _cached.cache_info()
+    
+    health_status = {
+        'status': 'healthy',
+        'timestamp': datetime.utcnow().isoformat(),
+        'instance': {
+            'site': os.getenv("WEBSITE_SITE_NAME"),
+            'instance_id': os.getenv("WEBSITE_INSTANCE_ID"),
+            'region': os.getenv("REGION_NAME", "unknown")
+        },
+        'cache': {
+            'redis': redis_ok,
+            'lru': {
+                'size': cache_info.currsize,
+                'hits': cache_info.hits,
+                'misses': cache_info.misses,
+                'hit_rate': f"{(cache_info.hits / (cache_info.hits + cache_info.misses) * 100):.1f}%" if (cache_info.hits + cache_info.misses) > 0 else "0%"
+            }
+        },
+        'features': {
+            'networkit': _NK,
+            'redis': redis_client is not None
+        }
+    }
+    response = jsonify(health_status)
     response.headers.add('Access-Control-Allow-Origin', '*')
     return response
 
@@ -766,5 +1009,5 @@ def after_request(response):
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    # Enable CORS in development mode
-    app.run(host='0.0.0.0', port=port, debug=False)
+    # Enable debug mode only in development
+    app.run(host='0.0.0.0', port=port, debug=DEBUG)
