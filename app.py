@@ -11,6 +11,11 @@ from datetime import datetime
 import pickle
 from contextlib import contextmanager
 
+
+from opencensus.ext.azure.trace_exporter import AzureExporter
+from opencensus.trace.samplers import ProbabilitySampler
+from opencensus.ext.wsgi import middleware as oc_middleware
+
 # Set BLAS threads to prevent CPU contention with Gunicorn
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")

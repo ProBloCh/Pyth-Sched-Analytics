@@ -25,6 +25,3 @@ gunicorn==21.2.0
 orjson==3.9.10  # Faster JSON serialization
 psutil==5.9.6   # System monitoring
 
-# Optional: Application monitoring
-opencensus-ext-azure==1.1.13
-opencensus-ext-flask==0.8.2
