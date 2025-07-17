@@ -18,6 +18,8 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
+
 
 import numpy as np
 import pandas as pd
@@ -57,6 +59,20 @@ REDIS_CACHE_TTL = int(os.getenv('REDIS_CACHE_TTL', 3600))
 ###############################################################################
 
 app = Flask(__name__)
+
+@app.errorhandler(HTTPException)
+def http_error(e):
+    # Preserve real status codes (404, 405, …)
+    return jsonify({"error": e.description}), e.code
+
+@app.errorhandler(Exception)
+def unhandled(e):
+    app.logger.exception(e)
+    return jsonify({"error": "internal error"}), 500
+
+@app.route("/")
+def index():
+    return jsonify({"status": "ok"}), 200
 
 # Set production log level
 log_level = logging.DEBUG if DEBUG else logging.WARNING
@@ -609,7 +625,7 @@ def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
                     clustering = AgglomerativeClustering(
                         n_clusters=n_clusters, 
                         linkage='complete', 
-                        affinity='precomputed'  # Use affinity instead of metric
+                        metric='precomputed'  # Use affinity instead of metric
                     )
                     labels = clustering.fit_predict(dist_sparse)
                     if len(set(labels)) > 1:
@@ -629,7 +645,7 @@ def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
         clustering = AgglomerativeClustering(
             n_clusters=best_n_clusters,
             linkage='complete',
-            affinity='precomputed'  # Use affinity instead of metric
+            metric='precomputed'  # Use affinity instead of metric
         )
         df['DependencyCluster'] = clustering.fit_predict(dist_sparse)
         
@@ -653,7 +669,7 @@ def _centralities(G: nx.DiGraph, df: pd.DataFrame):
             nx_to_nk = {node: idx for idx, node in enumerate(G.nodes())}
             
             # Compute centralities using NetworkKit (C++ implementation)
-            pr = nk.centrality.PageRank(G_nk, alpha=0.9).run().scores()
+            pr = nk.centrality.PageRank(G_nk, damp=0.9).run().scores()
             
             # For directed graphs, use harmonic closeness
             close = nk.centrality.HarmonicCloseness(G_nk, normalized=True).run().scores()
