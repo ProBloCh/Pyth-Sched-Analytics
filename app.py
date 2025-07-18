@@ -15,11 +15,11 @@ from contextlib import contextmanager
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
-
 
 import numpy as np
 import pandas as pd
@@ -46,33 +46,22 @@ import networkx as nx  # Single canonical import
 SMALL_GRAPH_THRESHOLD = int(os.getenv("SMALL_GRAPH_THRESHOLD", 2000))
 MAX_PATTERN_NODES = int(os.getenv("MAX_PATTERN_NODES", 1000))
 MAX_PATTERNS = int(os.getenv("MAX_PATTERNS", 10))
+# Cache sizing: With multi-minute requests, consider CACHE_SIZE=128+ if hit rate drops below 80%
 CACHE_SIZE = int(os.getenv("CACHE_SIZE", 32))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 120))
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+ENABLE_SILHOUETTE_OPTIMIZATION = os.getenv("ENABLE_SILHOUETTE_OPTIMIZATION", "false").lower() == "true"
 
 # Redis configuration
 REDIS_URL = os.getenv('REDIS_URL', None)
-REDIS_CACHE_TTL = int(os.getenv('REDIS_CACHE_TTL', 3600))
+# TTL should be > typical request cycle time. Lower if cache memory is constrained
+REDIS_CACHE_TTL = int(os.getenv('REDIS_CACHE_TTL', 3600))  # 1 hour default
 
 ###############################################################################
 # Flask setup                                                                 #
 ###############################################################################
 
 app = Flask(__name__)
-
-@app.errorhandler(HTTPException)
-def http_error(e):
-    # Preserve real status codes (404, 405, …)
-    return jsonify({"error": e.description}), e.code
-
-@app.errorhandler(Exception)
-def unhandled(e):
-    app.logger.exception(e)
-    return jsonify({"error": "internal error"}), 500
-
-@app.route("/")
-def index():
-    return jsonify({"status": "ok"}), 200
 
 # Set production log level
 log_level = logging.DEBUG if DEBUG else logging.WARNING
@@ -121,10 +110,9 @@ def redis_pipeline():
             yield pipe
             pipe.execute()
         except Exception as e:
-            if DEBUG:
-                logging.error(f"Redis pipeline error: {e}")
+            logging.warning(f"Redis pipeline failed, falling back to no-cache: {e}")
             pipe.reset()  # Reset pipeline on error
-            yield None
+            # Don't re-raise - let the app continue without caching
     else:
         yield None
 
@@ -151,8 +139,10 @@ def set_cached_result(key, value, ttl=None):
             if DEBUG:
                 logging.info(f"Cached result in Redis: {key[:8]}...")
         except Exception as e:
+            # Log but don't fail the request on cache write errors
             if DEBUG:
                 logging.warning(f"Redis set failed: {e}")
+            # Continue without caching - the result is still valid
 
 ###############################################################################
 # Helpers                                                                     #
@@ -189,9 +179,11 @@ def detect_repeating_patterns(nodes_df):
     else:
         sample_df = nodes_df
     
-    # Create pattern key more efficiently
-    pattern_key = (sample_df['TaskType'].cat.codes * 10000 + 
-                  sample_df['Duration'] * 100 + 
+    # Create pattern key more efficiently with discretized duration
+    # Round duration to avoid float precision issues
+    duration_discrete = (sample_df['Duration'].round(1) * 10).astype(int)
+    pattern_key = (sample_df['TaskType'].cat.codes * 100000 + 
+                  duration_discrete * 100 + 
                   sample_df['Resources'].cat.codes)
     
     sample_df['pattern_id'] = pd.factorize(pattern_key)[0]
@@ -356,6 +348,7 @@ def build_nx_graph(nodes, links):
     # Bulk add edges (more efficient than loop)
     edge_list = [(str(l['source']), str(l['target']), {
         'weight': l.get('duration', 1),
+        'duration': l.get('duration', 1),  # Add duration attribute for critical path
         'type': l.get('type', 'FS'),
         'lag': l.get('lag', 0)
     }) for l in links]
@@ -372,8 +365,8 @@ def build_nx_graph(nodes, links):
     
     # Vectorized date parsing
     nodes_df['start_date'] = pd.to_datetime(nodes_df.get('Start'), errors='coerce', utc=False)
-    # Remove timezone info if present (fix for naive datetime handling)
-    if hasattr(nodes_df['start_date'].dtype, 'tz') and nodes_df['start_date'].dtype.tz is not None:
+    # Remove timezone info if present (future-compatible check)
+    if getattr(nodes_df['start_date'].dtype, 'tz', None) is not None:
         nodes_df['start_date'] = nodes_df['start_date'].dt.tz_localize(None)
     
     nodes_df['duration'] = pd.to_numeric(nodes_df.get('Duration', 1), errors='coerce').fillna(1)
@@ -381,16 +374,21 @@ def build_nx_graph(nodes, links):
     # Vectorized end date calculation
     nodes_df['end_date'] = nodes_df['start_date'] + pd.to_timedelta(nodes_df['duration'], unit='D', errors='coerce')
     
-    # Vectorized boolean conversions
-    bool_cols = ['Milestone', 'isImportanceOutlier', 'isOnCriticalPath', 'isOnOutlierPath', 'isRiskOutlier']
+    # Vectorized boolean conversions with safer casting
+    bool_cols = ['isImportanceOutlier', 'isOnCriticalPath', 'isOnOutlierPath', 'isRiskOutlier']
+    
+    # Handle Milestone separately with safer conversion
+    if 'Milestone' in nodes_df.columns:
+        nodes_df['Milestone'] = pd.to_numeric(nodes_df['Milestone'], errors='coerce').fillna(0).astype(int) == 1
+    else:
+        nodes_df['Milestone'] = False
+    
+    # Handle other boolean columns
     for col in bool_cols:
         if col in nodes_df.columns:
-            if col == 'Milestone':
-                nodes_df[col] = nodes_df[col].astype(str).astype(int) == 1
-            else:
-                nodes_df[col] = nodes_df[col].astype(str).str.lower() == 'true'
+            nodes_df[col] = nodes_df[col].astype(str).str.lower() == 'true'
         else:
-            nodes_df[col] = False if col != 'Milestone' else 0
+            nodes_df[col] = False
     
     # Bulk add nodes with attributes
     node_attrs = {}
@@ -477,7 +475,7 @@ def ensure_dag(G: nx.DiGraph):
 ###############################################################################
 
 def _cluster_risk_kmeans(df: pd.DataFrame):
-    """K-means clustering with early exit for small datasets"""
+    """K-means clustering with optional silhouette optimization"""
     if 'importanceScore' not in df.columns or 'riskScore' not in df.columns:
         df['Cluster'] = 0
         return df
@@ -489,16 +487,34 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
         df['Cluster'] = 0
         return df
     
-    # Early exit for small datasets - skip expensive silhouette scoring
+    # Fast heuristic path (default)
+    if not ENABLE_SILHOUETTE_OPTIMIZATION:
+        # Heuristic: sqrt(n/2) clusters, bounded between 2 and 10
+        k = max(2, min(10, int(np.sqrt(n / 2))))
+        
+        if DEBUG:
+            logging.info(f"Using heuristic k={k} for {n} nodes (silhouette optimization disabled)")
+        
+        try:
+            df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
+        except ValueError:
+            df['Cluster'] = 0
+        return df
+    
+    # Silhouette optimization path (only if explicitly enabled)
+    if DEBUG:
+        logging.info(f"Running silhouette optimization for {n} nodes")
+    
+    # Early exit for small datasets
     if n <= 15:
         k = min(3, n)
         try:
             df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
-        except ValueError:  # Handles identical points or other KMeans issues
+        except ValueError:
             df['Cluster'] = 0
         return df
     
-    # Full silhouette optimization for larger datasets
+    # Full silhouette optimization
     max_clusters = min(10, n)
     best, k = -1, min(3, n)
     
@@ -550,6 +566,8 @@ def _dependency_groups_big(G_nx: nx.DiGraph, df: pd.DataFrame):
     try:
         # Convert to undirected for community detection
         G_undirected = G_nx.to_undirected()
+        # Store node list before conversion to maintain order
+        node_list = list(G_undirected.nodes())
         G_nk = nka.nx2nk(G_undirected)
         
         # Use Louvain algorithm (much faster than modularity)
@@ -557,15 +575,17 @@ def _dependency_groups_big(G_nx: nx.DiGraph, df: pd.DataFrame):
         algo.run()
         partition = algo.getPartition()
         
-        # Map back to dataframe
+        # Map back to dataframe using pre-conversion node list
         node_to_comm = {}
-        for node_idx, node_id in enumerate(G_undirected.nodes()):
-            node_to_comm[node_id] = partition.subsetOf(node_idx)
+        for node_idx in range(len(node_list)):
+            comm_id = partition.subsetOf(node_idx)
+            node_id = node_list[node_idx]
+            node_to_comm[node_id] = comm_id
         
         df['DependencyCluster'] = df['ID'].astype(str).map(node_to_comm).fillna(0).astype(int)
         
         if DEBUG:
-            n_clusters = len(set(df['DependencyCluster']))
+            n_clusters = partition.numberOfSubsets()
             logging.info(f"NetworkKit Louvain found {n_clusters} dependency clusters")
             
     except Exception as e:
@@ -645,7 +665,7 @@ def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
         clustering = AgglomerativeClustering(
             n_clusters=best_n_clusters,
             linkage='complete',
-            metric='precomputed'  # Use affinity instead of metric
+            metric='precomputed'
         )
         df['DependencyCluster'] = clustering.fit_predict(dist_sparse)
         
@@ -662,11 +682,14 @@ def _centralities(G: nx.DiGraph, df: pd.DataFrame):
     # Use NetworkKit for better performance if available (lower threshold)
     if _NK and len(G) > 50:
         try:
+            # Capture node list BEFORE conversion to maintain order
+            node_list = list(G.nodes())
+            
             # Convert to NetworkKit
             G_nk = nka.nx2nk(G)
             
-            # Map NetworkX node IDs to NetworkKit indices
-            nx_to_nk = {node: idx for idx, node in enumerate(G.nodes())}
+            # Map NetworkX node IDs to NetworkKit indices using pre-conversion node list
+            nx_to_nk = {node: idx for idx, node in enumerate(node_list)}
             
             # Compute centralities using NetworkKit (C++ implementation)
             pr = nk.centrality.PageRank(G_nk, damp=0.9).run().scores()
@@ -737,6 +760,8 @@ def _community_detection(G: nx.DiGraph, df: pd.DataFrame):
         try:
             # Use NetworkKit's PLM (Louvain) for community detection
             G_undirected = G.to_undirected()
+            # Get node list before conversion to maintain order
+            node_list = list(G_undirected.nodes())
             G_nk = nka.nx2nk(G_undirected)
             
             # Run PLM algorithm
@@ -744,11 +769,8 @@ def _community_detection(G: nx.DiGraph, df: pd.DataFrame):
             algo.run()
             partition = algo.getPartition()
             
-            # Map to dataframe
-            node_list = list(G_undirected.nodes())
+            # Map to dataframe - using pre-conversion node list
             node_to_comm = {}
-            
-            # Correctly iterate through partition
             for node_idx in range(len(node_list)):
                 comm_id = partition.subsetOf(node_idx)
                 node_id = node_list[node_idx]
@@ -832,14 +854,20 @@ def analyse(nodes, links):
         templates = create_templates_from_patterns(pattern_records)
         
         # Risk/importance clustering + PCA
+        clustering_start = time.time() if DEBUG else None
         df_nodes = _cluster_risk_kmeans(df_nodes)
         df_nodes = _pca(df_nodes)
+        if DEBUG:
+            logging.info(f"Risk/importance clustering took {time.time() - clustering_start:.2f}s")
         
         # Dependency grouping
+        dep_start = time.time() if DEBUG else None
         if len(df_nodes) > SMALL_GRAPH_THRESHOLD:
             df_nodes = _dependency_groups_big(G, df_nodes)
         else:
             df_nodes = _dependency_groups_small(G, df_nodes)
+        if DEBUG:
+            logging.info(f"Dependency clustering took {time.time() - dep_start:.2f}s")
         
         # Community detection
         df_nodes = _community_detection(G, df_nodes)
@@ -909,6 +937,7 @@ def graph_metrics():
     # Try Redis cache first
     cached_result = get_cached_result(redis_key)
     if cached_result:
+        cached_result.setdefault('cache_key', key)
         cached_result['cache_hit'] = True
         cached_result['processing_time'] = time.time() - start_time
         response = jsonify(cached_result)
@@ -954,16 +983,22 @@ def health():
     """Health check endpoint with system status"""
     # Check Redis once
     redis_ok = False
+    redis_configured = redis_client is not None
     try:
-        redis_ok = redis_client is not None and redis_client.ping()
+        redis_ok = redis_configured and redis_client.ping()
     except:
         redis_ok = False
     
     # Get LRU cache info
     cache_info = _cached.cache_info()
     
+    # Determine overall health status
+    status = 'healthy'
+    if REDIS_URL and not redis_ok:
+        status = 'degraded'  # Redis is configured but not working
+    
     health_status = {
-        'status': 'healthy',
+        'status': status,
         'timestamp': datetime.utcnow().isoformat(),
         'instance': {
             'site': os.getenv("WEBSITE_SITE_NAME"),
@@ -972,6 +1007,7 @@ def health():
         },
         'cache': {
             'redis': redis_ok,
+            'redis_configured': redis_configured,
             'lru': {
                 'size': cache_info.currsize,
                 'hits': cache_info.hits,
@@ -981,7 +1017,14 @@ def health():
         },
         'features': {
             'networkit': _NK,
-            'redis': redis_client is not None
+            'redis': redis_configured,
+            'silhouette_optimization': ENABLE_SILHOUETTE_OPTIMIZATION
+        },
+        'settings': {
+            'small_graph_threshold': SMALL_GRAPH_THRESHOLD,
+            'max_pattern_nodes': MAX_PATTERN_NODES,
+            'cache_size': CACHE_SIZE,
+            'debug': DEBUG
         }
     }
     response = jsonify(health_status)
@@ -1002,6 +1045,19 @@ def test_cors():
     response.headers.add('Access-Control-Allow-Origin', '*')
     response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
     response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    return response
+
+@app.route('/', methods=['GET'])
+def index():
+    """Root endpoint for health checks and crawlers"""
+    return jsonify({'status': 'ok', 'service': 'python-sched-analytics'}), 200
+
+@app.errorhandler(HTTPException)
+def handle_http_exception(e):
+    """Handle HTTP exceptions (404, 405, etc.) properly"""
+    response = jsonify({'error': e.description})
+    response.status_code = e.code
+    response.headers.add('Access-Control-Allow-Origin', '*')
     return response
 
 @app.errorhandler(Exception)
