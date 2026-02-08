@@ -50,6 +50,7 @@ CACHE_SIZE = int(os.getenv("CACHE_SIZE", 32))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 120))
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 ENABLE_SILHOUETTE_OPTIMIZATION = os.getenv("ENABLE_SILHOUETTE_OPTIMIZATION", "false").lower() == "true"
+COMMUNITY_RESOLUTION = float(os.getenv("COMMUNITY_RESOLUTION", 1.0))
 
 # Redis configuration
 REDIS_URL = os.getenv('REDIS_URL', None)
@@ -788,7 +789,22 @@ def _community_detection_nx(G: nx.DiGraph, df: pd.DataFrame):
     """NetworkX community detection fallback"""
     try:
         G_undirected = G.to_undirected()
-        communities = nx.algorithms.community.greedy_modularity_communities(G_undirected)
+        if G_undirected.number_of_edges() == 0:
+            df['CommunityGroup'] = 0
+            return df
+
+        try:
+            communities = nx.algorithms.community.louvain_communities(
+                G_undirected,
+                weight='weight',
+                resolution=COMMUNITY_RESOLUTION,
+                seed=0
+            )
+        except AttributeError:
+            communities = nx.algorithms.community.greedy_modularity_communities(
+                G_undirected,
+                weight='weight'
+            )
         
         node_community_dict = {}
         for community_id, nodes in enumerate(communities):
@@ -1017,7 +1033,8 @@ def health():
             'small_graph_threshold': SMALL_GRAPH_THRESHOLD,
             'max_pattern_nodes': MAX_PATTERN_NODES,
             'cache_size': CACHE_SIZE,
-            'debug': DEBUG
+            'debug': DEBUG,
+            'community_resolution': COMMUNITY_RESOLUTION
         }
     }
     response = jsonify(health_status)
