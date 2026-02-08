@@ -9,7 +9,6 @@ import os, json, logging, hashlib, time, gc
 from functools import lru_cache
 from datetime import datetime
 import pickle
-from contextlib import contextmanager
 
 # Set BLAS threads to prevent CPU contention with Gunicorn
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -17,7 +16,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
-from flask import Flask, request, jsonify, g
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 
@@ -101,21 +100,6 @@ if REDIS_URL:
         logging.warning(f"Redis connection failed: {e}. Falling back to in-memory cache.")
         redis_client = None
 
-@contextmanager
-def redis_pipeline():
-    """Context manager for Redis pipeline operations"""
-    if redis_client:
-        pipe = redis_client.pipeline()
-        try:
-            yield pipe
-            pipe.execute()
-        except Exception as e:
-            logging.warning(f"Redis pipeline failed, falling back to no-cache: {e}")
-            pipe.reset()  # Reset pipeline on error
-            # Don't re-raise - let the app continue without caching
-    else:
-        yield None
-
 def get_cached_result(key):
     """Try Redis first, then fall back to LRU cache"""
     if redis_client:
@@ -175,9 +159,9 @@ def detect_repeating_patterns(nodes_df):
     if len(nodes_df) > MAX_PATTERN_NODES:
         if DEBUG:
             logging.info(f"Large graph ({len(nodes_df)} nodes). Sampling first {MAX_PATTERN_NODES} for patterns.")
-        sample_df = nodes_df.head(MAX_PATTERN_NODES)
+        sample_df = nodes_df.head(MAX_PATTERN_NODES).copy()
     else:
-        sample_df = nodes_df
+        sample_df = nodes_df.copy()
     
     # Create pattern key more efficiently with discretized duration
     # Round duration to avoid float precision issues
@@ -227,10 +211,10 @@ def identify_critical_activities_and_milestones(G):
     critical_activities = [
         node for node in G.nodes if (
             G.nodes[node].get('Milestone') == 1 or
-            G.nodes[node].get('isImportanceOutlier', True) or
-            G.nodes[node].get('isOnCriticalPath', True) or
-            G.nodes[node].get('isOnOutlierPath', True) or
-            G.nodes[node].get('isRiskOutlier', True)
+            G.nodes[node].get('isImportanceOutlier', False) or
+            G.nodes[node].get('isOnCriticalPath', False) or
+            G.nodes[node].get('isOnOutlierPath', False) or
+            G.nodes[node].get('isRiskOutlier', False)
         )
     ]
     return set(critical_activities)
@@ -638,14 +622,15 @@ def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
             best_score = -1
             best_n_clusters = min(3, n)
             
+            clustering_kwargs = _agglomerative_precomputed_kwargs()
             for n_clusters in range(2, max_clusters + 1):
                 if n_clusters >= n:
                     break
                 try:
                     clustering = AgglomerativeClustering(
-                        n_clusters=n_clusters, 
-                        linkage='complete', 
-                        metric='precomputed'  # Use affinity instead of metric
+                        n_clusters=n_clusters,
+                        linkage='complete',
+                        **clustering_kwargs
                     )
                     labels = clustering.fit_predict(dist_sparse)
                     if len(set(labels)) > 1:
@@ -665,7 +650,7 @@ def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
         clustering = AgglomerativeClustering(
             n_clusters=best_n_clusters,
             linkage='complete',
-            metric='precomputed'
+            **_agglomerative_precomputed_kwargs()
         )
         df['DependencyCluster'] = clustering.fit_predict(dist_sparse)
         
@@ -674,6 +659,14 @@ def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
         df['DependencyCluster'] = 0
     
     return df
+
+def _agglomerative_precomputed_kwargs():
+    """Return compatible kwargs for precomputed distance clustering across sklearn versions."""
+    try:
+        AgglomerativeClustering(metric='precomputed')
+        return {'metric': 'precomputed'}
+    except TypeError:
+        return {'affinity': 'precomputed'}
 
 def _centralities(G: nx.DiGraph, df: pd.DataFrame):
     """Compute centralities with NetworkKit acceleration when available"""
