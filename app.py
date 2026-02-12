@@ -1060,17 +1060,6 @@ def unhandled(e):
     logging.exception('Unhandled: %s', e)
     return jsonify({'error': str(e)}), 500
 
-@app.after_request
-def after_request(response):
-    """Ensure CORS headers are always present (without duplicating Flask-CORS)"""
-    if 'Access-Control-Allow-Origin' not in response.headers:
-        response.headers['Access-Control-Allow-Origin'] = '*'
-    if 'Access-Control-Allow-Headers' not in response.headers:
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-    if 'Access-Control-Allow-Methods' not in response.headers:
-        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-    return response
-
 ###############################################################################
 # Local dev                                                                   #
 ###############################################################################
