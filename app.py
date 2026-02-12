@@ -1,4 +1,4 @@
-﻿"""
+"""
 Pyth-Sched-Analytics • Optimised v3.0 (Production-Ready)
 ==============================================================
 Includes: Redis caching, NetworkKit acceleration, sparse matrices,
@@ -7,7 +7,7 @@ vectorized operations, and Python 3.12 optimizations
 
 import os, json, logging, hashlib, time, gc
 from functools import lru_cache
-from datetime import datetime
+from datetime import datetime, timezone
 import pickle
 
 # Set BLAS threads to prevent CPU contention with Gunicorn
@@ -151,7 +151,14 @@ def detect_repeating_patterns(nodes_df):
     if 'TaskType' not in nodes_df.columns:
         logging.warning("No 'TaskType' column found in nodes data. Skipping pattern detection.")
         return []
-    
+
+    if 'Resources' not in nodes_df.columns:
+        logging.warning("No 'Resources' column found in nodes data. Skipping pattern detection.")
+        return []
+
+    # Work on a copy to avoid mutating the caller's DataFrame
+    nodes_df = nodes_df.copy()
+
     # Use categorical dtype for memory efficiency
     nodes_df['TaskType'] = nodes_df['TaskType'].astype('category')
     nodes_df['Resources'] = nodes_df['Resources'].astype('category')
@@ -290,15 +297,15 @@ def serialize_work_packages(work_packages):
             
             # Convert to ISO format string, handling timezone issues
             if start_date is not None:
-                if hasattr(start_date, 'tz') and start_date.tz is not None:
-                    start_date = start_date.tz_localize(None)
+                if hasattr(start_date, 'tzinfo') and start_date.tzinfo is not None:
+                    start_date = start_date.replace(tzinfo=None)
                 start_str = start_date.isoformat() if hasattr(start_date, 'isoformat') else str(start_date)
             else:
                 start_str = None
-                
+
             if end_date is not None:
-                if hasattr(end_date, 'tz') and end_date.tz is not None:
-                    end_date = end_date.tz_localize(None)
+                if hasattr(end_date, 'tzinfo') and end_date.tzinfo is not None:
+                    end_date = end_date.replace(tzinfo=None)
                 end_str = end_date.isoformat() if hasattr(end_date, 'isoformat') else str(end_date)
             else:
                 end_str = None
@@ -515,7 +522,7 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
                     logging.info(f"Silhouette Score for {c} clusters: {sc:.3f}")
                 if sc > best:
                     best, k = sc, c
-        except:
+        except Exception:
             continue
     
     # Guard against edge cases
@@ -927,11 +934,7 @@ def graph_metrics():
     
     # Handle preflight
     if request.method == 'OPTIONS':
-        response = jsonify({'status': 'ok'})
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
-        response.headers.add('Access-Control-Allow-Methods', 'POST')
-        return response
+        return jsonify({'status': 'ok'})
     
     data = request.get_json(force=True, silent=True) or {}
     nodes, links = data.get('nodes', []), data.get('links', [])
@@ -949,9 +952,7 @@ def graph_metrics():
         cached_result.setdefault('cache_key', key)
         cached_result['cache_hit'] = True
         cached_result['processing_time'] = time.time() - start_time
-        response = jsonify(cached_result)
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        return response
+        return jsonify(cached_result)
     
     if DEBUG:
         logging.info(f"Processing graph with {len(nodes)} nodes and {len(links)} links")
@@ -973,19 +974,15 @@ def graph_metrics():
         if DEBUG or elapsed > 5:
             logging.info(f"Graph processed in {elapsed:.2f}s (nodes: {len(nodes)}, links: {len(links)})")
         res['processing_time'] = elapsed
-        
-        response = jsonify(res)
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        return response
+
+        return jsonify(res)
         
     except Exception as exc:
         logging.exception('Analysis failed: %s', exc)
         error_msg = str(exc)
         if "tz-naive and tz-aware" in error_msg:
             error_msg = "Date format inconsistency detected. Please ensure all dates are in the same timezone format."
-        response = jsonify({'error': error_msg})
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        return response, 500
+        return jsonify({'error': error_msg}), 500
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -995,7 +992,7 @@ def health():
     redis_configured = redis_client is not None
     try:
         redis_ok = redis_configured and redis_client.ping()
-    except:
+    except Exception:
         redis_ok = False
     
     # Get LRU cache info
@@ -1008,7 +1005,7 @@ def health():
     
     health_status = {
         'status': status,
-        'timestamp': datetime.utcnow().isoformat(),
+        'timestamp': datetime.now(timezone.utc).isoformat(),
         'instance': {
             'site': os.getenv("WEBSITE_SITE_NAME"),
             'instance_id': os.getenv("WEBSITE_INSTANCE_ID"),
@@ -1037,25 +1034,18 @@ def health():
             'community_resolution': COMMUNITY_RESOLUTION
         }
     }
-    response = jsonify(health_status)
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    return response
+    return jsonify(health_status)
 
 @app.route('/test-cors', methods=['GET', 'POST', 'OPTIONS'])
 def test_cors():
     """Test endpoint to verify CORS is working"""
     if request.method == 'OPTIONS':
-        response = jsonify({'status': 'preflight ok'})
-    else:
-        response = jsonify({
-            'status': 'cors test ok',
-            'method': request.method,
-            'origin': request.headers.get('Origin', 'no origin header')
-        })
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
-    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-    return response
+        return jsonify({'status': 'preflight ok'})
+    return jsonify({
+        'status': 'cors test ok',
+        'method': request.method,
+        'origin': request.headers.get('Origin', 'no origin header')
+    })
 
 @app.route('/', methods=['GET'])
 def index():
@@ -1067,15 +1057,12 @@ def handle_http_exception(e):
     """Handle HTTP exceptions (404, 405, etc.) properly"""
     response = jsonify({'error': e.description})
     response.status_code = e.code
-    response.headers.add('Access-Control-Allow-Origin', '*')
     return response
 
 @app.errorhandler(Exception)
 def unhandled(e):
     logging.exception('Unhandled: %s', e)
-    response = jsonify({'error': str(e)})
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    return response, 500
+    return jsonify({'error': str(e)}), 500
 
 @app.after_request
 def after_request(response):

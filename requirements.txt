@@ -21,7 +21,4 @@ redis==5.0.1
 # Production server
 gunicorn==21.2.0
 
-# Performance optimization
-orjson==3.9.10  # Faster JSON serialization
-psutil==5.9.6   # System monitoring
 
