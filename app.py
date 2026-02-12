@@ -156,20 +156,16 @@ def detect_repeating_patterns(nodes_df):
         logging.warning("No 'Resources' column found in nodes data. Skipping pattern detection.")
         return []
 
-    # Work on a copy to avoid mutating the caller's DataFrame
-    nodes_df = nodes_df.copy()
+    # Only copy the subset we need to avoid doubling peak memory on large inputs
+    cols = ['TaskType', 'Resources', 'Duration', 'Dependencies'] if 'Dependencies' in nodes_df.columns else ['TaskType', 'Resources', 'Duration']
+    limit = min(len(nodes_df), MAX_PATTERN_NODES)
+    if limit < len(nodes_df) and DEBUG:
+        logging.info(f"Large graph ({len(nodes_df)} nodes). Sampling first {limit} for patterns.")
+    sample_df = nodes_df[cols].head(limit).copy()
 
     # Use categorical dtype for memory efficiency
-    nodes_df['TaskType'] = nodes_df['TaskType'].astype('category')
-    nodes_df['Resources'] = nodes_df['Resources'].astype('category')
-    
-    # Limit pattern detection for memory efficiency
-    if len(nodes_df) > MAX_PATTERN_NODES:
-        if DEBUG:
-            logging.info(f"Large graph ({len(nodes_df)} nodes). Sampling first {MAX_PATTERN_NODES} for patterns.")
-        sample_df = nodes_df.head(MAX_PATTERN_NODES).copy()
-    else:
-        sample_df = nodes_df.copy()
+    sample_df['TaskType'] = sample_df['TaskType'].astype('category')
+    sample_df['Resources'] = sample_df['Resources'].astype('category')
     
     # Create pattern key more efficiently with discretized duration
     # Round duration to avoid float precision issues
@@ -1066,10 +1062,13 @@ def unhandled(e):
 
 @app.after_request
 def after_request(response):
-    """Ensure CORS headers are always present"""
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    """Ensure CORS headers are always present (without duplicating Flask-CORS)"""
+    if 'Access-Control-Allow-Origin' not in response.headers:
+        response.headers['Access-Control-Allow-Origin'] = '*'
+    if 'Access-Control-Allow-Headers' not in response.headers:
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    if 'Access-Control-Allow-Methods' not in response.headers:
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     return response
 
 ###############################################################################
