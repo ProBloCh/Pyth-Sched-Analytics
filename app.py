@@ -51,6 +51,11 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 120))
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 ENABLE_SILHOUETTE_OPTIMIZATION = os.getenv("ENABLE_SILHOUETTE_OPTIMIZATION", "false").lower() == "true"
 COMMUNITY_RESOLUTION = float(os.getenv("COMMUNITY_RESOLUTION", 1.0))
+MAX_COMMUNITY_RATIO = float(os.getenv("MAX_COMMUNITY_RATIO", 0.3))
+GATEWAY_PERCENTILE = float(os.getenv("GATEWAY_PERCENTILE", 90))
+
+# Relationship type coupling weights (FS tightest, SF loosest)
+_RELATIONSHIP_COUPLING = {'FS': 1.0, 'SS': 0.85, 'FF': 0.85, 'SF': 0.5}
 
 # Redis configuration
 REDIS_URL = os.getenv('REDIS_URL', None)
@@ -243,13 +248,15 @@ def identify_critical_activities_and_milestones(G):
 # Work Packages (from v1)                                                     #
 ###############################################################################
 
-def define_work_packages(nodes_df, G):
+def define_work_packages(nodes_df, G, critical_path=None):
     work_packages = {}
-    
+
     if 'Cluster' not in nodes_df.columns:
         logging.warning("Cluster data not found in DataFrame.")
         return work_packages
-    
+
+    cp_set = set(critical_path) if critical_path else set()
+
     # Pre-extract dates from graph for efficiency
     node_dates = {}
     for node in G.nodes():
@@ -257,7 +264,7 @@ def define_work_packages(nodes_df, G):
             'start': G.nodes[node].get('start_date'),
             'end': G.nodes[node].get('end_date')
         }
-    
+
     # Process each cluster
     for cluster in nodes_df['Cluster'].unique():
         cluster_nodes = nodes_df[nodes_df['Cluster'] == cluster]
@@ -269,7 +276,7 @@ def define_work_packages(nodes_df, G):
             continue
 
         subgraph = G.subgraph(tasks)
-        
+
         # Check if subgraph is a DAG before computing longest path
         if nx.is_directed_acyclic_graph(subgraph) and len(subgraph) > 0:
             sub_critical_path = nx.dag_longest_path(subgraph, weight='duration')
@@ -279,9 +286,9 @@ def define_work_packages(nodes_df, G):
             sub_critical_duration = 0
 
         # Efficient date collection using pre-extracted data
-        valid_starts = [node_dates[t]['start'] for t in tasks 
+        valid_starts = [node_dates[t]['start'] for t in tasks
                        if t in node_dates and node_dates[t]['start'] is not None]
-        valid_ends = [node_dates[t]['end'] for t in tasks 
+        valid_ends = [node_dates[t]['end'] for t in tasks
                      if t in node_dates and node_dates[t]['end'] is not None]
 
         if not valid_starts or not valid_ends:
@@ -289,12 +296,31 @@ def define_work_packages(nodes_df, G):
                 logging.warning(f"No valid dates for cluster {cluster}. Skipping.")
             continue
 
+        # Controls KPIs
+        tasks_set = set(tasks)
+        cp_in_cluster = len(tasks_set & cp_set)
+        cp_concentration = cp_in_cluster / len(tasks) if tasks else 0
+
+        interface_edges = sum(
+            1 for u, v in G.edges()
+            if (u in tasks_set) != (v in tasks_set)
+        )
+
+        avg_risk = 0.0
+        if 'riskScore' in cluster_nodes.columns:
+            avg_risk = float(pd.to_numeric(
+                cluster_nodes['riskScore'], errors='coerce'
+            ).fillna(0).mean())
+
         work_packages[f'Package_{cluster}'] = {
             'tasks': tasks,
             'critical_path': sub_critical_path,
             'critical_path_length': sub_critical_duration,
             'start': min(valid_starts),
-            'end': max(valid_ends)
+            'end': max(valid_ends),
+            'critical_path_concentration': round(cp_concentration, 3),
+            'interface_edge_count': interface_edges,
+            'average_risk': round(avg_risk, 3),
         }
 
     return work_packages
@@ -327,7 +353,10 @@ def serialize_work_packages(work_packages):
                 'critical_path': package['critical_path'],
                 'critical_path_length': float(package['critical_path_length']),
                 'start': start_str,
-                'end': end_str
+                'end': end_str,
+                'critical_path_concentration': package.get('critical_path_concentration', 0),
+                'interface_edge_count': package.get('interface_edge_count', 0),
+                'average_risk': package.get('average_risk', 0),
             }
         except Exception as e:
             logging.warning(f"Error serializing work package {key}: {e}")
@@ -336,7 +365,10 @@ def serialize_work_packages(work_packages):
                 'critical_path': package.get('critical_path', []),
                 'critical_path_length': float(package.get('critical_path_length', 0)),
                 'start': None,
-                'end': None
+                'end': None,
+                'critical_path_concentration': 0,
+                'interface_edge_count': 0,
+                'average_risk': 0,
             }
     return serialized_packages
 
@@ -348,13 +380,21 @@ def build_nx_graph(nodes, links):
     """Optimized graph building with vectorized operations"""
     G = nx.DiGraph()
     
-    # Bulk add edges (more efficient than loop)
-    edge_list = [(str(l['source']), str(l['target']), {
-        'weight': l.get('duration', 1),
-        'duration': l.get('duration', 1),  # Add duration attribute for critical path
-        'type': l.get('type', 'FS'),
-        'lag': l.get('lag', 0)
-    }) for l in links]
+    # Bulk add edges with coupling-aware weights
+    # Weight reflects construction coupling: type strength × duration / (1 + |lag|)
+    edge_list = []
+    for l in links:
+        rel_type = l.get('type', 'FS')
+        lag = l.get('lag', 0)
+        duration = max(l.get('duration', 1), 1)
+        type_w = _RELATIONSHIP_COUPLING.get(rel_type, 0.7)
+        coupling = type_w * duration / (1 + abs(lag))
+        edge_list.append((str(l['source']), str(l['target']), {
+            'weight': coupling,
+            'duration': duration,
+            'type': rel_type,
+            'lag': lag
+        }))
     G.add_edges_from(edge_list)
     
     # Vectorized node attribute processing
@@ -477,12 +517,29 @@ def ensure_dag(G: nx.DiGraph):
 ###############################################################################
 
 def _cluster_risk_kmeans(df: pd.DataFrame):
-    """K-means clustering with optional silhouette optimization"""
+    """K-means clustering with controls-aware features and optional silhouette optimization"""
     if 'importanceScore' not in df.columns or 'riskScore' not in df.columns:
         df['Cluster'] = 0
         return df
-        
-    feats = df[['importanceScore', 'riskScore']].values
+
+    # Build feature matrix: start with core risk dimensions, add controls columns if available
+    feature_cols = ['importanceScore', 'riskScore']
+    for col in ['avgWeightedRisk', 'Duration']:
+        if col in df.columns:
+            series = pd.to_numeric(df[col], errors='coerce').fillna(0)
+            if series.std() > 0:  # only include if it carries signal
+                feature_cols.append(col)
+
+    feats = df[feature_cols].apply(pd.to_numeric, errors='coerce').fillna(0).values.astype(float)
+
+    # Normalize when using more than the original 2 features so scale differences
+    # between e.g. Duration (days) and riskScore (1-10) don't dominate KMeans
+    if feats.shape[1] > 2:
+        col_mean = np.mean(feats, axis=0)
+        col_std = np.std(feats, axis=0)
+        col_std[col_std == 0] = 1
+        feats = (feats - col_mean) / col_std
+
     n = len(df)
     
     if n < 2:
@@ -712,10 +769,13 @@ def _centralities(G: nx.DiGraph, df: pd.DataFrame):
             # Degree centrality
             deg = nk.centrality.DegreeCentrality(G_nk, normalized=True).run().scores()
             
+            # Betweenness centrality
+            betw = nk.centrality.Betweenness(G_nk, normalized=True).run().scores()
+
             # Clustering coefficient (need undirected)
             G_undirected = nka.nx2nk(G.to_undirected())
             lcc = nk.centrality.LocalClusteringCoefficient(G_undirected).run().scores()
-            
+
             # Map back to dataframe efficiently
             centrality_data = []
             for idx, row in df.iterrows():
@@ -726,6 +786,7 @@ def _centralities(G: nx.DiGraph, df: pd.DataFrame):
                         'PageRank': pr[nk_idx],
                         'closeness_centrality': close[nk_idx],
                         'degree_centrality': deg[nk_idx],
+                        'betweenness_centrality': betw[nk_idx],
                         'Clustering_Coefficient': lcc[nk_idx]
                     })
                 else:
@@ -733,6 +794,7 @@ def _centralities(G: nx.DiGraph, df: pd.DataFrame):
                         'PageRank': 0,
                         'closeness_centrality': 0,
                         'degree_centrality': 0,
+                        'betweenness_centrality': 0,
                         'Clustering_Coefficient': 0
                     })
             
@@ -754,17 +816,18 @@ def _centralities(G: nx.DiGraph, df: pd.DataFrame):
 
 def _centralities_nx(G: nx.DiGraph, df: pd.DataFrame):
     """Pure NetworkX centrality computation"""
-    # Compute centralities
     pr = nx.pagerank(G, alpha=0.9)
     close = nx.closeness_centrality(G)
     deg = nx.degree_centrality(G)
+    betw = nx.betweenness_centrality(G, normalized=True)
     clust = nx.clustering(G.to_undirected())
-    
-    # Vectorized mapping
-    df['PageRank'] = df['ID'].astype(str).map(pr).fillna(0)
-    df['closeness_centrality'] = df['ID'].astype(str).map(close).fillna(0)
-    df['degree_centrality'] = df['ID'].astype(str).map(deg).fillna(0)
-    df['Clustering_Coefficient'] = df['ID'].astype(str).map(clust).fillna(0)
+
+    id_str = df['ID'].astype(str)
+    df['PageRank'] = id_str.map(pr).fillna(0)
+    df['closeness_centrality'] = id_str.map(close).fillna(0)
+    df['degree_centrality'] = id_str.map(deg).fillna(0)
+    df['betweenness_centrality'] = id_str.map(betw).fillna(0)
+    df['Clustering_Coefficient'] = id_str.map(clust).fillna(0)
 
 def _community_detection(G: nx.DiGraph, df: pd.DataFrame):
     """Community detection using NetworkKit when available"""
@@ -834,6 +897,147 @@ def _community_detection_nx(G: nx.DiGraph, df: pd.DataFrame):
         df['CommunityGroup'] = 0
 
 ###############################################################################
+# Multi-resolution community detection                                        #
+###############################################################################
+
+_TIER_LABELS = {
+    0.1: 'ultra_coarse', 0.3: 'macro_systems', 0.5: 'macro_systems',
+    1.0: 'systems', 2.0: 'work_packages', 2.5: 'work_packages', 4.0: 'work_fronts',
+}
+
+def _resolution_ladder(n_nodes):
+    """Adaptive resolution ladder based on schedule size (from guidance doc)."""
+    if n_nodes < 100:
+        return [0.5, 1.0, 2.0]
+    if n_nodes < 500:
+        return [0.3, 1.0, 2.5]
+    if n_nodes < 5000:
+        return [0.3, 1.0, 2.5, 4.0]
+    return [0.1, 0.3, 1.0, 2.5, 4.0]
+
+def _run_louvain(G_undirected, gamma):
+    """Single Louvain run at a given resolution. Returns list-of-sets."""
+    if _NK and len(G_undirected) > 100:
+        try:
+            node_list = list(G_undirected.nodes())
+            G_nk = nka.nx2nk(G_undirected)
+            algo = nk.community.PLM(G_nk, gamma=gamma)
+            algo.run()
+            partition = algo.getPartition()
+            comm_map = {}
+            for node_idx in range(len(node_list)):
+                comm_id = partition.subsetOf(node_idx)
+                comm_map.setdefault(comm_id, set()).add(node_list[node_idx])
+            return list(comm_map.values())
+        except Exception as e:
+            logging.warning(f"NetworkKit Louvain (γ={gamma}) failed: {e}")
+    # NetworkX fallback
+    try:
+        return list(nx.algorithms.community.louvain_communities(
+            G_undirected, weight='weight', resolution=gamma, seed=0
+        ))
+    except AttributeError:
+        return list(nx.algorithms.community.greedy_modularity_communities(
+            G_undirected, weight='weight'
+        ))
+
+def _enforce_max_community_size(G_undirected, communities, gamma, n_total):
+    """Split oversized communities by re-running Louvain at 2× resolution on the subgraph."""
+    max_size = max(int(n_total * MAX_COMMUNITY_RATIO), 2)
+    result = []
+    for comm in communities:
+        if len(comm) <= max_size:
+            result.append(comm)
+        else:
+            subgraph = G_undirected.subgraph(comm)
+            try:
+                sub_comms = list(nx.algorithms.community.louvain_communities(
+                    subgraph, weight='weight', resolution=gamma * 2, seed=0
+                ))
+                result.extend(sub_comms)
+            except Exception:
+                result.append(comm)
+    return result
+
+def _multi_resolution_communities(G, df, deadline=None):
+    """Run Louvain at multiple resolutions, build tiered community structure."""
+    n = len(G)
+    if n < 2:
+        df['CommunityGroup'] = 0
+        return df, {'tiers': []}
+
+    G_undirected = G.to_undirected()
+    if G_undirected.number_of_edges() == 0:
+        df['CommunityGroup'] = 0
+        return df, {'tiers': []}
+
+    ladder = _resolution_ladder(n)
+    tiers = []
+    default_set = False
+
+    for gamma in ladder:
+        if deadline:
+            _check_deadline(deadline, f"community detection γ={gamma}")
+
+        communities = _run_louvain(G_undirected, gamma)
+        communities = _enforce_max_community_size(G_undirected, communities, gamma, n)
+
+        # Build node → community mapping
+        node_to_comm = {}
+        for comm_id, members in enumerate(communities):
+            for node in members:
+                node_to_comm[node] = comm_id
+
+        label = _TIER_LABELS.get(gamma, f'tier_{gamma}')
+        tier_col = f'CommunityGroup_{label}'
+        df[tier_col] = df['ID'].astype(str).map(node_to_comm).fillna(-1).astype(int)
+
+        # The tier matching COMMUNITY_RESOLUTION (default γ=1.0) populates CommunityGroup
+        if gamma == COMMUNITY_RESOLUTION:
+            df['CommunityGroup'] = df[tier_col]
+            default_set = True
+
+        tiers.append({
+            'resolution': gamma,
+            'label': label,
+            'n_communities': len(communities),
+            'column': tier_col,
+        })
+
+    # Fallback: if COMMUNITY_RESOLUTION wasn't in the ladder, use closest >= 1.0
+    if not default_set:
+        for t in tiers:
+            if t['resolution'] >= 1.0:
+                df['CommunityGroup'] = df[t['column']]
+                default_set = True
+                break
+        if not default_set and tiers:
+            df['CommunityGroup'] = df[tiers[-1]['column']]
+
+    return df, {'tiers': tiers}
+
+###############################################################################
+# Gateway / bridge activity detection                                         #
+###############################################################################
+
+def _detect_gateway_activities(df):
+    """Flag high-betweenness nodes as gateway/bridge activities for interface management."""
+    if 'betweenness_centrality' not in df.columns:
+        df['is_gateway'] = False
+        return []
+
+    bc = df['betweenness_centrality']
+    positive = bc[bc > 0]
+    if positive.empty:
+        df['is_gateway'] = False
+        return []
+
+    threshold = np.percentile(positive, GATEWAY_PERCENTILE)
+    mask = bc >= threshold
+    df['is_gateway'] = mask
+    return df.loc[mask, 'ID'].astype(str).tolist()
+
+###############################################################################
 # Main analysis function                                                      #
 ###############################################################################
 
@@ -857,7 +1061,9 @@ def analyse(nodes, links):
                 'work_packages': {},
                 'critical_path': [],
                 'critical_path_length': 0,
-                'templates': {}
+                'templates': {},
+                'community_tiers': [],
+                'gateway_activities': [],
             }
         
         # Create dataframes
@@ -907,23 +1113,26 @@ def analyse(nodes, links):
             logging.info(f"Dependency clustering took {time.time() - dep_start:.2f}s")
         _check_deadline(deadline, "dependency grouping")
 
-        # Community detection
-        df_nodes = _community_detection(G, df_nodes)
-        _check_deadline(deadline, "community detection")
+        # Multi-resolution community detection (replaces single-pass Louvain)
+        df_nodes, community_meta = _multi_resolution_communities(G, df_nodes, deadline)
 
-        # Centrality metrics
+        # Centrality metrics (includes betweenness for gateway detection)
         df_nodes = _centralities(G, df_nodes)
-        
-        # Work packages
-        work_packages = define_work_packages(df_nodes, G)
-        work_packages_serialized = serialize_work_packages(work_packages)
-        
-        # Critical path
+        _check_deadline(deadline, "centrality metrics")
+
+        # Gateway / bridge activity detection
+        gateway_activities = _detect_gateway_activities(df_nodes)
+
+        # Critical path (computed before work packages so KPIs can reference it)
         if nx.is_directed_acyclic_graph(G) and len(G) > 0:
             critical_path, critical_path_length = calculate_critical_path(G)
         else:
             critical_path, critical_path_length = [], 0
-        
+
+        # Work packages (enriched with controls KPIs)
+        work_packages = define_work_packages(df_nodes, G, critical_path=critical_path)
+        work_packages_serialized = serialize_work_packages(work_packages)
+
         # Build response
         response = {
             'nodes': df_nodes.replace({np.nan: None}).to_dict('records'),
@@ -931,7 +1140,9 @@ def analyse(nodes, links):
             'work_packages': work_packages_serialized,
             'critical_path': critical_path,
             'critical_path_length': float(critical_path_length),
-            'templates': templates
+            'templates': templates,
+            'community_tiers': community_meta.get('tiers', []),
+            'gateway_activities': gateway_activities,
         }
         
         # Garbage collection for large graphs
