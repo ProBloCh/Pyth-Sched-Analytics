@@ -22,7 +22,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Remove any old virtual environments or build artifacts
-RUN rm -rf venv antenv __pycache__ *.pyc .venv
+RUN rm -rf venv antenv __pycache__ *.pyc .venv tests/
 
 # Azure App Service expects port 8000
 EXPOSE 8000
@@ -40,6 +40,18 @@ ENV NUMEXPR_NUM_THREADS=1
 ENV OPENBLAS_NUM_THREADS=1
 ENV WEB_CONCURRENCY=2
 ENV DEBUG=false
+
+# Enterprise defaults (override via Azure App Settings / env vars)
+ENV REQUIRE_AUTH=false
+ENV RATE_LIMIT_ENABLED=true
+ENV RATE_LIMIT_REQUESTS=100
+ENV RATE_LIMIT_WINDOW=60
+ENV MAX_CONTENT_LENGTH_MB=50
+ENV MAX_NODES=50000
+ENV MAX_LINKS=200000
+ENV AUDIT_LOG_ENABLED=true
+ENV LOG_FORMAT=json
+ENV ALLOWED_ORIGINS=*
 
 # Add health check for Azure monitoring
 HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
