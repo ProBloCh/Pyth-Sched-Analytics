@@ -101,33 +101,49 @@ if REDIS_URL:
         logging.warning(f"Redis connection failed: {e}. Falling back to in-memory cache.")
         redis_client = None
 
+REDIS_RETRY_DELAY = 0.25  # seconds between retries for transient Redis errors
+
 def get_cached_result(key):
-    """Try Redis first, then fall back to LRU cache"""
+    """Try Redis first, then fall back to LRU cache. Retries once on transient errors."""
     if redis_client:
-        try:
-            cached = redis_client.get(key)
-            if cached:
-                if DEBUG:
-                    logging.info(f"Redis cache hit for key: {key[:8]}...")
-                return pickle.loads(cached)
-        except Exception as e:
-            if DEBUG:
+        for attempt in range(2):
+            try:
+                cached = redis_client.get(key)
+                if cached:
+                    if DEBUG:
+                        logging.info(f"Redis cache hit for key: {key[:8]}...")
+                    return pickle.loads(cached)
+                return None  # key simply not present — no retry needed
+            except (redis.ConnectionError, redis.TimeoutError) as e:
+                if attempt == 0:
+                    logging.warning(f"Redis get transient error (retrying): {e}")
+                    time.sleep(REDIS_RETRY_DELAY)
+                else:
+                    logging.warning(f"Redis get failed after retry: {e}")
+            except Exception as e:
                 logging.warning(f"Redis get failed: {e}")
+                break
     return None
 
 def set_cached_result(key, value, ttl=None):
-    """Store in Redis if available"""
+    """Store in Redis if available. Retries once on transient errors."""
     if redis_client:
-        try:
-            serialized = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
-            redis_client.setex(key, ttl or REDIS_CACHE_TTL, serialized)
-            if DEBUG:
-                logging.info(f"Cached result in Redis: {key[:8]}...")
-        except Exception as e:
-            # Log but don't fail the request on cache write errors
-            if DEBUG:
+        for attempt in range(2):
+            try:
+                serialized = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+                redis_client.setex(key, ttl or REDIS_CACHE_TTL, serialized)
+                if DEBUG:
+                    logging.info(f"Cached result in Redis: {key[:8]}...")
+                return
+            except (redis.ConnectionError, redis.TimeoutError) as e:
+                if attempt == 0:
+                    logging.warning(f"Redis set transient error (retrying): {e}")
+                    time.sleep(REDIS_RETRY_DELAY)
+                else:
+                    logging.warning(f"Redis set failed after retry: {e}")
+            except Exception as e:
                 logging.warning(f"Redis set failed: {e}")
-            # Continue without caching - the result is still valid
+                break
 
 ###############################################################################
 # Helpers                                                                     #
@@ -314,8 +330,7 @@ def serialize_work_packages(work_packages):
                 'end': end_str
             }
         except Exception as e:
-            if DEBUG:
-                logging.warning(f"Error serializing work package {key}: {e}")
+            logging.warning(f"Error serializing work package {key}: {e}")
             serialized_packages[key] = {
                 'tasks': package.get('tasks', []),
                 'critical_path': package.get('critical_path', []),
@@ -413,8 +428,7 @@ def ensure_dag(G: nx.DiGraph):
                 # NetworkKit doesn't have direct cycle removal
                 pass
         except Exception as e:
-            if DEBUG:
-                logging.warning(f"NetworkKit DAG check failed: {e}")
+            logging.warning(f"NetworkKit DAG check failed: {e}")
     
     # Remove cycles using NetworkX
     cycles_removed = 0
@@ -626,7 +640,7 @@ def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
             best_score = -1
             best_n_clusters = min(3, n)
             
-            clustering_kwargs = _agglomerative_precomputed_kwargs()
+            clustering_kwargs = _AGGLOMERATIVE_PRECOMPUTED_KWARGS
             for n_clusters in range(2, max_clusters + 1):
                 if n_clusters >= n:
                     break
@@ -645,8 +659,7 @@ def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
                             best_score = score
                             best_n_clusters = n_clusters
                 except Exception as e:
-                    if DEBUG:
-                        logging.warning(f"Clustering failed for {n_clusters} clusters: {e}")
+                    logging.warning(f"Clustering failed for {n_clusters} clusters: {e}")
                     continue
         
         # Final clustering
@@ -654,7 +667,7 @@ def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
         clustering = AgglomerativeClustering(
             n_clusters=best_n_clusters,
             linkage='complete',
-            **_agglomerative_precomputed_kwargs()
+            **_AGGLOMERATIVE_PRECOMPUTED_KWARGS
         )
         df['DependencyCluster'] = clustering.fit_predict(dist_sparse)
         
@@ -664,13 +677,15 @@ def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
     
     return df
 
-def _agglomerative_precomputed_kwargs():
-    """Return compatible kwargs for precomputed distance clustering across sklearn versions."""
+def _detect_agglomerative_precomputed_kwargs():
+    """Detect compatible kwargs for precomputed distance clustering across sklearn versions."""
     try:
         AgglomerativeClustering(metric='precomputed')
         return {'metric': 'precomputed'}
     except TypeError:
         return {'affinity': 'precomputed'}
+
+_AGGLOMERATIVE_PRECOMPUTED_KWARGS = _detect_agglomerative_precomputed_kwargs()
 
 def _centralities(G: nx.DiGraph, df: pd.DataFrame):
     """Compute centralities with NetworkKit acceleration when available"""
@@ -780,8 +795,7 @@ def _community_detection(G: nx.DiGraph, df: pd.DataFrame):
                 logging.info(f"NetworkKit found {n_communities} communities")
                 
         except Exception as e:
-            if DEBUG:
-                logging.warning(f"NetworkKit community detection failed: {e}")
+            logging.warning(f"NetworkKit community detection failed: {e}")
             _community_detection_nx(G, df)
     else:
         _community_detection_nx(G, df)
@@ -823,7 +837,16 @@ def _community_detection_nx(G: nx.DiGraph, df: pd.DataFrame):
 # Main analysis function                                                      #
 ###############################################################################
 
+class AnalysisTimeout(Exception):
+    """Raised when analysis exceeds the configured REQUEST_TIMEOUT."""
+
+def _check_deadline(deadline, stage):
+    """Raise AnalysisTimeout if the deadline has passed."""
+    if time.monotonic() > deadline:
+        raise AnalysisTimeout(f"Analysis timed out during {stage}")
+
 def analyse(nodes, links):
+    deadline = time.monotonic() + REQUEST_TIMEOUT
     try:
         # Validate input
         if not nodes:
@@ -860,18 +883,20 @@ def analyse(nodes, links):
         # Build and process graph
         G = build_nx_graph(nodes, links)
         G = ensure_dag(G)
-        
+        _check_deadline(deadline, "graph construction")
+
         # Pattern detection
         pattern_records = detect_repeating_patterns(df_nodes)
         templates = create_templates_from_patterns(pattern_records)
-        
+
         # Risk/importance clustering + PCA
         clustering_start = time.time() if DEBUG else None
         df_nodes = _cluster_risk_kmeans(df_nodes)
         df_nodes = _pca(df_nodes)
         if DEBUG:
             logging.info(f"Risk/importance clustering took {time.time() - clustering_start:.2f}s")
-        
+        _check_deadline(deadline, "clustering")
+
         # Dependency grouping
         dep_start = time.time() if DEBUG else None
         if len(df_nodes) > SMALL_GRAPH_THRESHOLD:
@@ -880,10 +905,12 @@ def analyse(nodes, links):
             df_nodes = _dependency_groups_small(G, df_nodes)
         if DEBUG:
             logging.info(f"Dependency clustering took {time.time() - dep_start:.2f}s")
-        
+        _check_deadline(deadline, "dependency grouping")
+
         # Community detection
         df_nodes = _community_detection(G, df_nodes)
-        
+        _check_deadline(deadline, "community detection")
+
         # Centrality metrics
         df_nodes = _centralities(G, df_nodes)
         
@@ -973,6 +1000,9 @@ def graph_metrics():
 
         return jsonify(res)
         
+    except AnalysisTimeout as exc:
+        logging.warning('Analysis timed out after %ss: %s', REQUEST_TIMEOUT, exc)
+        return jsonify({'error': f'Analysis timed out after {REQUEST_TIMEOUT}s'}), 504
     except Exception as exc:
         logging.exception('Analysis failed: %s', exc)
         error_msg = str(exc)
@@ -1058,7 +1088,8 @@ def handle_http_exception(e):
 @app.errorhandler(Exception)
 def unhandled(e):
     logging.exception('Unhandled: %s', e)
-    return jsonify({'error': str(e)}), 500
+    detail = str(e) if DEBUG else 'Internal server error'
+    return jsonify({'error': detail}), 500
 
 ###############################################################################
 # Local dev                                                                   #
