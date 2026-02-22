@@ -8,7 +8,6 @@ vectorized operations, and Python 3.12 optimizations
 import os, json, logging, hashlib, time, gc
 from functools import lru_cache
 from datetime import datetime, timezone
-import pickle
 
 # Set BLAS threads to prevent CPU contention with Gunicorn
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -48,6 +47,9 @@ MAX_PATTERNS = int(os.getenv("MAX_PATTERNS", 10))
 # Cache sizing: With multi-minute requests, consider CACHE_SIZE=128+ if hit rate drops below 80%
 CACHE_SIZE = int(os.getenv("CACHE_SIZE", 32))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 120))
+MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", 10 * 1024 * 1024))
+MAX_NODES = int(os.getenv("MAX_NODES", 50000))
+MAX_LINKS = int(os.getenv("MAX_LINKS", 200000))
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 ENABLE_SILHOUETTE_OPTIMIZATION = os.getenv("ENABLE_SILHOUETTE_OPTIMIZATION", "false").lower() == "true"
 COMMUNITY_RESOLUTION = float(os.getenv("COMMUNITY_RESOLUTION", 1.0))
@@ -102,24 +104,24 @@ if REDIS_URL:
         redis_client = None
 
 def get_cached_result(key):
-    """Try Redis first, then fall back to LRU cache"""
+    """Try Redis first, then fall back to LRU cache."""
     if redis_client:
         try:
             cached = redis_client.get(key)
             if cached:
                 if DEBUG:
                     logging.info(f"Redis cache hit for key: {key[:8]}...")
-                return pickle.loads(cached)
+                return json.loads(cached.decode('utf-8'))
         except Exception as e:
             if DEBUG:
                 logging.warning(f"Redis get failed: {e}")
     return None
 
 def set_cached_result(key, value, ttl=None):
-    """Store in Redis if available"""
+    """Store in Redis if available using JSON (avoid unsafe pickle deserialization)."""
     if redis_client:
         try:
-            serialized = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+            serialized = json.dumps(value, default=str, separators=(',', ':')).encode('utf-8')
             redis_client.setex(key, ttl or REDIS_CACHE_TTL, serialized)
             if DEBUG:
                 logging.info(f"Cached result in Redis: {key[:8]}...")
@@ -141,6 +143,53 @@ def _sha(payload):
 def _cached(nodes_json: str, links_json: str):
     """In-memory LRU cache as second-level cache"""
     return analyse(json.loads(nodes_json), json.loads(links_json))
+
+def _validate_graph_payload(nodes, links):
+    """Validate request shape and size to enforce a stable API contract."""
+    if not isinstance(nodes, list):
+        return False, "'nodes' must be a JSON array"
+    if not isinstance(links, list):
+        return False, "'links' must be a JSON array"
+    if len(nodes) == 0:
+        return False, "No nodes provided"
+    if len(nodes) > MAX_NODES:
+        return False, f"Payload too large: nodes={len(nodes)} exceeds limit={MAX_NODES}"
+    if len(links) > MAX_LINKS:
+        return False, f"Payload too large: links={len(links)} exceeds limit={MAX_LINKS}"
+
+    node_ids = set()
+    for idx, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            return False, f"node at index {idx} must be an object"
+        nid = str(node.get('ID', idx))
+        if nid in node_ids:
+            return False, f"duplicate node ID detected: {nid}"
+        node_ids.add(nid)
+
+    for idx, link in enumerate(links):
+        if not isinstance(link, dict):
+            return False, f"link at index {idx} must be an object"
+        if 'source' not in link or 'target' not in link:
+            return False, f"link at index {idx} must include 'source' and 'target'"
+        if str(link['source']) not in node_ids or str(link['target']) not in node_ids:
+            return False, f"link at index {idx} references unknown node IDs"
+
+    return True, None
+
+def _graph_stats(G: nx.DiGraph):
+    """Provide deterministic graph diagnostics in API responses."""
+    node_count = G.number_of_nodes()
+    edge_count = G.number_of_edges()
+    is_dag = nx.is_directed_acyclic_graph(G)
+    return {
+        'nodes': node_count,
+        'edges': edge_count,
+        'is_dag': is_dag,
+        'density': float(nx.density(G)) if node_count > 1 else 0.0,
+        'weak_components': nx.number_weakly_connected_components(G) if node_count > 0 else 0,
+        'sources': sum(1 for node in G.nodes if G.in_degree(node) == 0),
+        'sinks': sum(1 for node in G.nodes if G.out_degree(node) == 0)
+    }
 
 ###############################################################################
 # Pattern Detection (from v1)                                                 #
@@ -352,12 +401,14 @@ def build_nx_graph(nodes, links):
         nodes_df['ID'] = range(len(nodes_df))
     
     # Vectorized date parsing
-    nodes_df['start_date'] = pd.to_datetime(nodes_df.get('Start'), errors='coerce', utc=False)
+    start_series = nodes_df['Start'] if 'Start' in nodes_df.columns else pd.Series([None] * len(nodes_df), index=nodes_df.index)
+    nodes_df['start_date'] = pd.to_datetime(start_series, errors='coerce', utc=False)
     # Remove timezone info if present (future-compatible check)
     if getattr(nodes_df['start_date'].dtype, 'tz', None) is not None:
         nodes_df['start_date'] = nodes_df['start_date'].dt.tz_localize(None)
-    
-    nodes_df['duration'] = pd.to_numeric(nodes_df.get('Duration', 1), errors='coerce').fillna(1)
+
+    duration_series = nodes_df['Duration'] if 'Duration' in nodes_df.columns else pd.Series([1] * len(nodes_df), index=nodes_df.index)
+    nodes_df['duration'] = pd.to_numeric(duration_series, errors='coerce').fillna(1)
     
     # Vectorized end date calculation
     nodes_df['end_date'] = nodes_df['start_date'] + pd.to_timedelta(nodes_df['duration'], unit='D', errors='coerce')
@@ -470,15 +521,22 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
         
     feats = df[['importanceScore', 'riskScore']].values
     n = len(df)
-    
+
     if n < 2:
+        df['Cluster'] = 0
+        return df
+
+    # Avoid unstable/wasteful clustering when all points are identical
+    unique_points = np.unique(feats, axis=0)
+    unique_count = len(unique_points)
+    if unique_count < 2:
         df['Cluster'] = 0
         return df
     
     # Fast heuristic path (default)
     if not ENABLE_SILHOUETTE_OPTIMIZATION:
-        # Heuristic: sqrt(n/2) clusters, bounded between 2 and 10
-        k = max(2, min(10, int(np.sqrt(n / 2))))
+        # Heuristic: sqrt(n/2) clusters, bounded by unique points to avoid convergence warnings
+        k = max(2, min(10, int(np.sqrt(n / 2)), unique_count))
         
         if DEBUG:
             logging.info(f"Using heuristic k={k} for {n} nodes (silhouette optimization disabled)")
@@ -495,7 +553,7 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
     
     # Early exit for small datasets
     if n <= 15:
-        k = min(3, n)
+        k = min(3, n, unique_count)
         try:
             df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
         except ValueError:
@@ -503,7 +561,7 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
         return df
     
     # Full silhouette optimization
-    max_clusters = min(10, n)
+    max_clusters = min(10, n, unique_count)
     best, k = -1, min(3, n)
     
     for c in range(2, max_clusters + 1):
@@ -522,7 +580,7 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
             continue
     
     # Guard against edge cases
-    k = min(k, max(1, n))
+    k = min(k, max(1, n), unique_count)
     try:
         df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
     except ValueError:
@@ -538,7 +596,7 @@ def _pca(df):
         return df
         
     arr = df[['importanceScore', 'riskScore']].values
-    if len(arr) > 1:
+    if len(arr) > 1 and len(np.unique(arr, axis=0)) > 1:
         df[['pca1', 'pca2']] = PCA(2).fit_transform(arr)
     else:
         df['pca1'] = 0
@@ -824,6 +882,7 @@ def _community_detection_nx(G: nx.DiGraph, df: pd.DataFrame):
 ###############################################################################
 
 def analyse(nodes, links):
+    analysis_started = time.time()
     try:
         # Validate input
         if not nodes:
@@ -860,6 +919,7 @@ def analyse(nodes, links):
         # Build and process graph
         G = build_nx_graph(nodes, links)
         G = ensure_dag(G)
+        graph_stats = _graph_stats(G)
         
         # Pattern detection
         pattern_records = detect_repeating_patterns(df_nodes)
@@ -899,12 +959,15 @@ def analyse(nodes, links):
         
         # Build response
         response = {
+            'contract_version': '1.1',
             'nodes': df_nodes.replace({np.nan: None}).to_dict('records'),
             'links': df_links.replace({np.nan: None}).to_dict('records'),
             'work_packages': work_packages_serialized,
             'critical_path': critical_path,
             'critical_path_length': float(critical_path_length),
-            'templates': templates
+            'templates': templates,
+            'graph_stats': graph_stats,
+            'computation_ms': int((time.time() - analysis_started) * 1000)
         }
         
         # Garbage collection for large graphs
@@ -932,11 +995,16 @@ def graph_metrics():
     if request.method == 'OPTIONS':
         return jsonify({'status': 'ok'})
     
+    content_length = request.content_length or 0
+    if content_length > MAX_REQUEST_BYTES:
+        return jsonify({'error': f"Request too large: {content_length} bytes exceeds limit={MAX_REQUEST_BYTES}"}), 413
+
     data = request.get_json(force=True, silent=True) or {}
     nodes, links = data.get('nodes', []), data.get('links', [])
-    
-    if not nodes:
-        return jsonify({'error': 'No nodes provided'}), 400
+
+    valid, validation_error = _validate_graph_payload(nodes, links)
+    if not valid:
+        return jsonify({'error': validation_error}), 400
     
     # Generate cache key
     key = _sha([nodes, links])
@@ -970,6 +1038,7 @@ def graph_metrics():
         if DEBUG or elapsed > 5:
             logging.info(f"Graph processed in {elapsed:.2f}s (nodes: {len(nodes)}, links: {len(links)})")
         res['processing_time'] = elapsed
+        res.setdefault('contract_version', '1.1')
 
         return jsonify(res)
         
@@ -1027,7 +1096,10 @@ def health():
             'max_pattern_nodes': MAX_PATTERN_NODES,
             'cache_size': CACHE_SIZE,
             'debug': DEBUG,
-            'community_resolution': COMMUNITY_RESOLUTION
+            'community_resolution': COMMUNITY_RESOLUTION,
+            'max_nodes': MAX_NODES,
+            'max_links': MAX_LINKS,
+            'max_request_bytes': MAX_REQUEST_BYTES
         }
     }
     return jsonify(health_status)
