@@ -72,6 +72,22 @@ correctness, or adding tests when the scope warrants it. The CI pipeline has
 a placeholder for tests — prefer filling that gap over working without a
 safety net.
 
+## Running Locally
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Run in debug mode (Flask dev server, port 5000)
+DEBUG=true python app.py
+
+# Run production-like (Gunicorn, port 8000)
+gunicorn --workers 2 --threads 2 --bind 0.0.0.0:8000 --timeout 120 app:app
+
+# Health check
+curl http://localhost:8000/health
+```
+
 ## Project-Specific Rules
 
 ### Dual Graph Library Paths
@@ -112,6 +128,26 @@ matter:
 - Be aware of O(n^2) vs O(n) implications in any loop or matrix operation.
 - Thread-count env vars (`OMP_NUM_THREADS`, etc.) are set to `1` deliberately
   to prevent CPU contention under Gunicorn — do not remove them.
+
+### Import Order Is Load-Bearing
+
+The `os.environ.setdefault` calls for thread-count limits (`OMP_NUM_THREADS`,
+etc.) **must** appear before `numpy`, `scipy`, and `sklearn` imports. These
+libraries read the env vars at import time. If imports are reorganized above
+the `setdefault` block, thread limiting silently stops working. Do not
+reorder the top of `app.py`.
+
+### Caching and API Contract
+
+Response dicts are serialized with `pickle` into Redis (or LRU in-memory).
+Changing the structure of values returned by analytical functions can make
+cached entries incompatible — callers may get stale or malformed data until
+the cache expires or is flushed.
+
+The `POST /graph-metrics` response is consumed by a frontend
+(`CommunityGroups.js`). Renaming or removing response keys is a breaking
+change. Add new keys freely; modify or remove existing keys only with
+explicit intent to change the API contract.
 
 ### Deployment
 
