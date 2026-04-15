@@ -3,15 +3,22 @@
 ## Project Overview
 
 Flask-based API for analyzing schedule dependency networks in capital project
-management. Detects community structures, critical paths, repeating patterns,
-and work packages from activity graphs. Deployed to Azure via GitHub Actions.
+management. Two capability layers:
+
+1. **Descriptive analytics** (`POST /graph-metrics`) — community detection,
+   centrality, clustering, critical path, work packages.
+2. **Prescriptive analytics** (`solver/` package) — CADJ-P multi-objective
+   sensitivity analysis, gradient-descent optimization, and Pareto frontier
+   generation across schedule/cost/risk/resources/quality.
+
+Deployed to Azure via GitHub Actions.
 
 **Tech stack:** Python 3.12, Flask, NetworkX + NetworkKit (C++ acceleration),
 NumPy, Pandas, scikit-learn, SciPy, Redis (optional caching).
 
-**Architecture:** Single-file backend (`app.py`, ~1,070 LOC, 28 functions).
-One main endpoint (`POST /graph-metrics`) receives nodes + links JSON and
-returns structural analysis results.
+**Architecture:** `app.py` (~1,070 LOC) handles descriptive analytics.
+`solver/` (10 modules, ~1,480 LOC) is a Flask Blueprint registered in
+`app.py` that provides three prescriptive endpoints plus a health check.
 
 ## Four Principles
 
@@ -103,13 +110,27 @@ scikit-learn calls) without verifying output equivalence. Subtle changes to
 matrix operations, clustering parameters, or graph traversals can silently
 alter analytical results.
 
-### Single-File Architecture
+### Architecture: app.py + solver/ package
 
-All backend logic lives in `app.py`. Read and understand the relevant
-functions before editing — changes to imports, module-level state, or shared
-helpers affect the entire file. When the scope of work calls for a new module
-(e.g., the multi-resolution pipeline), create a separate file as recommended
-in `docs/cybereum-multiresolution-guidance.md`.
+Descriptive analytics lives in `app.py` (single file). Prescriptive analytics
+lives in `solver/` (10-module Flask Blueprint). The solver is registered in
+`app.py` via two lines after `CORS(app, ...)`:
+
+```python
+from solver import solver_bp
+app.register_blueprint(solver_bp)
+```
+
+**`app.py` rules:** Read and understand the relevant functions before editing —
+changes to imports, module-level state, or shared helpers affect the entire
+file.
+
+**`solver/` rules:** The package has clear module boundaries (models, dag,
+objectives, adjoints, stochastic, optimizer, pareto, analysis, core, routes).
+Changes to shared interfaces (e.g., `DAGState`, `ActivityParams`,
+`compute_gradients` signatures) ripple across modules. The `routes.py` uses
+a lazy import for caching functions from `app.py` to avoid circular
+dependencies — do not convert this to a top-level import.
 
 ### Multi-Resolution Pipeline
 
@@ -148,6 +169,29 @@ The `POST /graph-metrics` response is consumed by a frontend
 (`CommunityGroups.js`). Renaming or removing response keys is a breaking
 change. Add new keys freely; modify or remove existing keys only with
 explicit intent to change the API contract.
+
+The solver endpoints (`/solver/sensitivity`, `/solver/optimize`,
+`/solver/pareto`) use the same Redis caching via lazy import. Their response
+contracts are consumed by the C# backend (`ComputeMetrics.cs`) and JS
+frontend. The same rule applies: add new keys freely, don't rename/remove
+existing ones.
+
+### Solver-Specific Rules
+
+- **Numerical correctness in adjoints:** The resource adjoint uses finite
+  differences (review section 1.5) because the smoothed trapezoidal profile
+  has non-differentiable step boundaries. Do not replace with analytical
+  gradients without verifying equivalence.
+- **Cost adjoint cross-terms:** `dC/dd` includes the resource factor and
+  `dC/dr` includes the duration factor (review section 1.3). These are not
+  bugs — they are the correct partial derivatives for `C = rate * r * d`.
+- **State mutation in finite differences:** `resource_adj_dur` in
+  `adjoints.py` temporarily mutates `DAGState` via `run_cpm` and restores
+  it. This is safe for single-threaded Flask/Gunicorn workers but is not
+  thread-safe. Do not call from concurrent threads on the same state object.
+- **Stochastic seed:** Monte Carlo uses `seed=42` for reproducibility. The
+  antithetic variates pattern (section 1.8) relies on `z` and `-z` pairing;
+  do not shuffle the sample order.
 
 ### Deployment
 
