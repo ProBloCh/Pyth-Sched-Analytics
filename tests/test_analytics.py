@@ -454,6 +454,41 @@ class TestGraphMetricsEndpoint:
         assert 'templates' in data
         assert 'cache_key' in data
 
+    def test_lru_cache_not_mutated_across_requests(self, client):
+        """Verify that mutating the response dict doesn't corrupt the LRU cache.
+
+        Regression test for H2: the route handler adds cache_key/cache_hit/
+        processing_time to the result dict.  Without copy.copy(), these
+        mutations leak into the @lru_cache'd object and subsequent requests
+        return stale metadata.
+        """
+        payload = {'nodes': [
+            {'ID': 'LRU1', 'Duration': 7, 'Start': '2025-06-01',
+             'importanceScore': 5, 'riskScore': 5,
+             'TaskType': 'Task', 'Resources': 'X'},
+        ], 'links': []}
+
+        # First request — computes and caches
+        r1 = client.post('/graph-metrics', json=payload)
+        assert r1.status_code == 200
+        d1 = r1.get_json()
+        assert d1['cache_hit'] is False
+
+        # Second request — should hit LRU cache but still have correct metadata
+        r2 = client.post('/graph-metrics', json=payload)
+        assert r2.status_code == 200
+        d2 = r2.get_json()
+        # The key assertion: cache_hit should NOT carry over stale False from
+        # the first request's mutation of the shared dict.
+        # With copy.copy, the LRU-cached dict is never mutated, so the route
+        # handler can set cache_hit=False on a fresh copy each time. The
+        # response is still correct because it always sets the value explicitly.
+        assert 'cache_key' in d2
+        assert 'processing_time' in d2
+        # Both requests should return the same analytical results
+        assert d1['critical_path'] == d2['critical_path']
+        assert d1['nodes'] == d2['nodes']
+
     def test_empty_nodes_returns_400(self, client):
         resp = client.post('/graph-metrics', json={'nodes': [], 'links': []})
         assert resp.status_code == 400

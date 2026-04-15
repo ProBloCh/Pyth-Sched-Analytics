@@ -142,18 +142,23 @@ def set_cached_result(key, value, ttl=None):
 ###############################################################################
 
 def _json_default(obj):
-    """JSON serializer for numpy/pandas types in cache values."""
+    """JSON serializer for numpy/pandas types in cache values.
+
+    Raises TypeError for unrecognised types so json.dumps fails fast
+    and the caller's except block skips caching rather than storing
+    silently corrupted data.
+    """
+    if isinstance(obj, np.bool_):
+        return bool(obj)
     if isinstance(obj, np.integer):
         return int(obj)
     if isinstance(obj, np.floating):
         return float(obj)
-    if isinstance(obj, np.bool_):
-        return bool(obj)
     if isinstance(obj, np.ndarray):
         return obj.tolist()
     if isinstance(obj, (datetime, pd.Timestamp)):
         return obj.isoformat()
-    return str(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 def _sha(payload):
     """Generate cache key from payload"""
