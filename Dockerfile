@@ -18,11 +18,17 @@ COPY requirements.txt .
 # Install Python packages
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Create non-root user before copying application code
+RUN useradd --create-home --shell /bin/bash appuser
+
 # Copy the rest of the application
-COPY . .
+COPY --chown=appuser:appuser . .
 
 # Remove any old virtual environments or build artifacts
 RUN rm -rf venv antenv __pycache__ *.pyc .venv
+
+# Switch to non-root user
+USER appuser
 
 # Azure App Service expects port 8000
 EXPOSE 8000

@@ -8,7 +8,7 @@ vectorized operations, and Python 3.12 optimizations
 import os, json, logging, hashlib, time, gc
 from functools import lru_cache
 from datetime import datetime, timezone
-import pickle
+import copy
 
 # Set BLAS threads to prevent CPU contention with Gunicorn
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -116,7 +116,7 @@ def get_cached_result(key):
             if cached:
                 if DEBUG:
                     logging.info(f"Redis cache hit for key: {key[:8]}...")
-                return pickle.loads(cached)
+                return json.loads(cached)
         except Exception as e:
             if DEBUG:
                 logging.warning(f"Redis get failed: {e}")
@@ -126,7 +126,8 @@ def set_cached_result(key, value, ttl=None):
     """Store in Redis if available"""
     if redis_client:
         try:
-            serialized = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+            serialized = json.dumps(value, default=_json_default,
+                                     separators=(',', ':')).encode('utf-8')
             redis_client.setex(key, ttl or REDIS_CACHE_TTL, serialized)
             if DEBUG:
                 logging.info(f"Cached result in Redis: {key[:8]}...")
@@ -139,6 +140,20 @@ def set_cached_result(key, value, ttl=None):
 ###############################################################################
 # Helpers                                                                     #
 ###############################################################################
+
+def _json_default(obj):
+    """JSON serializer for numpy/pandas types in cache values."""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (datetime, pd.Timestamp)):
+        return obj.isoformat()
+    return str(obj)
 
 def _sha(payload):
     """Generate cache key from payload"""
@@ -423,9 +438,10 @@ def ensure_dag(G: nx.DiGraph):
             if DEBUG:
                 logging.warning(f"NetworkKit DAG check failed: {e}")
     
-    # Remove cycles using NetworkX
+    # Remove cycles using NetworkX (cap iterations to avoid runaway loops)
+    max_cycle_removals = max(len(G.edges) // 2, 100)
     cycles_removed = 0
-    while True:
+    while cycles_removed < max_cycle_removals:
         try:
             cycle = nx.find_cycle(G, orientation='original')
             u, v = cycle[0][0], cycle[0][1]
@@ -435,6 +451,10 @@ def ensure_dag(G: nx.DiGraph):
                 logging.info(f"Removed edge to break cycle: {u} -> {v}")
         except nx.NetworkXNoCycle:
             break
+
+    if cycles_removed >= max_cycle_removals:
+        logging.warning(f"Cycle removal capped at {max_cycle_removals}. "
+                        f"Graph may still contain cycles.")
     
     if DEBUG and cycles_removed > 0:
         logging.info(f"Removed {cycles_removed} edges to break cycles")
@@ -962,10 +982,11 @@ def graph_metrics():
     
     try:
         # Use in-memory LRU cache as second level
-        res = _cached(
+        # copy.copy to avoid mutating the dict stored inside @lru_cache
+        res = copy.copy(_cached(
             json.dumps(nodes, sort_keys=True, default=str),
             json.dumps(links, sort_keys=True, default=str)
-        )
+        ))
         res['cache_key'] = key
         res['cache_hit'] = False
         
