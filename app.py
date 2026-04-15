@@ -76,6 +76,9 @@ CORS(app,
      allow_headers=["Content-Type", "Authorization"],
      methods=["GET", "POST", "OPTIONS"])
 
+from solver import solver_bp
+app.register_blueprint(solver_bp)
+
 ###############################################################################
 # Redis Cache Setup                                                           #
 ###############################################################################
