@@ -6,12 +6,15 @@ each, and filters to non-dominated solutions.
 """
 
 import logging
+import time
 import numpy as np
 from .dag import build_dag
 from .models import SolverConfig, build_activity_params
 from .optimizer import optimize
 
 logger = logging.getLogger(__name__)
+
+WALL_TIME_LIMIT = 300  # 5 minutes — safety net for Pareto sweeps
 
 
 # ---------------------------------------------------------------------------
@@ -96,11 +99,23 @@ def run_pareto(nodes, links, activity_metadata, project_ctx, config,
 
     Each weight vector gets a fresh DAG + params to avoid cross-contamination.
     """
+    t0 = time.time()
+    deadline = t0 + WALL_TIME_LIMIT
+
     disciplines = config.disciplines
     weight_vectors = generate_weight_vectors(disciplines, n_vectors)
     all_solutions = []
 
+    logger.info("Pareto sweep start: %d vectors, %d disciplines",
+                len(weight_vectors), len(disciplines))
+
     for idx, wv in enumerate(weight_vectors):
+        if time.time() > deadline:
+            logger.warning("Pareto sweep hit wall-time limit after %d/%d "
+                           "vectors (%.1fs)", idx, len(weight_vectors),
+                           time.time() - t0)
+            break
+
         dag_state, _ = build_dag(nodes, links)
         params = build_activity_params(nodes, activity_metadata)
 
@@ -113,7 +128,8 @@ def run_pareto(nodes, links, activity_metadata, project_ctx, config,
             learning_rate=config.learning_rate,
         )
 
-        result = optimize(dag_state, params, project_ctx, run_cfg)
+        result = optimize(dag_state, params, project_ctx, run_cfg,
+                          deadline=deadline)
         all_solutions.append({
             'index':      idx,
             'weights':    wv,
@@ -125,6 +141,9 @@ def run_pareto(nodes, links, activity_metadata, project_ctx, config,
         })
 
     frontier = filter_pareto_front(all_solutions, disciplines)
+    logger.info("Pareto sweep done: %d/%d vectors, %d frontier points, %.1fs",
+                len(all_solutions), len(weight_vectors), len(frontier),
+                time.time() - t0)
 
     return {
         'frontier':      frontier,

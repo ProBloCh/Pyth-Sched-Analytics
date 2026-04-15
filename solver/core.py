@@ -32,6 +32,12 @@ def run_sensitivity(nodes, links, solver_config_dict,
 
     project_ctx = ProjectContext.from_dict(project_context_dict)
     config = SolverConfig.from_dict(solver_config_dict, phase=project_ctx.phase)
+
+    logger.info("Sensitivity: %d nodes, %d links, disciplines=%s, "
+                "phase=%s, stochastic=%s",
+                len(nodes), len(links), config.disciplines,
+                project_ctx.phase, config.stochastic)
+
     dag_state, id_to_idx = build_dag(nodes, links)
     params = build_activity_params(nodes, activity_metadata)
 
@@ -53,6 +59,10 @@ def run_sensitivity(nodes, links, solver_config_dict,
     cp_ids = [params.ids[i] for i in get_critical_path_indices(dag_state)
               if i < params.n]
 
+    elapsed_ms = round((time.time() - t0) * 1000, 1)
+    logger.info("Sensitivity done: makespan=%.1f, critical_path_len=%d, "
+                "%.1fms", dag_state.makespan, len(cp_ids), elapsed_ms)
+
     result = {
         'objectives':     {d: float(v) for d, v in objectives.items()},
         'makespan':       dag_state.makespan,
@@ -63,7 +73,7 @@ def run_sensitivity(nodes, links, solver_config_dict,
             'disciplines': config.disciplines,
             'weights':     config.weights,
         },
-        'computation_ms': round((time.time() - t0) * 1000, 1),
+        'computation_ms': elapsed_ms,
     }
 
     if stochastic:
@@ -87,6 +97,12 @@ def run_optimize(nodes, links, solver_config_dict,
 
     project_ctx = ProjectContext.from_dict(project_context_dict)
     config = SolverConfig.from_dict(solver_config_dict, phase=project_ctx.phase)
+
+    logger.info("Optimize: %d nodes, %d links, disciplines=%s, "
+                "max_iter=%d, stochastic=%s",
+                len(nodes), len(links), config.disciplines,
+                config.max_iterations, config.stochastic)
+
     dag_state, _ = build_dag(nodes, links)
     params = build_activity_params(nodes, activity_metadata)
 
@@ -111,6 +127,8 @@ def run_optimize(nodes, links, solver_config_dict,
             'on_critical_path':   bool(dag_state.critical_mask[i]),
         })
 
+    elapsed_ms = round((time.time() - t0) * 1000, 1)
+
     result = {
         'initial_objectives': opt['initial_objectives'],
         'final_objectives':   opt['final_objectives'],
@@ -132,7 +150,7 @@ def run_optimize(nodes, links, solver_config_dict,
             'weights':       config.weights,
             'max_iterations': config.max_iterations,
         },
-        'computation_ms': round((time.time() - t0) * 1000, 1),
+        'computation_ms': elapsed_ms,
     }
 
     if stochastic:
@@ -141,6 +159,11 @@ def run_optimize(nodes, links, solver_config_dict,
             'objectives_std':  stochastic['objectives_std'],
             'n_samples':       stochastic['n_samples'],
         }
+
+    logger.info("Optimize done: %d iterations, converged=%s, "
+                "makespan=%.1f, %.1fms",
+                opt['iterations'], opt['converged'],
+                dag_state.makespan, elapsed_ms)
 
     return result
 

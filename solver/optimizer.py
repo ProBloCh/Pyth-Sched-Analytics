@@ -7,6 +7,7 @@ Minimises a weighted sum of objectives subject to box constraints:
 """
 
 import logging
+import time
 import numpy as np
 from .dag import run_cpm
 from .objectives import compute_objectives
@@ -14,8 +15,10 @@ from .adjoints import compute_gradients
 
 logger = logging.getLogger(__name__)
 
+WALL_TIME_LIMIT = 120  # seconds — safety net; Gunicorn --timeout is primary
 
-def optimize(dag_state, params, project_ctx, config):
+
+def optimize(dag_state, params, project_ctx, config, deadline=None):
     """
     Run projected gradient descent.
 
@@ -32,6 +35,10 @@ def optimize(dag_state, params, project_ctx, config):
     if n == 0:
         return _empty(disciplines)
 
+    t0 = time.time()
+    if deadline is None:
+        deadline = t0 + WALL_TIME_LIMIT
+
     # Initial objectives and normalisation scales
     initial = compute_objectives(dag_state, params, project_ctx, disciplines)
     scales = {d: max(abs(initial.get(d, 0.0)), 1e-12) for d in disciplines}
@@ -39,9 +46,21 @@ def optimize(dag_state, params, project_ctx, config):
     lr = config.learning_rate
     history = []
     converged = False
+    timed_out = False
     prev_w = None
 
+    logger.info("Optimizer start: %d activities, %d disciplines, "
+                "max_iter=%d, lr=%.4f",
+                n, len(disciplines), config.max_iterations, lr)
+
     for it in range(config.max_iterations):
+        # Wall-time guard
+        if time.time() > deadline:
+            logger.warning("Optimizer hit wall-time limit after %d iterations "
+                           "(%.1fs)", it, time.time() - t0)
+            timed_out = True
+            break
+
         objs = compute_objectives(dag_state, params, project_ctx, disciplines)
         w_obj = sum(weights.get(d, 0.0) * objs.get(d, 0.0) / scales[d]
                     for d in disciplines)
@@ -57,6 +76,8 @@ def optimize(dag_state, params, project_ctx, config):
             rel = abs(w_obj - prev_w) / max(abs(prev_w), 1e-12)
             if rel < config.convergence_threshold:
                 converged = True
+                logger.info("Optimizer converged at iteration %d "
+                            "(rel_change=%.2e)", it, rel)
                 break
         prev_w = w_obj
 
@@ -77,6 +98,10 @@ def optimize(dag_state, params, project_ctx, config):
         # Project onto feasible set
         _project(params)
         run_cpm(dag_state, params.durations)
+
+    elapsed = time.time() - t0
+    logger.info("Optimizer done: %d iterations, converged=%s, %.1fs",
+                len(history), converged, elapsed)
 
     final = compute_objectives(dag_state, params, project_ctx, disciplines)
 

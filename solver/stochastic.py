@@ -6,10 +6,14 @@ for objectives and gradients.  Antithetic variates (review section 1.8)
 halve variance at negligible extra cost.
 """
 
+import logging
+import time
 import numpy as np
 from .dag import run_cpm
 from .objectives import compute_objectives
 from .adjoints import compute_gradients
+
+logger = logging.getLogger(__name__)
 
 
 def run_ensemble(dag_state, params, project_ctx, config):
@@ -22,12 +26,16 @@ def run_ensemble(dag_state, params, project_ctx, config):
         n_samples
     }
     """
+    t0 = time.time()
     M = config.monte_carlo_samples
     disciplines = config.disciplines
     n = dag_state.n
 
     if n == 0:
         return _empty(disciplines)
+
+    logger.info("MC ensemble start: M=%d, n=%d, antithetic=%s",
+                M, n, config.antithetic_variates)
 
     rng = np.random.default_rng(seed=42)
     sigma = 0.15  # 15 % CV on durations (log-normal)
@@ -93,6 +101,7 @@ def run_ensemble(dag_state, params, project_ctx, config):
                 'resources': float(np.mean(np.std(res_m, axis=0))),
             }
 
+    logger.info("MC ensemble done: %d samples, %.1fs", M, time.time() - t0)
     return result
 
 
