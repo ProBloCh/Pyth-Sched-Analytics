@@ -179,7 +179,7 @@ def run_pareto_endpoint(nodes, links, solver_config_dict,
 
     project_ctx = ProjectContext.from_dict(project_context_dict)
     config = SolverConfig.from_dict(solver_config_dict, phase=project_ctx.phase)
-    n_vec = (solver_config_dict or {}).get('pareto_vectors', 30)
+    n_vec = int((solver_config_dict or {}).get('pareto_vectors', 30))
 
     pareto = _run_pareto(nodes, links, activity_metadata,
                          project_ctx, config, n_vec)

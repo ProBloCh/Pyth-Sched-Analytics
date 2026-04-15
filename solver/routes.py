@@ -27,6 +27,13 @@ logger = logging.getLogger(__name__)
 
 solver_bp = Blueprint('solver', __name__, url_prefix='/solver')
 
+
+@solver_bp.record_once
+def _set_max_content_length(state):
+    """Enforce server-side payload limit (covers chunked encoding too)."""
+    state.app.config.setdefault('MAX_CONTENT_LENGTH', 10 * 1024 * 1024)
+
+
 # ---------------------------------------------------------------------------
 # Limits
 # ---------------------------------------------------------------------------
@@ -267,7 +274,7 @@ def sensitivity():
         return jsonify(result)
     except Exception as e:
         logger.exception("Sensitivity analysis failed: %s", e)
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'Internal solver error'}), 500
 
 
 @solver_bp.route('/optimize', methods=['POST', 'OPTIONS'])
@@ -302,7 +309,7 @@ def optimize_endpoint():
         return jsonify(result)
     except Exception as e:
         logger.exception("Optimisation failed: %s", e)
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'Internal solver error'}), 500
 
 
 @solver_bp.route('/pareto', methods=['POST', 'OPTIONS'])
@@ -337,7 +344,7 @@ def pareto():
         return jsonify(result)
     except Exception as e:
         logger.exception("Pareto analysis failed: %s", e)
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'Internal solver error'}), 500
 
 
 @solver_bp.route('/health', methods=['GET'])

@@ -45,7 +45,12 @@ def resource_objective(dag_state, params, project_ctx=None):
 
     capacity = 10.0
     if project_ctx and project_ctx.resource_capacities:
-        capacity = float(next(iter(project_ctx.resource_capacities.values())))
+        try:
+            cap = float(next(iter(project_ctx.resource_capacities.values())))
+            if np.isfinite(cap) and cap > 0:
+                capacity = cap
+        except (TypeError, ValueError, StopIteration):
+            pass
 
     makespan = dag_state.makespan
     n_bins = min(int(np.ceil(makespan)), 500)

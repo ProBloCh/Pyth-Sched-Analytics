@@ -120,6 +120,17 @@ class ProjectContext:
         )
 
 
+def _safe_float(value, default, lo=0.0, hi=1e12):
+    """Convert to float, clamping to [lo, hi] and replacing NaN/Inf."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not np.isfinite(v):
+        return float(default)
+    return max(lo, min(v, hi))
+
+
 def build_activity_params(nodes, activity_metadata):
     """Construct ActivityParams from request nodes + metadata dicts."""
     if not activity_metadata:
@@ -133,12 +144,13 @@ def build_activity_params(nodes, activity_metadata):
         durs.append(dur)
 
         meta = activity_metadata.get(aid, {})
-        rcs.append(float(meta.get('resource_count', 1.0)))
-        bcosts.append(float(meta.get('baseline_cost', dur * 1000.0)))
-        rates.append(float(meta.get('resource_rate', 85.0)))
-        crash.append(float(meta.get('crash_max_fraction', 0.2)))
-        risk.append(float(meta.get('combined_risk_score',
-                                   meta.get('external_risk_score', 0.5))))
+        rcs.append(_safe_float(meta.get('resource_count', 1.0), 1.0, lo=1.0))
+        bcosts.append(_safe_float(meta.get('baseline_cost', dur * 1000.0), dur * 1000.0))
+        rates.append(_safe_float(meta.get('resource_rate', 85.0), 85.0))
+        crash.append(_safe_float(meta.get('crash_max_fraction', 0.2), 0.2, lo=0.0, hi=1.0))
+        risk.append(_safe_float(
+            meta.get('combined_risk_score', meta.get('external_risk_score', 0.5)),
+            0.5, lo=0.0, hi=10.0))
 
     durs_arr = np.array(durs, dtype=np.float64)
     return ActivityParams(
