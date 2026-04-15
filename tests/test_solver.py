@@ -19,9 +19,10 @@ from solver.objectives import (
 )
 from solver.adjoints import (
     schedule_adj_dur, cost_adj_dur, cost_adj_res,
-    quality_adj_dur, compute_gradients,
+    quality_adj_dur, resource_adj_dur, compute_gradients,
 )
 from solver.optimizer import optimize
+from solver.stochastic import run_ensemble
 from solver.analysis import (
     analyze_conflicts_and_synergies, rank_interventions, compute_analysis,
 )
@@ -521,3 +522,149 @@ class TestCore:
         result = run_sensitivity([], [], {}, {}, {})
         assert result['makespan'] == 0.0
         assert result['sensitivity'] == []
+
+
+# =====================================================================
+# Regression tests for bug fixes
+# =====================================================================
+
+class TestBugfixRegressions:
+
+    def test_optimizer_zero_scale_quality(self, diamond_schedule,
+                                          diamond_metadata):
+        """Quality=0 at baseline must not dominate the weighted sum.
+
+        Previously scales used floor=1e-12, so quality's normalisation
+        coefficient became ~5e10, swamping every other discipline.
+        With floor=1.0 the coefficient is just the weight value.
+        """
+        nodes, links = diamond_schedule
+        state, _ = build_dag(nodes, links)
+        params = build_activity_params(nodes, diamond_metadata)
+        ctx = ProjectContext()
+        cfg = SolverConfig.from_dict({
+            'disciplines': ['schedule', 'cost', 'quality'],
+            'max_iterations': 20,
+        })
+
+        result = optimize(state, params, ctx, cfg)
+
+        # Schedule should actually improve (makespan goes down).
+        # With the old bug quality dominated and schedule barely moved.
+        sched_init = result['initial_objectives']['schedule']
+        sched_final = result['final_objectives']['schedule']
+        assert sched_final < sched_init, (
+            f"Schedule did not improve: {sched_init} -> {sched_final}")
+
+    def test_antithetic_m1_produces_samples(self, diamond_schedule,
+                                             diamond_metadata):
+        """M=1 with antithetic variates must produce at least 2 samples,
+        not zero (the old half=M//2=0 bug).
+        """
+        nodes, links = diamond_schedule
+        state, _ = build_dag(nodes, links)
+        params = build_activity_params(nodes, diamond_metadata)
+        ctx = ProjectContext()
+        cfg = SolverConfig.from_dict({
+            'monte_carlo_samples': 1,
+            'disciplines': ['schedule'],
+        })
+        cfg.stochastic = True
+
+        result = run_ensemble(state, params, ctx, cfg)
+        assert result['n_samples'] >= 2
+
+    def test_antithetic_odd_m(self, diamond_schedule, diamond_metadata):
+        """Odd M with antithetic rounds up to the nearest even pair."""
+        nodes, links = diamond_schedule
+        state, _ = build_dag(nodes, links)
+        params = build_activity_params(nodes, diamond_metadata)
+        cfg = SolverConfig.from_dict({
+            'monte_carlo_samples': 3,
+            'disciplines': ['schedule'],
+        })
+
+        result = run_ensemble(state, params, ProjectContext(), cfg)
+        # 3 // 2 = 1 pair -> 2 samples (not 0)
+        assert result['n_samples'] == 2
+
+    def test_ensemble_restores_duration_references(self, diamond_schedule,
+                                                    diamond_metadata):
+        """run_ensemble must not break aliasing between dag_state.durations
+        and params.durations.
+        """
+        nodes, links = diamond_schedule
+        state, _ = build_dag(nodes, links)
+        params = build_activity_params(nodes, diamond_metadata)
+        # Establish alias (as the optimizer does)
+        from solver.dag import run_cpm
+        run_cpm(state, params.durations)
+        assert state.durations is params.durations
+
+        cfg = SolverConfig.from_dict({
+            'monte_carlo_samples': 4,
+            'disciplines': ['schedule'],
+        })
+        run_ensemble(state, params, ProjectContext(), cfg)
+
+        # After ensemble, the original arrays should still be the same objects
+        assert state.durations is params.durations
+
+    def test_resource_adj_dur_preserves_reference(self, diamond_schedule,
+                                                   diamond_metadata):
+        """resource_adj_dur must restore dag_state.durations to the original
+        array reference, not a local copy.
+        """
+        nodes, links = diamond_schedule
+        state, _ = build_dag(nodes, links)
+        params = build_activity_params(nodes, diamond_metadata)
+        original_ref = state.durations
+
+        resource_adj_dur(state, params)
+
+        assert state.durations is original_ref
+        np.testing.assert_array_equal(state.durations, original_ref)
+
+    def test_quality_gradient_zero_baseline_activity(self):
+        """Activities with baseline_duration=0 must have zero quality
+        gradient (the objective contribution is identically zero).
+        """
+        nodes = [
+            {'ID': 'A', 'Duration': 10},
+            {'ID': 'Z', 'Duration': 0},   # zero-baseline activity
+        ]
+        state, _ = build_dag(nodes, [])
+        params = build_activity_params(nodes, {})
+
+        grad = quality_adj_dur(state, params)
+
+        # A has positive baseline -> gradient may be non-zero
+        # Z has zero baseline -> gradient MUST be zero
+        assert grad[1] == 0.0, (
+            f"Zero-baseline activity got non-zero quality gradient: {grad[1]}")
+
+    def test_quality_gradient_matches_fd_with_zero_baseline(self):
+        """Finite-difference check: quality gradient for a zero-baseline
+        activity should match the analytical gradient (both zero).
+        """
+        nodes = [
+            {'ID': 'A', 'Duration': 5},
+            {'ID': 'Z', 'Duration': 0},
+        ]
+        state, _ = build_dag(nodes, [])
+        params = build_activity_params(nodes, {})
+        # Crash A by 20% to make quality non-trivial for at least one activity
+        params.durations[0] = 4.0
+
+        analytical = quality_adj_dur(state, params)
+
+        eps = 1e-4
+        fd = np.zeros(2)
+        base = quality_objective(state, params)
+        for i in range(2):
+            orig = params.durations[i]
+            params.durations[i] = orig + eps
+            fd[i] = (quality_objective(state, params) - base) / eps
+            params.durations[i] = orig
+
+        np.testing.assert_allclose(analytical, fd, atol=1e-3)

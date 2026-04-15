@@ -105,7 +105,13 @@ def build_dag(nodes, links):
 
 
 def run_cpm(state, durations=None):
-    """Run forward/backward CPM passes.  Updates *state* in place."""
+    """Run forward/backward CPM passes.  Updates *state* in place.
+
+    Aliasing contract: when *durations* is provided, ``state.durations``
+    is set to that exact array (reference, not copy).  Callers that
+    temporarily swap durations (e.g. finite-difference loops) must
+    restore the original reference when done.
+    """
     if state.n == 0:
         return state
 

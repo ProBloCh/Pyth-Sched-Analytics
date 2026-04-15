@@ -41,7 +41,10 @@ def optimize(dag_state, params, project_ctx, config, deadline=None):
 
     # Initial objectives and normalisation scales
     initial = compute_objectives(dag_state, params, project_ctx, disciplines)
-    scales = {d: max(abs(initial.get(d, 0.0)), 1e-12) for d in disciplines}
+    # Floor of 1.0 prevents near-zero objectives (e.g. quality=0 at
+    # baseline) from producing enormous normalisation coefficients that
+    # would artificially dominate the weighted sum.
+    scales = {d: max(abs(initial.get(d, 0.0)), 1.0) for d in disciplines}
 
     lr = config.learning_rate
     history = []

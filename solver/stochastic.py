@@ -41,7 +41,7 @@ def run_ensemble(dag_state, params, project_ctx, config):
     sigma = 0.15  # 15 % CV on durations (log-normal)
 
     if config.antithetic_variates:
-        half = M // 2
+        half = max(M // 2, 1)  # at least one pair; M=1 must not produce 0 samples
         z = rng.standard_normal((half, n))
         z_all = np.concatenate([z, -z], axis=0)
         M = 2 * half
@@ -52,11 +52,13 @@ def run_ensemble(dag_state, params, project_ctx, config):
     grad_dur_acc = {d: [] for d in disciplines}
     grad_res_acc = {d: [] for d in disciplines}
 
-    saved_dur   = dag_state.durations.copy()
-    saved_param = params.durations.copy()
+    # Save original array references so we can restore aliasing after the loop.
+    orig_dag_dur   = dag_state.durations
+    orig_param_dur = params.durations
+    saved_values   = orig_dag_dur.copy()
 
     for m in range(M):
-        perturbed = saved_dur * np.exp(sigma * z_all[m])
+        perturbed = saved_values * np.exp(sigma * z_all[m])
         perturbed = np.maximum(perturbed, params.min_durations)
 
         run_cpm(dag_state, perturbed)
@@ -71,9 +73,12 @@ def run_ensemble(dag_state, params, project_ctx, config):
                 grad_dur_acc[d].append(grads[d]['duration'].copy())
                 grad_res_acc[d].append(grads[d]['resources'].copy())
 
-    # Restore original state
-    run_cpm(dag_state, saved_dur)
-    params.durations = saved_param
+    # Restore original state: write values back into original arrays
+    # and re-alias dag_state.durations to the original reference.
+    np.copyto(orig_dag_dur, saved_values)
+    np.copyto(orig_param_dur, saved_values)
+    run_cpm(dag_state, orig_dag_dur)
+    params.durations = orig_param_dur
 
     # Statistics
     result = {

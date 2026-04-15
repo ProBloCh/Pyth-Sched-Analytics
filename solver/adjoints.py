@@ -77,17 +77,18 @@ def resource_adj_dur(dag_state, params, project_ctx=None):
     grad = np.zeros(n, dtype=np.float64)
     base_val = resource_objective(dag_state, params, project_ctx)
 
-    saved = dag_state.durations.copy()
+    original = dag_state.durations          # save reference (may alias params.durations)
+    scratch = original.copy()
     for i in range(n):
-        old = saved[i]
-        saved[i] = old + _FD_EPS
-        run_cpm(dag_state, saved)
+        old = scratch[i]
+        scratch[i] = old + _FD_EPS
+        run_cpm(dag_state, scratch)
         grad[i] = (resource_objective(dag_state, params, project_ctx)
                     - base_val) / _FD_EPS
-        saved[i] = old
+        scratch[i] = old
 
-    # Restore original CPM state
-    run_cpm(dag_state, saved)
+    # Restore original CPM state with the original array reference
+    run_cpm(dag_state, original)
     return grad
 
 
@@ -117,8 +118,12 @@ def quality_adj_dur(dag_state, params, project_ctx=None):
     """
     dQ/dd_i = -2 * crash_frac_i * quality_sens_i.
     Negative because increasing duration reduces crash, improving quality.
+    Zero-baseline activities contribute nothing to the objective, so
+    their gradient is forced to zero (the chain rule only holds for bd > 0).
     """
-    return -2.0 * params.crash_fractions * params.quality_sensitivities
+    g = -2.0 * params.crash_fractions * params.quality_sensitivities
+    g[params.baseline_durations <= 0] = 0.0
+    return g
 
 
 def quality_adj_res(dag_state, params, project_ctx=None):
