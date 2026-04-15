@@ -192,6 +192,25 @@ def _validate_config(cfg):
         if ct <= 0 or math.isnan(ct) or math.isinf(ct):
             return 'convergence_threshold must be a positive finite number'
 
+    disciplines = cfg.get('disciplines')
+    if disciplines is not None:
+        if not isinstance(disciplines, list):
+            return 'disciplines must be a list of strings'
+        if not all(isinstance(d, str) for d in disciplines):
+            return 'disciplines must be a list of strings'
+
+    weights = cfg.get('weights')
+    if weights is not None:
+        if not isinstance(weights, dict):
+            return 'weights must be an object'
+        for k, v in weights.items():
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                return f'weight for {k} must be a number'
+            if math.isnan(fv) or math.isinf(fv) or fv < 0:
+                return f'weight for {k} must be a non-negative finite number'
+
     return None
 
 

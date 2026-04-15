@@ -215,6 +215,36 @@ class TestValidation:
         })
         assert resp.status_code == 400
 
+    def test_disciplines_not_list(self, client):
+        resp = client.post('/solver/sensitivity', json={
+            'nodes': [{'ID': 'A', 'Duration': 5}],
+            'solver_config': {'disciplines': 'schedule'},
+        })
+        assert resp.status_code == 400
+        assert 'list' in resp.get_json()['error']
+
+    def test_disciplines_non_string_entry(self, client):
+        resp = client.post('/solver/sensitivity', json={
+            'nodes': [{'ID': 'A', 'Duration': 5}],
+            'solver_config': {'disciplines': [123]},
+        })
+        assert resp.status_code == 400
+
+    def test_weights_not_dict(self, client):
+        resp = client.post('/solver/sensitivity', json={
+            'nodes': [{'ID': 'A', 'Duration': 5}],
+            'solver_config': {'weights': [1, 2]},
+        })
+        assert resp.status_code == 400
+        assert 'object' in resp.get_json()['error']
+
+    def test_weights_non_numeric(self, client):
+        resp = client.post('/solver/sensitivity', json={
+            'nodes': [{'ID': 'A', 'Duration': 5}],
+            'solver_config': {'weights': {'schedule': 'bad'}},
+        })
+        assert resp.status_code == 400
+
     def test_valid_request_passes_validation(self, client, diamond_schedule,
                                              diamond_metadata):
         """Full valid request passes all validation."""

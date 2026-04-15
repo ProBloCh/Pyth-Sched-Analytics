@@ -576,7 +576,7 @@ class TestBugfixRegressions:
         assert result['n_samples'] >= 2
 
     def test_antithetic_odd_m(self, diamond_schedule, diamond_metadata):
-        """Odd M with antithetic rounds up to the nearest even pair."""
+        """Odd M with antithetic floors to complete pairs (min 1 pair)."""
         nodes, links = diamond_schedule
         state, _ = build_dag(nodes, links)
         params = build_activity_params(nodes, diamond_metadata)

@@ -59,7 +59,7 @@ def rank_interventions(gradients, config, params):
     Rank activities by weighted gradient magnitude across all disciplines.
     High-magnitude activities are the highest-leverage interventions.
 
-    Returns list of {activity_id, rank, score, normalised_score,
+    Returns list of {activity_id, rank, score, normalized_score,
                      per_discipline, recommendation}.
     """
     n = params.n
