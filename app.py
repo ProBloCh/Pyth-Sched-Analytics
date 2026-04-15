@@ -8,7 +8,6 @@ vectorized operations, and Python 3.12 optimizations
 import os, json, logging, hashlib, time, gc
 from functools import lru_cache
 from datetime import datetime, timezone
-import copy
 
 # Set BLAS threads to prevent CPU contention with Gunicorn
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -378,13 +377,19 @@ def build_nx_graph(nodes, links):
     if 'ID' not in nodes_df.columns:
         nodes_df['ID'] = range(len(nodes_df))
     
-    # Vectorized date parsing
-    nodes_df['start_date'] = pd.to_datetime(nodes_df.get('Start'), errors='coerce', utc=False)
-    # Remove timezone info if present (future-compatible check)
-    if getattr(nodes_df['start_date'].dtype, 'tz', None) is not None:
-        nodes_df['start_date'] = nodes_df['start_date'].dt.tz_localize(None)
-    
-    nodes_df['duration'] = pd.to_numeric(nodes_df.get('Duration', 1), errors='coerce').fillna(1)
+    # Vectorized date parsing (guard against missing columns)
+    if 'Start' in nodes_df.columns:
+        nodes_df['start_date'] = pd.to_datetime(nodes_df['Start'], errors='coerce', utc=False)
+        # Remove timezone info if present (future-compatible check)
+        if getattr(nodes_df['start_date'].dtype, 'tz', None) is not None:
+            nodes_df['start_date'] = nodes_df['start_date'].dt.tz_localize(None)
+    else:
+        nodes_df['start_date'] = pd.NaT
+
+    if 'Duration' in nodes_df.columns:
+        nodes_df['duration'] = pd.to_numeric(nodes_df['Duration'], errors='coerce').fillna(1)
+    else:
+        nodes_df['duration'] = 1
     
     # Vectorized end date calculation
     nodes_df['end_date'] = nodes_df['start_date'] + pd.to_timedelta(nodes_df['duration'], unit='D', errors='coerce')
@@ -970,9 +975,10 @@ def graph_metrics():
     if not nodes:
         return jsonify({'error': 'No nodes provided'}), 400
     
-    # Generate cache key
+    # Generate cache key (v2 prefix avoids reading stale pickle-serialized
+    # entries left by the pre-JSON caching code during a rolling deploy)
     key = _sha([nodes, links])
-    redis_key = f"graph:{key}"
+    redis_key = f"graph:v2:{key}"
     
     # Try Redis cache first
     cached_result = get_cached_result(redis_key)
@@ -986,18 +992,20 @@ def graph_metrics():
         logging.info(f"Processing graph with {len(nodes)} nodes and {len(links)} links")
     
     try:
-        # Use in-memory LRU cache as second level
-        # copy.copy to avoid mutating the dict stored inside @lru_cache
-        res = copy.copy(_cached(
+        # Use in-memory LRU cache as second level.
+        # Build a NEW dict via {**...} so the @lru_cache'd object is never
+        # mutated — not even at the top level.  Nested values (nodes list,
+        # work_packages dict) are shared references, which is safe because
+        # jsonify() only reads.
+        cached_res = _cached(
             json.dumps(nodes, sort_keys=True, default=str),
             json.dumps(links, sort_keys=True, default=str)
-        ))
-        res['cache_key'] = key
-        res['cache_hit'] = False
-        
+        )
+        res = {**cached_res, 'cache_key': key, 'cache_hit': False}
+
         # Store in Redis for other instances
         set_cached_result(redis_key, res)
-        
+
         # Log processing time
         elapsed = time.time() - start_time
         if DEBUG or elapsed > 5:

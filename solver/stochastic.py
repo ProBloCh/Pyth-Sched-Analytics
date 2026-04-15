@@ -48,6 +48,13 @@ def run_ensemble(dag_state, params, project_ctx, config):
     else:
         z_all = rng.standard_normal((M, n))
 
+    # Resource FD gradients are O(n) CPM runs per sample.  When the total
+    # cost n*M is large, compute them once on the original state and keep
+    # only the cheap analytical disciplines inside the MC loop.
+    _FD_BUDGET = 50_000
+    expensive_fd = 'resources' in disciplines and n * M > _FD_BUDGET
+    loop_disciplines = [d for d in disciplines if d != 'resources'] if expensive_fd else disciplines
+
     obj_samples  = {d: [] for d in disciplines}
     grad_dur_acc = {d: [] for d in disciplines}
     grad_res_acc = {d: [] for d in disciplines}
@@ -65,7 +72,7 @@ def run_ensemble(dag_state, params, project_ctx, config):
         params.durations = perturbed
 
         objs  = compute_objectives(dag_state, params, project_ctx, disciplines)
-        grads = compute_gradients(dag_state, params, project_ctx, disciplines)
+        grads = compute_gradients(dag_state, params, project_ctx, loop_disciplines)
 
         for d in disciplines:
             obj_samples[d].append(objs.get(d, 0.0))
@@ -79,6 +86,18 @@ def run_ensemble(dag_state, params, project_ctx, config):
     np.copyto(orig_param_dur, saved_values)
     run_cpm(dag_state, orig_dag_dur)
     params.durations = orig_param_dur
+
+    # Compute resource FD gradients once on the original state when they
+    # were excluded from the per-sample loop to avoid O(M*n) CPM runs.
+    if expensive_fd:
+        logger.info("Resource FD budget exceeded (n*M=%d > %d); "
+                    "computing resource gradients on mean state",
+                    n * M, _FD_BUDGET)
+        res_grads = compute_gradients(dag_state, params, project_ctx,
+                                      ['resources'])
+        if 'resources' in res_grads:
+            grad_dur_acc['resources'] = [res_grads['resources']['duration']]
+            grad_res_acc['resources'] = [res_grads['resources']['resources']]
 
     # Statistics
     result = {

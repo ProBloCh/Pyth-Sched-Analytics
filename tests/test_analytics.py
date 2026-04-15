@@ -127,6 +127,21 @@ class TestBuildNxGraph:
         G = build_nx_graph(nodes, [])
         assert G.nodes['X']['start_date'] is None
 
+    def test_missing_duration_defaults_to_1(self):
+        """All nodes lacking Duration should get duration=1, not crash."""
+        nodes = [{'ID': 'X'}]
+        G = build_nx_graph(nodes, [])
+        assert G.nodes['X']['duration'] == 1
+
+    def test_missing_start_and_duration(self):
+        """Nodes with neither Start nor Duration should build cleanly."""
+        nodes = [{'ID': 'A'}, {'ID': 'B'}]
+        links = [{'source': 'A', 'target': 'B'}]
+        G = build_nx_graph(nodes, links)
+        assert len(G.nodes) == 2
+        assert G.nodes['A']['start_date'] is None
+        assert G.nodes['A']['duration'] == 1
+
     def test_missing_id_gets_index(self):
         nodes = [{'Duration': 5}, {'Duration': 10}]
         G = build_nx_graph(nodes, [])
@@ -455,12 +470,13 @@ class TestGraphMetricsEndpoint:
         assert 'cache_key' in data
 
     def test_lru_cache_not_mutated_across_requests(self, client):
-        """Verify that mutating the response dict doesn't corrupt the LRU cache.
+        """Regression test for H2: the route handler adds cache_key/cache_hit/
+        processing_time to the response.  The @lru_cache'd dict must never be
+        mutated — the route builds a new dict via {**cached, ...} instead.
 
-        Regression test for H2: the route handler adds cache_key/cache_hit/
-        processing_time to the result dict.  Without copy.copy(), these
-        mutations leak into the @lru_cache'd object and subsequent requests
-        return stale metadata.
+        Without this protection, top-level keys written into the first response
+        leak into the cached object and subsequent requests return stale
+        metadata (wrong cache_hit, wrong processing_time).
         """
         payload = {'nodes': [
             {'ID': 'LRU1', 'Duration': 7, 'Start': '2025-06-01',
@@ -474,18 +490,13 @@ class TestGraphMetricsEndpoint:
         d1 = r1.get_json()
         assert d1['cache_hit'] is False
 
-        # Second request — should hit LRU cache but still have correct metadata
+        # Second request — LRU cache hit, must still produce correct metadata
         r2 = client.post('/graph-metrics', json=payload)
         assert r2.status_code == 200
         d2 = r2.get_json()
-        # The key assertion: cache_hit should NOT carry over stale False from
-        # the first request's mutation of the shared dict.
-        # With copy.copy, the LRU-cached dict is never mutated, so the route
-        # handler can set cache_hit=False on a fresh copy each time. The
-        # response is still correct because it always sets the value explicitly.
         assert 'cache_key' in d2
         assert 'processing_time' in d2
-        # Both requests should return the same analytical results
+        # Analytical results must be identical
         assert d1['critical_path'] == d2['critical_path']
         assert d1['nodes'] == d2['nodes']
 
