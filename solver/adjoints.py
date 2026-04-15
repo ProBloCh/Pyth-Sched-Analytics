@@ -66,7 +66,8 @@ def risk_adj_res(dag_state, params, project_ctx=None):
 # Resources  (finite differences per review section 1.5)
 # ---------------------------------------------------------------------------
 
-_FD_EPS = 0.1  # perturbation size (time units)
+_FD_EPS = 0.1   # perturbation size (time units)
+_FD_MAX_N = 500  # skip O(n^2) FD loop for graphs above this size
 
 
 def resource_adj_dur(dag_state, params, project_ctx=None):
@@ -75,6 +76,11 @@ def resource_adj_dur(dag_state, params, project_ctx=None):
 
     n = dag_state.n
     grad = np.zeros(n, dtype=np.float64)
+    if n > _FD_MAX_N:
+        import logging
+        logging.getLogger(__name__).info(
+            "Skipping resource duration FD gradient (n=%d > %d)", n, _FD_MAX_N)
+        return grad
     base_val = resource_objective(dag_state, params, project_ctx)
 
     original = dag_state.durations          # save reference (may alias params.durations)
@@ -98,6 +104,11 @@ def resource_adj_res(dag_state, params, project_ctx=None):
 
     n = dag_state.n
     grad = np.zeros(n, dtype=np.float64)
+    if n > _FD_MAX_N:
+        import logging
+        logging.getLogger(__name__).info(
+            "Skipping resource resource FD gradient (n=%d > %d)", n, _FD_MAX_N)
+        return grad
     base_val = resource_objective(dag_state, params, project_ctx)
 
     for i in range(n):

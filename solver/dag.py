@@ -88,9 +88,18 @@ def build_dag(nodes, links):
         logger.warning("DAG has cycles involving %d nodes; back-edges dropped",
                        len(remaining))
         for node in remaining:
-            pred[node] = [p for p in pred[node] if visited[p]]
             topo.append(node)
             visited[node] = True
+
+        # Prune pred/succ so every edge goes forward in topo order.
+        # Without this the backward CPM pass reads uninitialised LS values
+        # for cycle-involved successors.
+        order_pos = np.empty(n, dtype=np.int64)
+        for pos, node in enumerate(topo):
+            order_pos[node] = pos
+        for node in range(n):
+            pred[node] = [p for p in pred[node] if order_pos[p] < order_pos[node]]
+            succ[node] = [s for s in succ[node] if order_pos[node] < order_pos[s]]
 
     topo_arr = np.array(topo, dtype=np.int64)
 
