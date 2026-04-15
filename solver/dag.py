@@ -5,6 +5,7 @@ NumPy-vectorised forward/backward pass.  Same algorithm as PathScripts.js
 but operating on contiguous arrays for performance.
 """
 
+import collections
 import logging
 import numpy as np
 
@@ -66,12 +67,12 @@ def build_dag(nodes, links):
 
     # Kahn's topological sort (also handles cycles gracefully)
     in_deg = np.array([len(p) for p in pred], dtype=np.int64)
-    queue = list(np.where(in_deg == 0)[0])
+    queue = collections.deque(np.where(in_deg == 0)[0])
     topo = []
     visited = np.zeros(n, dtype=bool)
 
     while queue:
-        node = queue.pop(0)
+        node = queue.popleft()
         if visited[node]:
             continue
         visited[node] = True

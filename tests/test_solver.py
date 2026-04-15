@@ -284,17 +284,18 @@ class TestAdjoints:
 
         eps = 0.01
         fd_grad = np.zeros(state.n)
+        baseline = params.baseline_durations.copy()
+        run_cpm(state, baseline.copy())
         base_obj = schedule_objective(state, params)
 
         for i in range(state.n):
-            saved = state.durations.copy()
-            saved[i] += eps
-            run_cpm(state, saved)
+            perturbed = baseline.copy()
+            perturbed[i] += eps
+            run_cpm(state, perturbed)
             fd_grad[i] = (schedule_objective(state, params) - base_obj) / eps
-            run_cpm(state, state.durations)
 
         # Restore
-        run_cpm(state, params.baseline_durations.copy())
+        run_cpm(state, baseline.copy())
 
         # Analytical and FD should agree on critical mask
         for i in range(state.n):

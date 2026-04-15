@@ -52,9 +52,9 @@ def _cache():
         try:
             from app import get_cached_result, set_cached_result
             _cache_fns = (get_cached_result, set_cached_result)
-        except ImportError:
+        except Exception as exc:
             logger.info("Caching functions not available; solver running "
-                        "without cache")
+                        "without cache: %s", exc)
             _cache_fns = (None, None)
     return _cache_fns
 
