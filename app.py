@@ -76,6 +76,13 @@ CORS(app,
      allow_headers=["Content-Type", "Authorization"],
      methods=["GET", "POST", "OPTIONS"])
 
+try:
+    from solver import solver_bp
+    app.register_blueprint(solver_bp)
+except Exception as _solver_err:
+    logging.warning("Solver package failed to load: %s. "
+                    "Solver endpoints will be unavailable.", _solver_err)
+
 ###############################################################################
 # Redis Cache Setup                                                           #
 ###############################################################################
