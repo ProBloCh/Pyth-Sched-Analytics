@@ -451,6 +451,13 @@ def run_ensemble(dag_state, params, project_ctx, config):
     raw_sum_sq = np.zeros(n, dtype=np.float64)
     cap_hits   = np.zeros(n, dtype=np.int64)
 
+    # SRA accumulators — Criticality Index (Van Slyke 1963) and
+    # Cruciality Index (Williams 1992), computed online in O(n) memory.
+    crit_count    = np.zeros(n, dtype=np.int64)   # times on critical path
+    makespan_sum  = 0.0
+    makespan_sumsq = 0.0
+    cross_sum     = np.zeros(n, dtype=np.float64)  # Σ(mult_i * makespan)
+
     # Save original array references so we can restore aliasing after the loop.
     orig_dag_dur   = dag_state.durations
     orig_param_dur = params.durations
@@ -473,6 +480,13 @@ def run_ensemble(dag_state, params, project_ctx, config):
 
         run_cpm(dag_state, perturbed)
         params.durations = perturbed
+
+        # SRA: accumulate criticality and makespan-correlation data
+        crit_count    += dag_state.critical_mask.astype(np.int64)
+        ms             = dag_state.makespan
+        makespan_sum  += ms
+        makespan_sumsq += ms * ms
+        cross_sum     += capped_mult * ms
 
         objs  = compute_objectives(dag_state, params, project_ctx, disciplines)
         grads = compute_gradients(dag_state, params, project_ctx,
@@ -541,6 +555,40 @@ def run_ensemble(dag_state, params, project_ctx, config):
     result['black_swans']  = black_swans
     result['dragon_kings'] = dragon_kings
 
+    # Schedule Risk Analysis indices (Van Slyke 1963; Williams 1992)
+    criticality_index = crit_count / max(M, 1)
+
+    # Cruciality index: Pearson correlation between activity multiplier
+    # and project makespan, computed from online accumulators.
+    ms_mean = makespan_sum / max(M, 1)
+    ms_var  = makespan_sumsq / max(M, 1) - ms_mean ** 2
+    ms_std  = np.sqrt(max(ms_var, 0.0))
+
+    mult_mean = raw_sum / max(M, 1)
+    mult_var  = raw_sum_sq / max(M, 1) - mult_mean ** 2
+    mult_std  = np.sqrt(np.maximum(mult_var, 0.0))
+
+    if ms_std > 1e-12:
+        cov = cross_sum / max(M, 1) - mult_mean * ms_mean
+        denom = mult_std * ms_std
+        safe_denom = np.where(denom > 1e-12, denom, 1.0)
+        cruciality_index = np.where(denom > 1e-12, cov / safe_denom, 0.0)
+    else:
+        cruciality_index = np.zeros(n, dtype=np.float64)
+
+    result['sra'] = {
+        'criticality_index': {
+            params.ids[i]: round(float(criticality_index[i]), 4)
+            for i in range(n)
+        },
+        'cruciality_index': {
+            params.ids[i]: round(float(cruciality_index[i]), 4)
+            for i in range(n)
+        },
+        'makespan_mean': round(float(ms_mean), 2),
+        'makespan_std':  round(float(ms_std), 2),
+    }
+
     # 2D cost-schedule clustering (Natarajan et al., PMJ 2022, Figs. 15-17)
     result['cost_schedule_joint'] = _detect_2d_extremes(
         obj_samples, disciplines, initial_objs)
@@ -560,5 +608,7 @@ def _empty(disciplines):
         'n_samples':            0,
         'black_swans':          [],
         'dragon_kings':         [],
+        'sra':                  {'criticality_index': {}, 'cruciality_index': {},
+                                 'makespan_mean': 0.0, 'makespan_std': 0.0},
         'cost_schedule_joint':  None,
     }
