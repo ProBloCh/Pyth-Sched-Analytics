@@ -81,6 +81,8 @@ def run_sensitivity(nodes, links, solver_config_dict,
             'objectives_mean': stochastic['objectives_mean'],
             'objectives_std':  stochastic['objectives_std'],
             'n_samples':       stochastic['n_samples'],
+            'black_swans':     stochastic.get('black_swans', []),
+            'dragon_kings':    stochastic.get('dragon_kings', []),
         }
 
     return result
@@ -158,6 +160,8 @@ def run_optimize(nodes, links, solver_config_dict,
             'objectives_mean': stochastic['objectives_mean'],
             'objectives_std':  stochastic['objectives_std'],
             'n_samples':       stochastic['n_samples'],
+            'black_swans':     stochastic.get('black_swans', []),
+            'dragon_kings':    stochastic.get('dragon_kings', []),
         }
 
     logger.info("Optimize done: %d iterations, converged=%s, "
