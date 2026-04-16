@@ -242,22 +242,29 @@ def calculate_critical_path(G):
         from solver.dag import build_dag as _build_dag, get_critical_path_indices
         cpm_nodes = [{'ID': str(nd), 'Duration': float(G.nodes[nd].get('duration', 1))}
                      for nd in G.nodes()]
-        cpm_links = [{'source': str(u), 'target': str(v),
-                      'type': G.edges[u, v].get('type', 'FS'),
-                      'lag':  float(G.edges[u, v].get('lag', 0))}
-                     for u, v in G.edges()]
+        cpm_links = []
+        for u, v in G.edges():
+            edge = G.edges[u, v]
+            try:
+                lag = float(edge.get('lag', 0))
+            except (TypeError, ValueError):
+                lag = 0.0
+            cpm_links.append({
+                'source': str(u), 'target': str(v),
+                'type': edge.get('type', 'FS'), 'lag': lag,
+            })
         dag_state, _ = _build_dag(cpm_nodes, cpm_links)
         cp_ids = [cpm_nodes[i]['ID'] for i in get_critical_path_indices(dag_state)]
-        # Return total-float dict so analyse() can populate df_nodes
         tf_map = {cpm_nodes[i]['ID']: float(dag_state.TF[i])
                   for i in range(dag_state.n)}
         return cp_ids, dag_state.makespan, tf_map
+    except ImportError:
+        pass
     except Exception as e:
-        if DEBUG:
-            logging.warning(f"CPM critical path failed ({e}); falling back to NetworkX")
-        critical_path = nx.dag_longest_path(G, weight='duration')
-        critical_path_length = nx.dag_longest_path_length(G, weight='duration')
-        return critical_path, critical_path_length, {}
+        logging.warning(f"CPM critical path failed ({e}); falling back to NetworkX")
+    critical_path = nx.dag_longest_path(G, weight='duration')
+    critical_path_length = nx.dag_longest_path_length(G, weight='duration')
+    return critical_path, critical_path_length, {}
 
 def identify_critical_activities_and_milestones(G):
     critical_activities = [
