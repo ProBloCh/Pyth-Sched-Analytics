@@ -506,12 +506,12 @@ def ensure_dag(G: nx.DiGraph):
 # Analytics – Optimized algorithms                                           #
 ###############################################################################
 
-def _cluster_risk_kmeans(df: pd.DataFrame):
-    """K-means clustering with optional silhouette optimization"""
+def _cluster_risk(df: pd.DataFrame):
+    """Density-based clustering (HDBSCAN primary, K-means fallback)."""
     if 'importanceScore' not in df.columns or 'riskScore' not in df.columns:
         df['Cluster'] = 0
         return df
-        
+
     feats = df[['importanceScore', 'riskScore']].values
     n = len(df)
 
@@ -519,23 +519,50 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
         df['Cluster'] = 0
         return df
 
-    # O(n) short-circuit when all feature points are identical (KMeans
-    # would produce convergence warnings and meaningless clusters).
+    # O(n) short-circuit when all feature points are identical.
     if (feats == feats[0]).all():
         df['Cluster'] = 0
         return df
 
-    # O(n log n) unique count for k-bounding — negligible vs KMeans cost.
+    # O(n log n) unique count for k-bounding — negligible vs clustering cost.
     unique_count = len(np.unique(feats, axis=0))
 
-    # Fast heuristic path (default)
+    # ---- HDBSCAN primary path ----
+    if n >= 15 and unique_count >= 5:
+        try:
+            from sklearn.cluster import HDBSCAN as _HDBSCAN
+            min_cluster_size = max(5, n // 20)
+            labels = _HDBSCAN(
+                min_cluster_size=min_cluster_size, min_samples=3
+            ).fit_predict(feats)
+
+            noise_ratio = np.sum(labels == -1) / n
+            n_clusters = len(set(labels) - {-1})
+            if noise_ratio <= 0.5 and n_clusters >= 2:
+                # Reassign noise points to nearest cluster
+                if np.any(labels == -1):
+                    from sklearn.neighbors import NearestNeighbors
+                    clustered = labels != -1
+                    nn = NearestNeighbors(n_neighbors=1).fit(feats[clustered])
+                    _, idx = nn.kneighbors(feats[~clustered])
+                    labels[~clustered] = labels[clustered][idx.ravel()]
+                df['Cluster'] = labels
+                if DEBUG:
+                    logging.info(f"HDBSCAN: {n_clusters} clusters, "
+                                 f"noise={noise_ratio:.0%}")
+                return df
+            if DEBUG:
+                logging.info(f"HDBSCAN produced {n_clusters} clusters with "
+                             f"{noise_ratio:.0%} noise; falling back to K-means")
+        except Exception as e:
+            if DEBUG:
+                logging.info(f"HDBSCAN unavailable ({e}); using K-means")
+
+    # ---- K-means fallback ----
     if not ENABLE_SILHOUETTE_OPTIMIZATION:
-        # Heuristic: sqrt(n/2) clusters, bounded by [2, 10] and unique_count
         k = max(2, min(10, int(np.sqrt(n / 2)), unique_count))
-
         if DEBUG:
-            logging.info(f"Using heuristic k={k} for {n} nodes (silhouette optimization disabled)")
-
+            logging.info(f"K-means heuristic k={k} for {n} nodes")
         try:
             df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
         except ValueError:
@@ -543,10 +570,6 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
         return df
 
     # Silhouette optimization path (only if explicitly enabled)
-    if DEBUG:
-        logging.info(f"Running silhouette optimization for {n} nodes")
-
-    # Early exit for small datasets
     if n <= 15:
         k = min(3, n, unique_count)
         try:
@@ -555,7 +578,6 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
             df['Cluster'] = 0
         return df
 
-    # Full silhouette optimization
     max_clusters = min(10, n, unique_count)
     best, k = -1, min(3, n, unique_count)
 
@@ -567,14 +589,11 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
             lbl = kmeans.fit_predict(feats)
             if len(set(lbl)) > 1:
                 sc = silhouette_score(feats, lbl)
-                if DEBUG:
-                    logging.info(f"Silhouette Score for {c} clusters: {sc:.3f}")
                 if sc > best:
                     best, k = sc, c
         except Exception:
             continue
 
-    # Guard against edge cases
     k = min(k, max(1, n), unique_count)
     try:
         df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
@@ -920,7 +939,7 @@ def analyse(nodes, links):
         
         # Risk/importance clustering + PCA
         clustering_start = time.time() if DEBUG else None
-        df_nodes = _cluster_risk_kmeans(df_nodes)
+        df_nodes = _cluster_risk(df_nodes)
         df_nodes = _pca(df_nodes)
         if DEBUG:
             logging.info(f"Risk/importance clustering took {time.time() - clustering_start:.2f}s")
@@ -934,8 +953,17 @@ def analyse(nodes, links):
         if DEBUG:
             logging.info(f"Dependency clustering took {time.time() - dep_start:.2f}s")
         
-        # Community detection
+        # Community detection (single-resolution — populates CommunityGroup column)
         df_nodes = _community_detection(G, df_nodes)
+
+        # Multi-resolution community detection (additive — new response key)
+        multi_res = None
+        if len(df_nodes) >= 50 and G.number_of_edges() > 0:
+            try:
+                from multi_resolution_pipeline import run_multi_resolution
+                multi_res = run_multi_resolution(G.to_undirected())
+            except Exception as e:
+                logging.warning(f"Multi-resolution community detection failed: {e}")
         
         # Centrality metrics
         df_nodes = _centralities(G, df_nodes)
@@ -959,6 +987,8 @@ def analyse(nodes, links):
             'critical_path_length': float(critical_path_length),
             'templates': templates
         }
+        if multi_res:
+            response['multi_resolution_communities'] = multi_res
         
         # Garbage collection for large graphs
         if len(nodes) > 5000:

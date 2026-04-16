@@ -1,9 +1,10 @@
 """
-solver/stochastic.py - Monte Carlo ensemble with antithetic variates.
+solver/stochastic.py - Monte Carlo ensemble with Sobol quasi-random sequences.
 
-Perturbs activity durations stochastically and computes ensemble statistics
-for objectives and gradients.  Antithetic variates (review section 1.8)
-halve variance at negligible extra cost.
+Uses Sobol low-discrepancy sequences (scipy.stats.qmc) for better
+space-filling than pseudorandom sampling.  Falls back to pseudorandom
+for dimensions beyond the Sobol limit.  Antithetic variates remain
+available as a complementary variance-reduction technique.
 """
 
 import logging
@@ -14,6 +15,56 @@ from .objectives import compute_objectives
 from .adjoints import compute_gradients
 
 logger = logging.getLogger(__name__)
+
+# scipy.stats.qmc.Sobol supports up to 21201 dimensions
+_SOBOL_MAX_DIM = 21201
+
+
+def _generate_samples(M, n, antithetic, seed=42):
+    """
+    Generate standard-normal samples.
+
+    Uses Sobol QMC when n <= 21201 (better space-filling, lower
+    discrepancy).  Falls back to pseudorandom for higher dimensions
+    where QMC benefits diminish.  Returns (z_all, M_actual).
+    """
+    if n <= _SOBOL_MAX_DIM:
+        from scipy.stats.qmc import Sobol
+        from scipy.stats import norm
+
+        if antithetic:
+            half = max(M // 2, 1)
+            half_pow2 = 1 << max(int(np.ceil(np.log2(max(half, 1)))), 0)
+            sobol = Sobol(d=n, scramble=True, seed=seed)
+            u = sobol.random(half_pow2)
+            z = norm.ppf(np.clip(u, 1e-10, 1 - 1e-10))
+            z_all = np.concatenate([z, -z], axis=0)
+            M_actual = 2 * half_pow2
+        else:
+            M_pow2 = 1 << max(int(np.ceil(np.log2(max(M, 1)))), 0)
+            sobol = Sobol(d=n, scramble=True, seed=seed)
+            u = sobol.random(M_pow2)
+            z_all = norm.ppf(np.clip(u, 1e-10, 1 - 1e-10))
+            M_actual = M_pow2
+
+        logger.info("Sobol QMC: requested M=%d, actual M=%d, n=%d, "
+                     "antithetic=%s", M, M_actual, n, antithetic)
+    else:
+        # Fallback: pseudorandom (QMC benefit diminishes in very high dim)
+        rng = np.random.default_rng(seed=seed)
+        if antithetic:
+            half = max(M // 2, 1)
+            z = rng.standard_normal((half, n))
+            z_all = np.concatenate([z, -z], axis=0)
+            M_actual = 2 * half
+        else:
+            z_all = rng.standard_normal((M, n))
+            M_actual = M
+
+        logger.info("Pseudorandom MC (n=%d > Sobol max %d): M=%d",
+                     n, _SOBOL_MAX_DIM, M_actual)
+
+    return z_all, M_actual
 
 
 def run_ensemble(dag_state, params, project_ctx, config):
@@ -37,16 +88,8 @@ def run_ensemble(dag_state, params, project_ctx, config):
     logger.info("MC ensemble start: M=%d, n=%d, antithetic=%s",
                 M, n, config.antithetic_variates)
 
-    rng = np.random.default_rng(seed=42)
+    z_all, M = _generate_samples(M, n, config.antithetic_variates)
     sigma = 0.15  # 15 % CV on durations (log-normal)
-
-    if config.antithetic_variates:
-        half = max(M // 2, 1)  # at least one pair; M=1 must not produce 0 samples
-        z = rng.standard_normal((half, n))
-        z_all = np.concatenate([z, -z], axis=0)
-        M = 2 * half
-    else:
-        z_all = rng.standard_normal((M, n))
 
     # Resource FD gradients are O(n) CPM runs per sample.  When the total
     # cost n*M is large, compute them once on the original state and keep

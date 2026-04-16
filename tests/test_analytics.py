@@ -19,7 +19,7 @@ from app import (
     create_templates_from_patterns,
     define_work_packages,
     serialize_work_packages,
-    _cluster_risk_kmeans,
+    _cluster_risk,
     _pca,
     _centralities,
     _community_detection,
@@ -215,13 +215,13 @@ class TestClusterRiskKmeans:
             'importanceScore': [1, 1, 9, 9, 5],
             'riskScore': [1, 2, 8, 9, 5],
         })
-        result = _cluster_risk_kmeans(df)
+        result = _cluster_risk(df)
         assert 'Cluster' in result.columns
         assert result['Cluster'].nunique() >= 2
 
     def test_single_node(self):
         df = pd.DataFrame({'importanceScore': [5], 'riskScore': [5]})
-        result = _cluster_risk_kmeans(df)
+        result = _cluster_risk(df)
         assert result['Cluster'].iloc[0] == 0
 
     def test_identical_points(self):
@@ -230,12 +230,12 @@ class TestClusterRiskKmeans:
             'importanceScore': [5, 5, 5, 5],
             'riskScore': [3, 3, 3, 3],
         })
-        result = _cluster_risk_kmeans(df)
+        result = _cluster_risk(df)
         assert 'Cluster' in result.columns
 
     def test_missing_columns(self):
         df = pd.DataFrame({'other': [1, 2, 3]})
-        result = _cluster_risk_kmeans(df)
+        result = _cluster_risk(df)
         assert (result['Cluster'] == 0).all()
 
 
