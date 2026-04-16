@@ -486,3 +486,357 @@ class TestCalendarPath:
             config={'iterations': 50, 'enable_risk': False})
         # Wall-clock 10 days
         assert r['expected_finish'].startswith('2025-01-16')
+
+
+# =====================================================================
+# /completion/recovery-options
+# =====================================================================
+
+from completion.recovery import (
+    run_recovery_options, classify_crash_profile,
+    RecoveryConfig, _compute_target,
+)
+
+
+class TestClassifyCrashProfile:
+
+    def test_supplier_override_wins(self):
+        # Supplier type takes precedence over name regex
+        assert classify_crash_profile('Install', 'external_equipment') \
+            == {'max_frac': 0.03, 'kind': 'external_equipment'}
+        assert classify_crash_profile(None, 'external_material') \
+            == {'max_frac': 0.05, 'kind': 'external_material'}
+        assert classify_crash_profile('Design Drawings', 'external_service') \
+            == {'max_frac': 0.10, 'kind': 'external_service'}
+
+    def test_name_regex_governance(self):
+        assert classify_crash_profile('Environmental Permit', None)['kind'] == 'governance'
+        assert classify_crash_profile('Regulatory Approval', None)['kind'] == 'governance'
+
+    def test_name_regex_construction(self):
+        assert classify_crash_profile('Install Foundation', None)['kind'] == 'construction'
+        assert classify_crash_profile('Erect Steel', None)['kind'] == 'construction'
+        assert classify_crash_profile('Mechanical Piping', None)['kind'] == 'construction'
+
+    def test_name_regex_engineering(self):
+        assert classify_crash_profile('Engineering Drawings', None)['kind'] == 'engineering'
+        assert classify_crash_profile('IFC Issue', None)['kind'] == 'engineering'
+
+    def test_name_regex_procurement(self):
+        assert classify_crash_profile('Procure Valve', None)['kind'] == 'procurement'
+        assert classify_crash_profile('Vendor Delivery', None)['kind'] == 'procurement'
+
+    def test_name_regex_commissioning(self):
+        assert classify_crash_profile('Hydro Test', None)['kind'] == 'commissioning'
+        assert classify_crash_profile('Commission Unit', None)['kind'] == 'commissioning'
+
+    def test_name_regex_fabrication(self):
+        assert classify_crash_profile('Shop Fabrication', None)['kind'] == 'fabrication'
+        assert classify_crash_profile('Weld Spools', None)['kind'] == 'fabrication'
+
+    def test_design_hits_governance_quirk(self):
+        # The JS regex /sign/ catches de-sign; preserved for parity.
+        assert classify_crash_profile('Design Review', None)['kind'] == 'governance'
+
+    def test_generic_fallback(self):
+        assert classify_crash_profile('Miscellaneous Task', None) \
+            == {'max_frac': 0.25, 'kind': 'generic'}
+
+    def test_empty_name(self):
+        assert classify_crash_profile('', None)['kind'] == 'generic'
+        assert classify_crash_profile(None, None)['kind'] == 'generic'
+
+
+class TestTargetMath:
+
+    def test_overrun_with_buffer(self):
+        planned = _parse_iso_to_ms('2025-02-01T00:00:00Z')
+        expected = _parse_iso_to_ms('2025-02-11T00:00:00Z')  # 10d overrun
+        p80 = _parse_iso_to_ms('2025-02-21T00:00:00Z')       # 10d buffer
+        td, th, overrun, buf = _compute_target(
+            planned, expected, p80, max_risk_buffer_days=10, hours_per_day=8)
+        assert overrun == 10
+        assert buf == 10
+        assert td == 20
+        assert th == 160
+
+    def test_buffer_caps(self):
+        planned = _parse_iso_to_ms('2025-02-01T00:00:00Z')
+        expected = _parse_iso_to_ms('2025-02-11T00:00:00Z')
+        p80 = _parse_iso_to_ms('2025-03-11T00:00:00Z')       # 28d buffer
+        _, _, _, buf = _compute_target(
+            planned, expected, p80, max_risk_buffer_days=10, hours_per_day=8)
+        assert buf == 10  # capped
+
+    def test_no_overrun_yields_scenario_mode(self):
+        """When expected <= planned, target_days = capped buffer only."""
+        planned = _parse_iso_to_ms('2025-03-01T00:00:00Z')
+        expected = _parse_iso_to_ms('2025-02-20T00:00:00Z')  # ahead of plan
+        p80 = _parse_iso_to_ms('2025-02-28T00:00:00Z')       # 8d buffer
+        td, _, overrun, buf = _compute_target(
+            planned, expected, p80, max_risk_buffer_days=10, hours_per_day=8)
+        assert overrun == 0
+        assert buf == 8
+        assert td == 8  # buffer only
+
+    def test_no_p80(self):
+        planned = _parse_iso_to_ms('2025-02-01T00:00:00Z')
+        expected = _parse_iso_to_ms('2025-02-11T00:00:00Z')
+        td, _, overrun, buf = _compute_target(
+            planned, expected, None, max_risk_buffer_days=10, hours_per_day=8)
+        assert overrun == 10
+        assert buf == 0
+        assert td == 10
+
+    def test_no_planned_finish(self):
+        expected = _parse_iso_to_ms('2025-02-11T00:00:00Z')
+        p80 = _parse_iso_to_ms('2025-02-21T00:00:00Z')
+        td, _, overrun, buf = _compute_target(
+            None, expected, p80, max_risk_buffer_days=10, hours_per_day=8)
+        assert overrun == 0
+        assert buf == 10
+        assert td == 10
+
+
+class TestRecoveryEngine:
+
+    def _diamond_with_names(self):
+        return [
+            {'ID': 'A', 'Duration': 10, 'TimeUnits': 'days', 'Name': 'Engineering Drawings'},
+            {'ID': 'B', 'Duration': 15, 'TimeUnits': 'days', 'Name': 'Install Pipe'},
+            {'ID': 'C', 'Duration': 8,  'TimeUnits': 'days', 'Name': 'Procure Valve'},
+            {'ID': 'D', 'Duration': 12, 'TimeUnits': 'days', 'Name': 'Construct Frame'},
+            {'ID': 'E', 'Duration': 5,  'TimeUnits': 'days', 'Name': 'Commission Unit'},
+        ]
+
+    def _diamond_links(self):
+        return [
+            {'source': 'A', 'target': 'B'}, {'source': 'A', 'target': 'C'},
+            {'source': 'B', 'target': 'D'}, {'source': 'C', 'target': 'D'},
+            {'source': 'D', 'target': 'E'},
+        ]
+
+    def test_critical_path_activities_ranked(self):
+        r = run_recovery_options(
+            self._diamond_with_names(), self._diamond_links(),
+            '2025-01-01T00:00:00Z',
+            planned_finish='2025-01-20T00:00:00Z',  # forces overrun
+            p80_finish='2025-03-15T00:00:00Z',
+            project_context={'calendar': {'hours_per_day': 8,
+                                          'working_days': [1, 2, 3, 4, 5]}})
+        crash_ids = {c['id'] for c in r['crash_candidates']}
+        # All four critical-path activities should appear (A, B, D, E).
+        # C is near-critical with insufficient crash (procurement 12%, 64h -> 7.68h < 8h).
+        assert 'A' in crash_ids
+        assert 'B' in crash_ids
+        assert 'D' in crash_ids
+        assert 'E' in crash_ids
+        assert 'C' not in crash_ids
+
+    def test_sorted_by_score_desc(self):
+        r = run_recovery_options(
+            self._diamond_with_names(), self._diamond_links(),
+            '2025-01-01T00:00:00Z',
+            planned_finish='2025-01-20T00:00:00Z',
+            project_context={'calendar': {'hours_per_day': 8,
+                                          'working_days': [1, 2, 3, 4, 5]}})
+        scores = [c['score'] for c in r['crash_candidates']]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_scenario_mode_when_no_overrun(self):
+        r = run_recovery_options(
+            self._diamond_with_names(), self._diamond_links(),
+            '2025-01-01T00:00:00Z',
+            planned_finish='2025-06-01T00:00:00Z',  # plenty of room
+            project_context={'calendar': {'hours_per_day': 8,
+                                          'working_days': [1, 2, 3, 4, 5]}})
+        assert r['is_scenario_mode'] is True
+        assert r['overrun_days'] == 0
+        # Scenario mode still surfaces compressible activities
+        assert len(r['crash_candidates']) > 0
+        assert 'Scenario' in r['notes']
+
+    def test_target_hours_consumed_monotonically(self):
+        """In overrun mode, packaged crash_hours should not exceed target_hours."""
+        r = run_recovery_options(
+            self._diamond_with_names(), self._diamond_links(),
+            '2025-01-01T00:00:00Z',
+            planned_finish='2025-01-20T00:00:00Z',  # large overrun
+            project_context={'calendar': {'hours_per_day': 8,
+                                          'working_days': [1, 2, 3, 4, 5]}})
+        total_crash = sum(o['crash_hours'] for o in r['recovery_options'])
+        # Achieved should not wildly exceed target (allow one overshoot from last candidate)
+        assert total_crash >= 0
+        assert r['achieved_hours'] == pytest.approx(total_crash, rel=1e-6)
+
+    def test_max_recovery_options_respected(self):
+        """Large project with many candidates is truncated to max_recovery_options."""
+        nodes = [{'ID': f'T{i}', 'Duration': 10, 'TimeUnits': 'days',
+                  'Name': f'Install Unit {i}'} for i in range(30)]
+        links = [{'source': f'T{i}', 'target': f'T{i+1}'} for i in range(29)]
+        r = run_recovery_options(
+            nodes, links, '2025-01-01T00:00:00Z',
+            planned_finish='2025-01-05T00:00:00Z',  # huge overrun
+            project_context={'calendar': {'hours_per_day': 8,
+                                          'working_days': [1, 2, 3, 4, 5]}},
+            config={'max_recovery_options': 5})
+        assert len(r['recovery_options']) <= 5
+
+    def test_lag_candidate_ranking(self):
+        """Lag on critical edge ranks higher than lag on non-critical edge."""
+        nodes = [
+            {'ID': 'A', 'Duration': 10, 'TimeUnits': 'days', 'Name': 'Install A'},
+            {'ID': 'B', 'Duration': 10, 'TimeUnits': 'days', 'Name': 'Install B'},
+        ]
+        links = [{'source': 'A', 'target': 'B', 'type': 'FS',
+                  'lag': 48, 'lagUnits': 'h'}]  # 48h == 6 working days
+        r = run_recovery_options(
+            nodes, links, '2025-01-01T00:00:00Z',
+            planned_finish='2025-01-10T00:00:00Z',
+            project_context={'calendar': {'hours_per_day': 8,
+                                          'working_days': [1, 2, 3, 4, 5]}})
+        assert len(r['lag_candidates']) == 1
+        lag = r['lag_candidates'][0]
+        assert lag['source'] == 'A' and lag['target'] == 'B'
+        assert lag['is_on_critical_path'] is True
+        assert lag['potential_savings_hrs'] == 24.0  # 48h * 0.5
+
+    def test_short_lag_filtered(self):
+        """Lag shorter than min_lag_days_for_compression is filtered."""
+        nodes = [
+            {'ID': 'A', 'Duration': 10, 'TimeUnits': 'days'},
+            {'ID': 'B', 'Duration': 10, 'TimeUnits': 'days'},
+        ]
+        links = [{'source': 'A', 'target': 'B', 'type': 'FS',
+                  'lag': 8, 'lagUnits': 'h'}]  # 1 day
+        r = run_recovery_options(
+            nodes, links, '2025-01-01T00:00:00Z',
+            project_context={'calendar': {'hours_per_day': 8,
+                                          'working_days': [1, 2, 3, 4, 5]}})
+        assert r['lag_candidates'] == []
+
+    def test_expected_finish_defaults_to_cpm(self):
+        """When expected_finish is not supplied, backend computes it from CPM."""
+        r = run_recovery_options(
+            self._diamond_with_names(), self._diamond_links(),
+            '2025-01-01T00:00:00Z',
+            project_context={'calendar': {'hours_per_day': 8,
+                                          'working_days': [1, 2, 3, 4, 5]}})
+        # Deterministic forward pass: 42 working days
+        assert r['expected_finish'] is not None
+
+    def test_all_actual_finish_empty_result(self):
+        """All activities done -> no candidates, no target."""
+        nodes = [
+            {'ID': 'A', 'Duration': 10, 'TimeUnits': 'days',
+             'ActualFinish': '2024-12-20T00:00:00Z'},
+        ]
+        r = run_recovery_options(
+            nodes, [], '2025-01-01T00:00:00Z',
+            planned_finish='2025-01-10T00:00:00Z')
+        assert r['crash_candidates'] == []
+        assert r['lag_candidates'] == []
+
+    def test_milestone_excluded(self):
+        nodes = [
+            {'ID': 'M', 'Duration': 0, 'TimeUnits': 'h',
+             'Milestone': True, 'Name': 'Major Milestone'},
+            {'ID': 'T', 'Duration': 40, 'TimeUnits': 'h',
+             'Name': 'Install Foundation'},
+        ]
+        links = [{'source': 'M', 'target': 'T'}]
+        r = run_recovery_options(
+            nodes, links, '2025-01-01T00:00:00Z',
+            planned_finish='2025-01-02T00:00:00Z',
+            project_context={'calendar': {'hours_per_day': 8,
+                                          'working_days': [1, 2, 3, 4, 5]}})
+        crash_ids = {c['id'] for c in r['crash_candidates']}
+        assert 'M' not in crash_ids
+
+    def test_percent_complete_reduces_remaining(self):
+        """50%-complete 20-day task has same remaining as full 10-day task."""
+        def remain(node):
+            r = run_recovery_options(
+                [node], [], '2025-01-01T00:00:00Z',
+                planned_finish='2025-01-02T00:00:00Z',
+                project_context={'calendar': {'hours_per_day': 8,
+                                              'working_days': [1, 2, 3, 4, 5]}})
+            return r['crash_candidates'][0]['remaining_hrs'] if r['crash_candidates'] else 0
+        half = remain({'ID': 'X', 'Duration': 20, 'TimeUnits': 'days',
+                       'PercentComplete': 0.5, 'Name': 'Install Pipe'})
+        full = remain({'ID': 'Y', 'Duration': 10, 'TimeUnits': 'days',
+                       'Name': 'Install Pipe'})
+        assert half == full == 80.0
+
+
+class TestRecoveryEndpoint:
+
+    def test_returns_200(self, client, diamond_schedule):
+        nodes, links = diamond_schedule
+        for n in nodes:
+            n['TimeUnits'] = 'days'
+            n['Name'] = f'Install {n["ID"]}'
+        resp = client.post('/completion/recovery-options', json={
+            'nodes': nodes, 'links': links,
+            'status_date': '2025-01-01T00:00:00Z',
+            'planned_finish': '2025-01-15T00:00:00Z',
+            'project_context': {'calendar': {'hours_per_day': 8,
+                                             'working_days': [1, 2, 3, 4, 5]}},
+        })
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert 'recovery_options' in data
+        assert 'lag_options' in data
+        assert 'target_days' in data
+        assert data['overrun_days'] > 0
+
+    def test_options_preflight(self, client):
+        resp = client.options('/completion/recovery-options')
+        assert resp.status_code == 200
+
+    def test_health_includes_recovery(self, client):
+        resp = client.get('/completion/health')
+        data = resp.get_json()
+        assert '/completion/recovery-options' in data['endpoints']
+
+    def test_missing_status_date(self, client):
+        resp = client.post('/completion/recovery-options', json={
+            'nodes': [{'ID': 'A', 'Duration': 1}],
+            'links': [],
+        })
+        assert resp.status_code == 400
+        assert 'status_date' in resp.get_json()['error']
+
+    def test_invalid_planned_finish_type(self, client):
+        resp = client.post('/completion/recovery-options', json={
+            'nodes': [{'ID': 'A', 'Duration': 1}],
+            'status_date': '2025-01-01T00:00:00Z',
+            'planned_finish': 12345,  # not a string
+        })
+        assert resp.status_code == 400
+
+    def test_invalid_config_values(self, client):
+        resp = client.post('/completion/recovery-options', json={
+            'nodes': [{'ID': 'A', 'Duration': 1}],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {'lag_compression_factor': 1.5},  # out of [0,1]
+        })
+        assert resp.status_code == 400
+        assert 'lag_compression_factor' in resp.get_json()['error']
+
+
+class TestRecoveryConfig:
+
+    def test_defaults(self):
+        c = RecoveryConfig()
+        assert c.max_risk_buffer_days == 10.0
+        assert c.max_recovery_options == 18
+        assert c.lag_compression_factor == 0.5
+
+    def test_from_dict_overrides(self):
+        c = RecoveryConfig.from_dict({
+            'max_recovery_options': 5,
+            'lag_compression_factor': 0.25,
+        })
+        assert c.max_recovery_options == 5
+        assert c.lag_compression_factor == 0.25

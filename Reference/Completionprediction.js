@@ -60,6 +60,14 @@
         useBackendCompletion: true,
         completionEndpoint: '/completion/monte-carlo',
         completionRequestTimeoutMs: 15000,
+        // Backend recovery-option offload
+        // (Pyth-Sched-Analytics /completion/recovery-options).
+        // Same backend-first pattern: buildCrashOptions falls through to the
+        // in-browser implementation on any failure.  AI enrichment still runs
+        // on the returned crash_candidates if aiEnrichmentEnabled is true.
+        useBackendRecovery: true,
+        recoveryEndpoint: '/completion/recovery-options',
+        recoveryRequestTimeoutMs: 10000,
         // Add to CONFIG object:
         mcNoRiskBelow: 0.06,    // Below this risk score, no inflation
         mcNormalFrom: 0.18,     // Above this, use normal distribution
@@ -1874,6 +1882,282 @@
         }
         const d = safeDate(value);
         return d ? d.toISOString() : null;
+    }
+
+    // =========================================================================
+    // BACKEND-FIRST RECOVERY OPTIONS WRAPPER
+    // =========================================================================
+    //
+    // Offloads crash/lag candidate ranking to the Pyth-Sched-Analytics
+    // /completion/recovery-options endpoint when available.  The backend
+    // ports classifyCrashProfile + buildCrashOptions lines ~2062-2300;
+    // on any failure (disabled, missing endpoint, non-200, network,
+    // timeout) the original sync buildCrashOptions runs as a fallback.
+    //
+    // Shape parity: returns the same camelCase keys downstream consumers
+    // expect (targetDays, recoveryOptions, lagOptions, _crashCandidates,
+    // _enrichmentPending, etc.) so wireRiskMitigationClicks and the UI
+    // renderers are unchanged.  AI enrichment is still kicked off on the
+    // returned crash candidates when CONFIG.aiEnrichmentEnabled is true.
+
+    async function buildCrashOptionsAsync(nodes, maps, expected, risk,
+                                          reachability, drivingChain) {
+        const disabled = !CONFIG.useBackendRecovery
+            || typeof fetch !== 'function'
+            || !CONFIG.recoveryEndpoint;
+        if (disabled) {
+            return buildCrashOptions(nodes, maps, expected, risk,
+                                     reachability, drivingChain);
+        }
+
+        const scope = reachability?.scopeToEnd;
+        if (!maps?.statusDate || !scope || scope.size === 0
+            || scope.size > CONFIG.monteCarloMaxActivities) {
+            return buildCrashOptions(nodes, maps, expected, risk,
+                                     reachability, drivingChain);
+        }
+
+        try {
+            const body = _buildRecoveryRequestBody(
+                nodes, maps, expected, risk, reachability);
+
+            const controller = (typeof AbortController === 'function')
+                ? new AbortController() : null;
+            const timer = controller ? setTimeout(
+                () => controller.abort(),
+                +CONFIG.recoveryRequestTimeoutMs || 10000) : null;
+
+            const resp = await fetch(CONFIG.recoveryEndpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                signal: controller ? controller.signal : undefined,
+            });
+
+            if (timer) clearTimeout(timer);
+
+            if (!resp.ok) {
+                console.warn('[CompletionPrediction] Backend recovery returned',
+                             resp.status, '-- falling back to JS buildCrashOptions');
+                return buildCrashOptions(nodes, maps, expected, risk,
+                                         reachability, drivingChain);
+            }
+
+            const payload = await resp.json();
+            const mapped = _mapRecoveryResponse(payload, nodes, maps, expected,
+                                                scope, risk, drivingChain);
+
+            // AI enrichment: reuse the existing sync helpers so the UI flow
+            // (spinner + final replacement of recoveryOptions) continues to
+            // work regardless of backend mode.
+            if (CONFIG.aiEnrichmentEnabled && mapped._crashCandidates.length > 0) {
+                mapped._enrichmentPromise = (async () => {
+                    try {
+                        const projectContext = {
+                            sector: typeof inferProjectSector === 'function'
+                                ? inferProjectSector(mapped._crashCandidates) : null,
+                            overrunDays: Math.round(
+                                (expected.expectedProjectFinish - expected.plannedProjectFinish)
+                                / MS_PER_DAY),
+                            spreadDays: risk?.spreadDays || 0
+                        };
+                        const assessments = await requestCrashEnrichment(
+                            mapped._crashCandidates, projectContext);
+                        if (assessments && assessments.size > 0) {
+                            mapped.recoveryOptions = applyAIEnrichment(
+                                mapped.recoveryOptions, assessments);
+                            mapped._enrichmentComplete = true;
+                            const newAchievedHrs = mapped.recoveryOptions.reduce(
+                                (sum, o) => sum + (o.crashHours || 0), 0);
+                            mapped.achievedDays = Math.round(
+                                newAchievedHrs / CONFIG.workingHoursPerDay);
+                        }
+                    } catch (e) {
+                        console.warn('[CompletionPrediction] Enrichment failed '
+                                     + '(backend-recovery path):', e);
+                    }
+                })();
+            }
+
+            console.log('[CompletionPrediction] Backend recovery results:', {
+                targetDays: mapped.targetDays,
+                achievedDays: mapped.achievedDays,
+                overrunDays: payload.overrun_days,
+                recoveryOptions: mapped.recoveryOptions.length,
+                lagOptions: mapped.lagOptions.length,
+                scenarioMode: payload.is_scenario_mode,
+                computationMs: payload.computation_ms,
+                cacheHit: payload.cache_hit,
+            });
+            return mapped;
+
+        } catch (err) {
+            console.warn('[CompletionPrediction] Backend recovery failed (',
+                         err?.name || 'error', err?.message || err,
+                         ') -- falling back to JS buildCrashOptions');
+            return buildCrashOptions(nodes, maps, expected, risk,
+                                     reachability, drivingChain);
+        }
+    }
+
+    function _buildRecoveryRequestBody(nodes, maps, expected, risk, reachability) {
+        const scope = reachability?.scopeToEnd;
+        const statusDate = maps?.statusDate;
+
+        const includeIds = new Set();
+        if (scope && scope.size > 0) {
+            for (const id of scope) includeIds.add(String(id));
+            for (const id of Array.from(includeIds)) {
+                const preds = maps?.predMap?.get(id);
+                if (preds) for (const p of preds) includeIds.add(String(p.source));
+            }
+        } else {
+            for (const n of nodes || EMPTY_ARRAY) includeIds.add(String(n.ID));
+        }
+
+        const sentNodes = [];
+        for (const n of nodes || EMPTY_ARRAY) {
+            const nid = String(n.ID);
+            if (!includeIds.has(nid)) continue;
+            sentNodes.push({
+                ID: nid,
+                Name: n.Name || nid,
+                Duration: n.Duration,
+                TimeUnits: n.TimeUnits,
+                PercentComplete: n.PercentComplete ?? n.percentComplete,
+                ActualFinish: _isoOrNull(n.ActualFinish),
+                SupplierType: n.SupplierType || n.supplierType,
+                Milestone: n.Milestone === true || n.Milestone === 1 || n.Milestone === '1',
+                ComputedImportanceScore: n.ComputedImportanceScore
+                    ?? n.importanceScore ?? n.importance,
+            });
+        }
+
+        const sentLinks = [];
+        for (const l of (maps?.linkIndex ? null : null) || EMPTY_ARRAY) { /* placeholder */ }
+        // Re-derive links from maps.predMap (frontend doesn't keep the
+        // raw links list around in all code paths).
+        if (maps?.predMap) {
+            for (const [targetId, preds] of maps.predMap) {
+                if (!includeIds.has(String(targetId))) continue;
+                for (const p of preds) {
+                    const srcId = String(p.source);
+                    if (!includeIds.has(srcId)) continue;
+                    sentLinks.push({
+                        source: srcId,
+                        target: String(targetId),
+                        type: (p.type || 'FS').toUpperCase(),
+                        lag: +p.lagHrs || 0,
+                        lagUnits: 'h',
+                    });
+                }
+            }
+        }
+
+        const teamCal = (typeof window !== 'undefined'
+                         && window.cybereumState?.teamCalendar) || null;
+        const holidays = Array.isArray(teamCal?.holidays)
+            ? teamCal.holidays.map(h => (h && h.date) ? h.date : h).filter(Boolean)
+            : [];
+
+        return {
+            nodes: sentNodes,
+            links: sentLinks,
+            status_date: _isoOrNull(statusDate) || new Date(statusDate).toISOString(),
+            planned_finish:   _isoOrNull(expected?.plannedProjectFinish),
+            expected_finish:  _isoOrNull(expected?.expectedProjectFinish),
+            p80_finish:       _isoOrNull(risk?.p80Finish),
+            project_context: {
+                calendar: {
+                    hours_per_day: CONFIG.workingHoursPerDay || 8,
+                    working_days: Array.isArray(teamCal?.workingDays) && teamCal.workingDays.length
+                        ? teamCal.workingDays
+                        : [1, 2, 3, 4, 5],
+                    holidays: holidays,
+                },
+            },
+            config: {
+                max_risk_buffer_days:         CONFIG.maxRiskBufferDaysForRecovery,
+                max_recovery_options:         CONFIG.maxRecoveryOptions,
+                max_lag_options:              CONFIG.maxLagOptions,
+                min_crashable_hours:          CONFIG.minCrashableHours,
+                min_lag_days_for_compression: CONFIG.minLagDaysForCompression,
+                lag_compression_factor:       CONFIG.lagCompressionFactor,
+            },
+        };
+    }
+
+    function _mapRecoveryResponse(payload, nodes, maps, expected, scope, risk,
+                                  drivingChain) {
+        // Map snake_case backend fields to the camelCase JS contract.
+        const recoveryOptions = (payload.recovery_options || []).map(o => ({
+            id:                    o.id,
+            type:                  o.type,
+            title:                 o.title,
+            targetActivityId:      o.target_activity_id,
+            activityName:          o.activity_name,
+            kind:                  o.kind,
+            crashHours:            o.crash_hours,
+            potentialSavingsDays:  o.potential_savings_days,
+            leverage:              o.leverage,
+            isOnDrivingChain:      o.is_on_critical_path,
+            floatDays:             o.float_days,
+            effort:                o.effort,
+            risk:                  o.risk,
+            rationale:             o.rationale,
+        }));
+
+        const lagOptions = (payload.lag_options || []).map(o => ({
+            id:                    o.id,
+            type:                  o.type,
+            title:                 o.title,
+            edgeId:                o.edge_id,
+            sourceId:              o.source_id,
+            targetId:              o.target_id,
+            sourceName:            o.source_name,
+            targetName:            o.target_name,
+            relationType:          o.relation_type,
+            currentLagHours:       o.current_lag_hours,
+            currentLagDays:        o.current_lag_days,
+            potentialSavingsDays:  o.potential_savings_days,
+            isOnDrivingChain:      o.is_on_critical_path,
+            effort:                o.effort,
+            risk:                  o.risk,
+        }));
+
+        // Remap raw crash_candidates to the camelCase shape the AI
+        // enrichment helper expects (requestCrashEnrichment).
+        const crashCandidates = (payload.crash_candidates || []).map(c => ({
+            id:           c.id,
+            name:         c.name,
+            kind:         c.kind,
+            remainingHrs: c.remaining_hrs,
+            maxCrashHrs:  c.max_crash_hrs,
+            leverage:     c.leverage,
+            isChain:      c.is_on_critical_path,
+            floatDays:    c.float_days,
+            score:        c.score,
+            importance:   c.importance,
+        }));
+
+        return {
+            recoveryOptions,
+            lagOptions,
+            // riskMitigationOptions stays empty in backend mode; the
+            // risk-register path is JS-only (see CLAUDE.md).
+            riskMitigationOptions: [],
+            targetDays:     payload.target_days,
+            achievedDays:   payload.achieved_days,
+            notes:          payload.notes || '',
+            _enrichmentPending:
+                !!CONFIG.aiEnrichmentEnabled && crashCandidates.length > 0,
+            _enrichmentComplete: false,
+            _crashCandidates: crashCandidates,
+            _scope:    scope,
+            _maps:     maps,
+            _expected: expected,
+            source:    'backend',
+        };
     }
 
     // =========================================================================
@@ -5725,11 +6009,15 @@
             p80Impact: risk.p80ImpactDays
         });
 
-        const crashPlan = buildCrashOptions(nodes, maps, expected, risk, reachability, drivingChain);
+        // Backend-first recovery options; falls back to JS buildCrashOptions
+        // on any backend failure (see buildCrashOptionsAsync).
+        const crashPlan = await buildCrashOptionsAsync(
+            nodes, maps, expected, risk, reachability, drivingChain);
         console.log('[CompletionPrediction] Recovery Optimizer:', {
             targetDays: crashPlan.targetDays,
             achievableDays: crashPlan.achievedDays,
-            optionsFound: crashPlan.recoveryOptions.length + crashPlan.lagOptions.length
+            optionsFound: crashPlan.recoveryOptions.length + crashPlan.lagOptions.length,
+            source: crashPlan.source || 'js'
         });
 
         const curves = buildCurves(nodes, maps, expected, risk);

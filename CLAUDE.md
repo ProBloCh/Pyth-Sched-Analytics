@@ -27,10 +27,12 @@ NumPy, Pandas, scikit-learn, SciPy, Redis (optional caching).
 `multi_resolution_pipeline.py` (~335 LOC) handles hierarchical community
 detection.  `solver/` (10 modules, ~2,400 LOC) is a Flask Blueprint
 registered in `app.py` that provides three prescriptive endpoints plus a
-health check.  `completion/` (3 modules) is a second Flask Blueprint
-serving `/completion/monte-carlo` — a remaining-work finish-date
-forecast that wraps `solver/stochastic.py`'s five-tier distribution
-machinery.  Tests: 187 across 5 test files.
+health check.  `completion/` (5 modules: `__init__`, `routes`,
+`monte_carlo`, `calendar`, `recovery`) is a second Flask Blueprint
+serving `/completion/monte-carlo` (remaining-work finish-date forecast
+wrapping `solver/stochastic.py`'s five-tier distribution) and
+`/completion/recovery-options` (ranked crash + lag-compression options
+composing with the MC P80).  Tests: 232 across 5 test files.
 
 ## Four Principles
 

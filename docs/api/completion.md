@@ -251,18 +251,239 @@ working-hour interpretation), but with one deliberate RNG difference:
 
 ---
 
+## POST /completion/recovery-options
+
+Produces a ranked list of schedule-recovery options -- crash candidates
+and lag-compression opportunities -- targeting the gap between the
+expected project finish and the baseline plan, plus an optional
+P80-based risk buffer.
+
+Extracted from `Reference/Completionprediction.js`
+(`buildCrashOptions`, lines ~2062-2300).  Designed to compose with
+`/completion/monte-carlo` output: pass the MC's `p80_finish` to include
+a risk buffer in the target; omit it for a pure overrun-only target.
+
+### Request
+
+```jsonc
+{
+  "nodes": [                          // Required.  Same schema as /monte-carlo
+    {                                 //   (Duration, TimeUnits, PercentComplete,
+      "ID": "A1",                     //   ActualFinish, Name, SupplierType).
+      "Duration": 10,
+      "TimeUnits": "days",
+      "PercentComplete": 0.25,
+      "ActualFinish": null,
+      "Name": "Install Foundation",   // Optional.  Used for crash-profile
+                                      //   classification (regex-matched).
+      "SupplierType": "external_equipment",  // Optional.  Overrides name
+                                      //   classification with a tighter
+                                      //   max-crash fraction.
+      "ComputedImportanceScore": 0.7, // Optional.  0..1.  Factors into crash
+                                      //   score: score ~= remaining_hrs *
+                                      //   leverage * (0.55 + 0.45*importance).
+      "Milestone": false              // Optional.  Milestones are excluded.
+    }
+  ],
+  "links": [                          // Optional.  Same schema as /monte-carlo
+    {                                 //   plus optional "lagUnits" ("h"/"d"/"w"),
+      "source": "A0",                 //   default "h" to match
+      "target": "A1",                 //   Reference/Completionprediction.js
+      "type": "FS",                   //   getLagInHours().
+      "lag": 48,
+      "lagUnits": "h"
+    }
+  ],
+  "status_date": "2025-01-15T00:00:00Z",   // Required.  Same semantics as
+                                      //   /monte-carlo (anchor for remaining
+                                      //   work).
+  "planned_finish":   "2025-02-20T00:00:00Z",  // Optional.  Baseline plan date.
+                                      //   overrun_days = max(0, expected - planned).
+                                      //   If absent, overrun_days = 0 (scenario mode).
+  "expected_finish":  "2025-03-01T00:00:00Z",  // Optional.  Deterministic CPM
+                                      //   finish (risk off).  If absent,
+                                      //   backend computes it via
+                                      //   run_completion_mc(enable_risk=false).
+  "p80_finish":       "2025-03-15T00:00:00Z",  // Optional.  From prior
+                                      //   /completion/monte-carlo call.
+                                      //   risk_buffer_days = min(cap, p80 - expected).
+                                      //   If absent, risk_buffer_days = 0.
+  "activity_metadata": { "...": "..." },   // Optional.  Same schema as
+                                      //   /monte-carlo (importance_score,
+                                      //   supplier_type).
+  "project_context": {                // Optional.  Calendar is reused
+    "calendar": {                     //   identically to /monte-carlo
+      "hours_per_day": 8.0,           //   (target_hours = target_days * hpd,
+      "working_days": [1,2,3,4,5],    //   lag unit-conversion).
+      "holidays": ["2025-07-04"]
+    }
+  },
+  "config": {                         // Optional.  All numeric, all bounded.
+    "max_risk_buffer_days":         10,    // Cap on (p80 - expected). Default: 10.
+    "max_recovery_options":         18,    // Top-N crash options returned.  Default: 18.
+    "max_lag_options":              10,    // Top-N lag options returned.  Default: 10.
+    "min_crashable_hours":          16,    // Filter: remaining_hrs must be >=. Default: 16.
+    "min_lag_days_for_compression": 2,     // Filter: lag_days must be >=. Default: 2.
+    "lag_compression_factor":       0.5    // savings = lag * factor.  Default: 0.5.
+  }
+}
+```
+
+### Response (200)
+
+```jsonc
+{
+  "status_date":      "2025-01-15T00:00:00+00:00",
+  "planned_finish":   "2025-02-20T00:00:00+00:00",  // null if not supplied.
+  "expected_finish":  "2025-03-01T00:00:00+00:00",  // echoed or CPM-computed.
+  "p80_finish":       "2025-03-15T00:00:00+00:00",  // null if not supplied.
+  "overrun_days":       9.0,         // max(0, expected - planned) wall-clock days.
+  "risk_buffer_days":  10.0,         // min(max_risk_buffer_days, max(0, p80-expected)).
+  "target_days":       19.0,         // overrun + capped buffer (or buffer only if
+                                     //   no overrun -- "scenario mode").
+  "target_hours":     152.0,         // target_days * hours_per_day.
+  "achieved_days":     12.5,         // Approximate recovery from the packaged
+                                     //   options (sum crash_hours / hpd).
+  "achieved_hours":   100.0,
+  "is_scenario_mode": false,         // True iff overrun_days == 0.  When true,
+                                     //   options surface compressible activities
+                                     //   for proactive planning rather than a
+                                     //   fixed recovery target.
+  "recovery_options": [              // Top-N crash options.  Packaged from the
+    {                                //   highest-scoring crash_candidates until
+      "id":                   "crash_A1",    // target_hours is consumed.
+      "type":                 "duration_crash",
+      "title":                "Crash: Install Foundation",
+      "target_activity_id":   "A1",
+      "activity_name":        "Install Foundation",
+      "kind":                 "construction",
+      "crash_hours":          33.6,
+      "potential_savings_days": 4,   // max(1, round(crash_hours / hpd)).
+      "leverage":             1.0,
+      "is_on_critical_path":  true,
+      "float_days":           0.0,
+      "effort":               "medium",   // low (<3d) / medium (3-7d) / high (>=7d).
+      "risk":                 "high",     // high if score > 200, else medium.
+      "rationale":            ["On critical path", "construction"]
+    }
+  ],
+  "lag_options": [                   // Top-N lag-compression options.
+    {
+      "id":                    "lag_0",
+      "type":                  "lag_compression",
+      "title":                 "Install A -> Install B",
+      "edge_id":               "A1->B1",
+      "source_id":             "A1",
+      "target_id":             "B1",
+      "relation_type":         "FS",
+      "current_lag_hours":     48.0,
+      "current_lag_days":      6.0,
+      "potential_savings_days": 3,   // max(1, round(savings_hrs / hpd)).
+      "is_on_critical_path":   true,
+      "effort":                "low",
+      "risk":                  "medium"
+    }
+  ],
+  "crash_candidates": [              // Raw, unpackaged list.  All crash
+    { "id": "A1", "kind": "construction", "remaining_hrs": 120.0,
+      "max_crash_hrs": 33.6, "leverage": 1.0, "is_on_critical_path": true,
+      "float_days": 0.0, "score": 93.0, "importance": 0.5, "name": "..." }
+  ],                                 //   candidates that passed all filters,
+                                     //   sorted by score desc.  Kept for
+                                     //   downstream UI / enrichment.
+  "lag_candidates":   [ "..." ],     // Raw lag list, same pattern.
+  "notes": "Target: recover 9d delay + 10d risk buffer",  // Human-readable.
+  "config":  { "...": "..." },       // Echo of resolved config.
+  "computation_ms": 2.1,
+  "cache_hit": false
+}
+```
+
+### Filtering Rules (applied in the engine)
+
+**Crash candidates:**
+1. Activity must have an ID in the graph.
+2. Not a milestone (`Milestone` truthy).
+3. `ActualFinish` not set.
+4. `remaining_hrs >= config.min_crashable_hours` (default 16).
+5. `max_crash_hrs >= 8` after applying the crash-profile fraction.
+6. If **not on the critical path** and `float_days > 10`, dropped (too
+   much slack to make the option worth surfacing).
+
+**Lag candidates:**
+1. Both endpoints in the graph.
+2. `lag_days >= config.min_lag_days_for_compression` (default 2).
+3. If **not a critical-path edge** and `lag_days < 5`, dropped.
+
+### Crash Profiles
+
+Classification precedence: explicit `SupplierType` > regex on
+`Name` > default.  Matches the JS `classifyCrashProfile`.
+
+| Input | `kind` | `max_frac` |
+|---|---|---|
+| `SupplierType = "external_equipment"` | external_equipment | 0.03 |
+| `SupplierType = "external_material"`  | external_material  | 0.05 |
+| `SupplierType = "external_service"`   | external_service   | 0.10 |
+| Name matches `/permit\|approval\|regulat\|review\|sign/i` | governance | 0.08 |
+| Name matches `/procure\|purchase\|delivery\|ship\|vendor/i` | procurement | 0.12 |
+| Name matches `/design\|engineer\|ifc\|draw\|model/i` | engineering | 0.18 |
+| Name matches `/fabricat\|shop\|weld\|machine\|prefab/i` | fabrication | 0.22 |
+| Name matches `/install\|erect\|construct\|civil\|mech\|elect\|pipe/i` | construction | 0.28 |
+| Name matches `/test\|commission\|start.?up\|turnover/i` | commissioning | 0.20 |
+| (no match) | generic | 0.25 |
+
+**Known quirk (preserved for JS parity):** the governance regex includes
+`sign`, which accidentally matches `de-sign`.  An activity named "Design
+Drawings" classifies as **governance** (8%), not **engineering** (18%).
+To force engineering classification, use a name like "Engineering
+Drawings" or supply an explicit metadata entry.
+
+### Response (400)
+
+```json
+{ "error": "status_date is required (ISO-8601)" }
+```
+
+Validation covers: missing nodes / status_date, duplicate IDs, negative
+durations, unknown link source/target, non-string date fields, and
+out-of-range config values (`max_risk_buffer_days` 0..365,
+`lag_compression_factor` 0..1, etc.).
+
+### What is NOT Included
+
+The JS `buildCrashOptions` also triggers two frontend-specific flows
+that are intentionally out of scope for this endpoint:
+
+- **AI enrichment** against `/OpenAI/EnrichCrashCandidates` and
+  `/OpenAI/EnrichRiskCandidates`.  Those stay in the frontend (rate-limit
+  sensitive, UI-scoped).
+- **`riskMitigationOptions`** (risk-register cards).  Separate concern
+  from recovery; different data source.
+
+Callers that need enrichment can take the `crash_candidates` /
+`lag_candidates` arrays from the response and feed them into the
+enrichment pipeline themselves.
+
+---
+
 ## GET /completion/health
 
 ```json
 {
   "status": "healthy",
   "module": "completion-forecast",
-  "endpoints": ["/completion/monte-carlo"]
+  "endpoints": [
+    "/completion/monte-carlo",
+    "/completion/recovery-options"
+  ]
 }
 ```
 
 ## Caching
 
 Responses are cached via the same Redis / LRU bridge as the solver
-endpoints (lazy-imported from `app.py`).  Cache key: `completion:mc:<sha256
-of request body>`.  Cached responses return with `cache_hit: true`.
+endpoints (lazy-imported from `app.py`).  Cache keys:
+`completion:mc:<sha256>` and `completion:recovery:<sha256>` over the
+respective request bodies.  Cached responses return with
+`cache_hit: true`.
