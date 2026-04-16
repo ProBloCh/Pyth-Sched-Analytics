@@ -17,6 +17,7 @@ from solver.dag import build_dag, run_cpm
 from solver.models import SolverConfig, ProjectContext, build_activity_params
 from solver.optimizer import optimize
 from solver.pareto import run_pareto, filter_pareto_front
+from scipy.special import ndtri
 from solver.stochastic import (
     run_ensemble,
     _generate_samples,
@@ -174,8 +175,9 @@ class TestRiskTiers:
         maxes = np.zeros(5)
         N = 500
         for _ in range(N):
-            u = rng.random(5)
-            mult = _compute_raw_multipliers(u, risk, fat_thresh)
+            u = np.clip(rng.random(5), 1e-10, 1 - 1e-10)
+            z = ndtri(u)
+            mult = _compute_raw_multipliers(u, z, risk, fat_thresh)
             means += mult
             maxes = np.maximum(maxes, mult)
         means /= N

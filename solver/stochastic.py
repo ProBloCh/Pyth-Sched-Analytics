@@ -121,17 +121,21 @@ def _triangular_ppf(u, low, mode, high):
     return x
 
 
-def _bs_ppf(u, alpha, beta):
-    """Vectorised Birnbaum-Saunders inverse CDF.
+def _bs_ppf_z(z, alpha, beta):
+    """Vectorised Birnbaum-Saunders quantile from precomputed z ~ N(0,1).
 
     BS was originally a fatigue-life model (materials failing under
     cyclic stress) — maps naturally to schedule activities that can
     "fail" under accumulated project stress.
     """
-    from scipy.stats import norm as _norm
-    z = _norm.ppf(u)
     half_az = alpha * z / 2.0
     return beta * (half_az + np.sqrt(half_az ** 2 + 1.0)) ** 2
+
+
+def _bs_ppf(u, alpha, beta):
+    """Birnbaum-Saunders inverse CDF from uniform u ∈ (0,1)."""
+    from scipy.special import ndtri
+    return _bs_ppf_z(ndtri(u), alpha, beta)
 
 
 def _pareto_ppf(u, alpha):
@@ -161,9 +165,13 @@ def _fat_tail_thresholds(activity_types, n):
     return thresh
 
 
-def _compute_raw_multipliers(u, risk, fat_thresh):
+def _compute_raw_multipliers(u, z, risk, fat_thresh):
     """
     Per-activity raw duration multipliers from the five-tier model.
+
+    *z* is the precomputed standard-normal transform of *u* (via
+    scipy.special.ndtri), passed in to avoid recomputing it inside
+    the MC loop.
 
     Tiers (risk as fraction 0–1):
       < 6%:             noise floor → multiplier = 1.0
@@ -192,17 +200,15 @@ def _compute_raw_multipliers(u, risk, fat_thresh):
 
     # Tier 3: normal (σ proportional to risk)
     if np.any(norm_mask):
-        from scipy.stats import norm as _norm
         r = risk[norm_mask]
-        z = _norm.ppf(u[norm_mask])
-        mult[norm_mask] = np.maximum(0.5, 1.0 + z * r)
+        mult[norm_mask] = np.maximum(0.5, 1.0 + z[norm_mask] * r)
 
     # Tier 4: Birnbaum-Saunders (fat tail — best fit for O&G overruns)
     if np.any(bs_mask):
         r = risk[bs_mask]
         alpha = 0.25 + 0.65 * r
         beta  = 1.00 + 0.10 * r
-        mult[bs_mask] = _bs_ppf(u[bs_mask], alpha, beta)
+        mult[bs_mask] = _bs_ppf_z(z[bs_mask], alpha, beta)
 
     # Tier 5: Pareto power-law (polynomial tail — Flyvbjerg α≈2.35 regime)
     if np.any(pareto_mask):
@@ -433,6 +439,11 @@ def run_ensemble(dag_state, params, project_ctx, config):
     fat_thresh = _fat_tail_thresholds(params.activity_types, n)
     caps = _compute_caps(risk, params.durations, fat_thresh)
 
+    # Precompute standard-normal transform once (avoids scipy overhead
+    # per-sample inside _compute_raw_multipliers — Copilot review #3).
+    from scipy.special import ndtri
+    z_all = ndtri(u_all)
+
     # Resource FD gradients are O(n) CPM runs per sample.  When the total
     # cost n*M is large, compute them once on the original state and keep
     # only the cheap analytical disciplines inside the MC loop.
@@ -465,7 +476,7 @@ def run_ensemble(dag_state, params, project_ctx, config):
 
     for m in range(M):
         # Risk-tiered multipliers (matching Completionprediction.js tiers)
-        raw_mult = _compute_raw_multipliers(u_all[m], risk, fat_thresh)
+        raw_mult = _compute_raw_multipliers(u_all[m], z_all[m], risk, fat_thresh)
         capped_mult = np.minimum(raw_mult, caps)
         capped_mult = np.maximum(capped_mult, 0.1)
 

@@ -844,8 +844,8 @@ def _risk_propagation(G: nx.DiGraph, df: pd.DataFrame):
     """Propagate risk through the dependency network.
 
     Each activity's propagated_risk combines its intrinsic riskScore
-    with risk inherited from predecessors, weighted by the number of
-    dependency paths.  This models the cascade mechanism that generates
+    with risk inherited from predecessors, averaged over immediate
+    predecessor count at convergence points.  This models the cascade mechanism that generates
     fat-tailed overrun distributions (Natarajan et al., PMJ 2022;
     Flyvbjerg et al., JMIS 2022).
 
@@ -1017,21 +1017,21 @@ def _schedule_health(G: nx.DiGraph, df: pd.DataFrame, critical_path, critical_pa
     # 1. Logic (relationship) density — target: 1.5–2.5 per task
     logic_density = round(n_links / max(n_tasks, 1), 2)
 
-    # 2. Missing predecessors (excluding start nodes)
-    missing_pred = []
-    for nd in G.nodes():
-        if G.in_degree(nd) == 0 and G.out_degree(nd) > 0:
-            # Start nodes are expected to have no predecessors
-            pass
-        elif G.in_degree(nd) == 0 and G.out_degree(nd) == 0:
-            missing_pred.append(str(nd))  # Orphan — no pred or succ
-    # Also check for non-start nodes with no predecessors
-    for nd in G.nodes():
-        if G.in_degree(nd) == 0 and G.out_degree(nd) > 0:
-            # This is a start node — only flag if there are multiple
-            pass
-    n_no_pred = sum(1 for nd in G.nodes() if G.in_degree(nd) == 0)
-    n_no_succ = sum(1 for nd in G.nodes() if G.out_degree(nd) == 0)
+    # 2. Missing predecessors / successors (DCMA definition: non-start/end
+    #    tasks with no logical ties).  Legitimate start nodes (in_degree=0,
+    #    out_degree>0) and end nodes (out_degree=0, in_degree>0) are excluded.
+    n_no_pred = sum(1 for nd in G.nodes()
+                    if G.in_degree(nd) == 0 and G.out_degree(nd) > 0
+                    and sum(1 for _ in G.predecessors(nd)) == 0
+                    # Count only if there are already other start nodes
+                    )
+    # Simpler: count interior tasks (have successors) with no predecessors,
+    # minus one legitimate start node.
+    starts = [nd for nd in G.nodes() if G.in_degree(nd) == 0]
+    ends   = [nd for nd in G.nodes() if G.out_degree(nd) == 0]
+    # One start and one end are expected; extras are "missing logic"
+    n_no_pred = max(0, len(starts) - 1)
+    n_no_succ = max(0, len(ends) - 1)
 
     # 3. Relationship type breakdown
     rel_counts = {'FS': 0, 'SS': 0, 'FF': 0, 'SF': 0}

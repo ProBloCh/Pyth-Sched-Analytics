@@ -80,7 +80,10 @@ def build_dag(nodes, links):
         if src in id_to_idx and tgt in id_to_idx:
             si, ti = id_to_idx[src], id_to_idx[tgt]
             if si != ti:
-                lag = float(link.get('lag', 0))
+                try:
+                    lag = float(link.get('lag', 0))
+                except (TypeError, ValueError):
+                    lag = 0.0
                 rel = str(link.get('type', 'FS')).upper()
                 if rel not in (_FS, _SS, _FF, _SF):
                     rel = _FS
@@ -219,7 +222,43 @@ def run_cpm(state, durations=None):
 
 
 def get_critical_path_indices(state):
-    """Activity indices on the critical path, in topological order."""
+    """Single contiguous critical path, in topological order.
+
+    When multiple critical paths exist, follows the first critical
+    successor at each step (deterministic, reproducible).
+    """
     if state.n == 0:
         return []
-    return [int(i) for i in state.topo_order if state.critical_mask[i]]
+
+    # Find the start: critical activity with no critical predecessors
+    crit_set = set(int(i) for i in state.topo_order if state.critical_mask[i])
+    if not crit_set:
+        return []
+
+    # Start from the first critical node in topological order
+    start = None
+    for i in state.topo_order:
+        if int(i) in crit_set:
+            has_crit_pred = any(int(p) in crit_set for p in state.pred[i])
+            if not has_crit_pred:
+                start = int(i)
+                break
+
+    if start is None:
+        start = min(crit_set)
+
+    # Follow critical successors
+    path = [start]
+    current = start
+    while True:
+        next_crit = None
+        for s in state.succ[current]:
+            if int(s) in crit_set:
+                next_crit = int(s)
+                break
+        if next_crit is None:
+            break
+        path.append(next_crit)
+        current = next_crit
+
+    return path
