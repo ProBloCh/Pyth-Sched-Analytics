@@ -64,6 +64,9 @@ def _generate_samples(M, n, antithetic, seed=42):
     generated at power-of-2 counts for optimal discrepancy, then
     truncated to the requested M to avoid inflating computation time.
     """
+    if M <= 0:
+        return np.empty((0, max(n, 1)), dtype=np.float64), 0
+
     if n <= _SOBOL_MAX_DIM:
         from scipy.stats.qmc import Sobol
 

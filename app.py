@@ -863,11 +863,7 @@ def _risk_propagation(G: nx.DiGraph, df: pd.DataFrame):
         df['coupling_density'] = 0.0
         return df
 
-    ids = df['ID'].astype(str).tolist()
-    id_to_idx = {aid: i for i, aid in enumerate(ids)}
-    n = len(ids)
-
-    # Map riskScore from df to array indexed by graph node order
+    # Map riskScore from df to activity/node id
     risk_map = dict(zip(df['ID'].astype(str), df['riskScore'].fillna(0).values))
 
     # Topological propagation: propagated_risk[j] = risk[j] + Σ propagated_risk[pred] / in_degree[j]
@@ -1018,18 +1014,10 @@ def _schedule_health(G: nx.DiGraph, df: pd.DataFrame, critical_path, critical_pa
     logic_density = round(n_links / max(n_tasks, 1), 2)
 
     # 2. Missing predecessors / successors (DCMA definition: non-start/end
-    #    tasks with no logical ties).  Legitimate start nodes (in_degree=0,
-    #    out_degree>0) and end nodes (out_degree=0, in_degree>0) are excluded.
-    n_no_pred = sum(1 for nd in G.nodes()
-                    if G.in_degree(nd) == 0 and G.out_degree(nd) > 0
-                    and sum(1 for _ in G.predecessors(nd)) == 0
-                    # Count only if there are already other start nodes
-                    )
-    # Simpler: count interior tasks (have successors) with no predecessors,
-    # minus one legitimate start node.
+    #    tasks with no logical ties).  One start and one end are expected;
+    #    extras are treated as missing logic.
     starts = [nd for nd in G.nodes() if G.in_degree(nd) == 0]
     ends   = [nd for nd in G.nodes() if G.out_degree(nd) == 0]
-    # One start and one end are expected; extras are "missing logic"
     n_no_pred = max(0, len(starts) - 1)
     n_no_succ = max(0, len(ends) - 1)
 
@@ -1043,7 +1031,10 @@ def _schedule_health(G: nx.DiGraph, df: pd.DataFrame, critical_path, critical_pa
             rel_counts[rel] += 1
         else:
             rel_counts['FS'] += 1
-        lag = float(data.get('lag', 0))
+        try:
+            lag = float(data.get('lag', 0))
+        except (TypeError, ValueError):
+            lag = 0.0
         if abs(lag) > 1e-9:
             lag_count += 1
         if lag < -1e-9:
