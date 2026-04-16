@@ -189,6 +189,24 @@ contracts are consumed by the C# backend (`ComputeMetrics.cs`) and JS
 frontend. The same rule applies: add new keys freely, don't rename/remove
 existing ones.
 
+**Canonical API contracts live in `docs/api/`.**  Every request/response
+field, its type, presence rules, and nesting is documented there:
+
+- [`docs/api/README.md`](docs/api/README.md) — overview, stability rules,
+  consumer map, and maintenance checklist.
+- [`docs/api/graph-metrics.md`](docs/api/graph-metrics.md) — `POST
+  /graph-metrics` request and response contract.
+- [`docs/api/solver.md`](docs/api/solver.md) — all three solver endpoint
+  contracts, shared request format, phase-dependent weights, validation
+  limits, and the stochastic sub-object.
+- [`docs/api/health.md`](docs/api/health.md) — `GET /health` and `GET
+  /solver/health` contracts.
+
+**When changing any endpoint's request or response shape, update the
+corresponding `docs/api/*.md` file in the same PR.**  The docs are the
+reference that consuming teams (C#, JS) rely on — keeping them current
+prevents integration drift.
+
 ### Solver-Specific Rules
 
 - **L-BFGS-B optimizer** (`optimizer.py`): Uses `scipy.optimize.minimize`
