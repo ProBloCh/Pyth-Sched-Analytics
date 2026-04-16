@@ -84,6 +84,13 @@ except Exception as _solver_err:
     logging.warning("Solver package failed to load: %s. "
                     "Solver endpoints will be unavailable.", _solver_err)
 
+try:
+    from completion import completion_bp
+    app.register_blueprint(completion_bp)
+except Exception as _completion_err:
+    logging.warning("Completion package failed to load: %s. "
+                    "Completion endpoints will be unavailable.", _completion_err)
+
 ###############################################################################
 # Redis Cache Setup                                                           #
 ###############################################################################

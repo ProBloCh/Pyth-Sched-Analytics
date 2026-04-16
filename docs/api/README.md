@@ -13,8 +13,10 @@ consumers).
 | `/solver/sensitivity` | POST | [solver.md](solver.md#post-solversensitivity) | Single-pass CADJ-P sensitivity analysis |
 | `/solver/optimize` | POST | [solver.md](solver.md#post-solveroptimize) | L-BFGS-B gradient-descent optimization |
 | `/solver/pareto` | POST | [solver.md](solver.md#post-solverpareto) | Pareto frontier sweep (Tchebycheff scalarization) |
+| `/completion/monte-carlo` | POST | [completion.md](completion.md#post-completionmonte-carlo) | Remaining-work MC finish-date forecast (P20/P50/P80) |
 | `/health` | GET | [health.md](health.md#get-health) | Main app health check |
 | `/solver/health` | GET | [health.md](health.md#get-solverhealth) | Solver module health check |
+| `/completion/health` | GET | [completion.md](completion.md#get-completionhealth) | Completion module health check |
 
 ## API Stability Rules
 
