@@ -240,21 +240,24 @@ def calculate_critical_path(G):
     """
     try:
         from solver.dag import build_dag as _build_dag, get_critical_path_indices
-        nodes = [{'ID': str(nd), 'Duration': float(G.nodes[nd].get('duration', 1))}
-                 for nd in G.nodes()]
-        links = [{'source': str(u), 'target': str(v),
-                  'type': G.edges[u, v].get('type', 'FS'),
-                  'lag':  float(G.edges[u, v].get('lag', 0))}
-                 for u, v in G.edges()]
-        dag_state, _ = _build_dag(nodes, links)
-        cp_ids = [nodes[i]['ID'] for i in get_critical_path_indices(dag_state)]
-        return cp_ids, dag_state.makespan
+        cpm_nodes = [{'ID': str(nd), 'Duration': float(G.nodes[nd].get('duration', 1))}
+                     for nd in G.nodes()]
+        cpm_links = [{'source': str(u), 'target': str(v),
+                      'type': G.edges[u, v].get('type', 'FS'),
+                      'lag':  float(G.edges[u, v].get('lag', 0))}
+                     for u, v in G.edges()]
+        dag_state, _ = _build_dag(cpm_nodes, cpm_links)
+        cp_ids = [cpm_nodes[i]['ID'] for i in get_critical_path_indices(dag_state)]
+        # Return total-float dict so analyse() can populate df_nodes
+        tf_map = {cpm_nodes[i]['ID']: float(dag_state.TF[i])
+                  for i in range(dag_state.n)}
+        return cp_ids, dag_state.makespan, tf_map
     except Exception as e:
         if DEBUG:
             logging.warning(f"CPM critical path failed ({e}); falling back to NetworkX")
         critical_path = nx.dag_longest_path(G, weight='duration')
         critical_path_length = nx.dag_longest_path_length(G, weight='duration')
-        return critical_path, critical_path_length
+        return critical_path, critical_path_length, {}
 
 def identify_critical_activities_and_milestones(G):
     critical_activities = [
@@ -1218,9 +1221,11 @@ def analyse(nodes, links):
         work_packages = define_work_packages(df_nodes, G)
         work_packages_serialized = serialize_work_packages(work_packages)
         
-        # Critical path
+        # Critical path (CPM with FS/SS/FF/SF + lag)
         if nx.is_directed_acyclic_graph(G) and len(G) > 0:
-            critical_path, critical_path_length = calculate_critical_path(G)
+            critical_path, critical_path_length, tf_map = calculate_critical_path(G)
+            if tf_map:
+                df_nodes['total_float'] = df_nodes['ID'].astype(str).map(tf_map).fillna(0)
         else:
             critical_path, critical_path_length = [], 0
         

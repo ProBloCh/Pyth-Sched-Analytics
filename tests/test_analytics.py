@@ -191,7 +191,7 @@ class TestCriticalPath:
         nodes, links = simple_chain
         G = build_nx_graph(nodes, links)
         G = ensure_dag(G)
-        path, length = calculate_critical_path(G)
+        path, length, tf_map = calculate_critical_path(G)
         assert path == ['A', 'B', 'C']
         assert length == 35  # CPM makespan: A(10) + B(20) + C(5)
 
@@ -199,7 +199,7 @@ class TestCriticalPath:
         nodes, links = diamond
         G = build_nx_graph(nodes, links)
         G = ensure_dag(G)
-        path, length = calculate_critical_path(G)
+        path, length, tf_map = calculate_critical_path(G)
         assert length == 30  # CPM makespan: A(10) + B(15) + D(5)
         assert 'A' in path and 'D' in path
 

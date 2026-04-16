@@ -256,11 +256,12 @@ def _detect_extremes(raw_max, raw_mean, raw_std, cap_hits, M, caps,
     """
     Identify extreme-risk activities from MC multiplier statistics.
 
-    Black swans:  activities that regularly hit the duration cap —
+    Black swans:  activities that regularly hit the duration cap
+                  (within 5% of cap value) in ≥ 10% of scenarios —
                   extreme overruns are not rare but recurring.
     Dragon kings: activities where the worst-case scenario dwarfs
                   even the expected tail behaviour (outlier among
-                  outliers).
+                  outliers, max > mean + 4σ).
     """
     n = len(ids)
     risk = np.clip(risk_scores / 10.0, 0.0, 1.0)
@@ -467,10 +468,13 @@ def run_ensemble(dag_state, params, project_ctx, config):
 
     # SRA accumulators — Criticality Index (Van Slyke 1963) and
     # Cruciality Index (Williams 1992), computed online in O(n) memory.
-    crit_count    = np.zeros(n, dtype=np.int64)   # times on critical path
-    makespan_sum  = 0.0
+    # Uses capped multipliers for cruciality (same values that drive CPM).
+    crit_count     = np.zeros(n, dtype=np.int64)   # times on critical path
+    makespan_sum   = 0.0
     makespan_sumsq = 0.0
-    cross_sum     = np.zeros(n, dtype=np.float64)  # Σ(mult_i * makespan)
+    cross_sum      = np.zeros(n, dtype=np.float64)  # Σ(capped_mult_i * makespan)
+    cap_sum        = np.zeros(n, dtype=np.float64)   # Σ(capped_mult_i)
+    cap_sum_sq     = np.zeros(n, dtype=np.float64)   # Σ(capped_mult_i²)
 
     # Save original array references so we can restore aliasing after the loop.
     orig_dag_dur   = dag_state.durations
@@ -487,7 +491,7 @@ def run_ensemble(dag_state, params, project_ctx, config):
         raw_max    = np.maximum(raw_max, raw_mult)
         raw_sum   += raw_mult
         raw_sum_sq += raw_mult ** 2
-        cap_hits  += (raw_mult >= caps * 0.95).astype(np.int64)
+        cap_hits  += (raw_mult >= caps * 0.95).astype(np.int64)  # 95% soft threshold
 
         perturbed = saved_values * capped_mult
         perturbed = np.maximum(perturbed, params.min_durations)
@@ -501,6 +505,8 @@ def run_ensemble(dag_state, params, project_ctx, config):
         makespan_sum  += ms
         makespan_sumsq += ms * ms
         cross_sum     += capped_mult * ms
+        cap_sum       += capped_mult
+        cap_sum_sq    += capped_mult ** 2
 
         objs  = compute_objectives(dag_state, params, project_ctx, disciplines)
         grads = compute_gradients(dag_state, params, project_ctx,
@@ -578,8 +584,10 @@ def run_ensemble(dag_state, params, project_ctx, config):
     ms_var  = makespan_sumsq / max(M, 1) - ms_mean ** 2
     ms_std  = np.sqrt(max(ms_var, 0.0))
 
-    mult_mean = raw_sum / max(M, 1)
-    mult_var  = raw_sum_sq / max(M, 1) - mult_mean ** 2
+    # Use capped multipliers (same values that drove CPM) for consistent
+    # correlation.  raw_sum/raw_sum_sq are only for extreme-event detection.
+    mult_mean = cap_sum / max(M, 1)
+    mult_var  = cap_sum_sq / max(M, 1) - mult_mean ** 2
     mult_std  = np.sqrt(np.maximum(mult_var, 0.0))
 
     if ms_std > 1e-12:
