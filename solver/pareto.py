@@ -1,8 +1,10 @@
 """
 solver/pareto.py - Pareto frontier generation.
 
-Sweeps weight vectors across the objective simplex, runs the optimiser for
-each, and filters to non-dominated solutions.
+Sweeps weight vectors across the objective simplex using augmented
+Tchebycheff scalarisation (via the optimizer's utopia parameter),
+which can find solutions on non-convex frontiers.  Non-dominated
+sorting is vectorised with numpy.
 """
 
 import logging
@@ -59,33 +61,58 @@ def generate_weight_vectors(disciplines, n_vectors=30):
 
 
 # ---------------------------------------------------------------------------
-# Dominance
+# Non-dominated sorting (vectorised)
 # ---------------------------------------------------------------------------
 
-def _dominates(obj_a, obj_b, discs):
-    """True if *a* dominates *b* (a <= b everywhere, a < b somewhere)."""
-    at_least_one_strict = False
-    for d in discs:
-        if obj_a[d] > obj_b[d]:
-            return False
-        if obj_a[d] < obj_b[d]:
-            at_least_one_strict = True
-    return at_least_one_strict
-
-
 def filter_pareto_front(solutions, disciplines):
-    """Keep only non-dominated solutions."""
-    front = []
-    for i, si in enumerate(solutions):
-        dominated = False
-        for j, sj in enumerate(solutions):
-            if i != j and _dominates(sj['objectives'], si['objectives'],
-                                     disciplines):
-                dominated = True
-                break
-        if not dominated:
-            front.append(si)
-    return front
+    """Keep only non-dominated solutions (vectorised numpy)."""
+    n = len(solutions)
+    if n == 0:
+        return []
+
+    obj_matrix = np.array(
+        [[s['objectives'][d] for d in disciplines] for s in solutions]
+    )
+    dominated = np.zeros(n, dtype=bool)
+
+    for i in range(n):
+        if dominated[i]:
+            continue
+        # Check which solutions point i dominates
+        diffs = obj_matrix[i] - obj_matrix        # shape (n, k)
+        leq = np.all(diffs <= 0, axis=1)           # i <= j everywhere
+        strict = np.any(diffs < 0, axis=1)          # i < j somewhere
+        newly_dominated = leq & strict
+        newly_dominated[i] = False
+        dominated |= newly_dominated
+
+    return [s for i, s in enumerate(solutions) if not dominated[i]]
+
+
+# ---------------------------------------------------------------------------
+# Utopia estimation
+# ---------------------------------------------------------------------------
+
+def _compute_utopia(nodes, links, activity_metadata, project_ctx, config,
+                    deadline):
+    """Estimate utopia by optimising each discipline independently."""
+    utopia = {}
+    for d in config.disciplines:
+        if time.time() > deadline:
+            break
+        dag_state, _ = build_dag(nodes, links)
+        params = build_activity_params(nodes, activity_metadata)
+        quick_cfg = SolverConfig(
+            disciplines=[d],
+            weights={d: 1.0},
+            max_iterations=min(20, config.max_iterations),
+            convergence_threshold=config.convergence_threshold,
+            learning_rate=config.learning_rate,
+        )
+        result = optimize(dag_state, params, project_ctx, quick_cfg,
+                          deadline=deadline)
+        utopia[d] = result['final_objectives'].get(d, 0.0)
+    return utopia
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +122,8 @@ def filter_pareto_front(solutions, disciplines):
 def run_pareto(nodes, links, activity_metadata, project_ctx, config,
                n_vectors=30):
     """
-    Sweep weight vectors and return Pareto frontier.
+    Sweep weight vectors using augmented Tchebycheff and return
+    the Pareto frontier.
 
     Each weight vector gets a fresh DAG + params to avoid cross-contamination.
     """
@@ -103,11 +131,17 @@ def run_pareto(nodes, links, activity_metadata, project_ctx, config,
     deadline = t0 + WALL_TIME_LIMIT
 
     disciplines = config.disciplines
+
+    # Reserve up to 20% of the time budget (max 60s) for utopia estimation
+    utopia_deadline = t0 + min(60, WALL_TIME_LIMIT * 0.2)
+    utopia = _compute_utopia(nodes, links, activity_metadata, project_ctx,
+                             config, utopia_deadline)
+
     weight_vectors = generate_weight_vectors(disciplines, n_vectors)
     all_solutions = []
 
-    logger.info("Pareto sweep start: %d vectors, %d disciplines",
-                len(weight_vectors), len(disciplines))
+    logger.info("Pareto sweep start: %d vectors, %d disciplines, utopia=%s",
+                len(weight_vectors), len(disciplines), utopia)
 
     for idx, wv in enumerate(weight_vectors):
         if time.time() > deadline:
@@ -129,7 +163,7 @@ def run_pareto(nodes, links, activity_metadata, project_ctx, config,
         )
 
         result = optimize(dag_state, params, project_ctx, run_cfg,
-                          deadline=deadline)
+                          deadline=deadline, utopia=utopia)
         all_solutions.append({
             'index':      idx,
             'weights':    wv,

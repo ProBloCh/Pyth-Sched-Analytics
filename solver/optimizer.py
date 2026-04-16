@@ -1,14 +1,16 @@
 """
-solver/optimizer.py - Projected gradient descent.
+solver/optimizer.py - L-BFGS-B optimisation with box constraints.
 
-Minimises a weighted sum of objectives subject to box constraints:
-  - duration:  min_duration_i  <=  d_i  <=  baseline_duration_i
-  - resources: r_i >= 1
+Uses scipy.optimize.minimize(method='L-BFGS-B') for quasi-Newton
+convergence with built-in Wolfe-condition line search.  Supports
+weighted-sum and augmented Tchebycheff scalarisation (the latter
+can find points on non-convex Pareto frontiers).
 """
 
 import logging
 import time
 import numpy as np
+from scipy.optimize import minimize as sp_minimize
 from .dag import run_cpm
 from .objectives import compute_objectives
 from .adjoints import compute_gradients
@@ -18,9 +20,14 @@ logger = logging.getLogger(__name__)
 WALL_TIME_LIMIT = 120  # seconds — safety net; Gunicorn --timeout is primary
 
 
-def optimize(dag_state, params, project_ctx, config, deadline=None):
+def optimize(dag_state, params, project_ctx, config, deadline=None,
+             utopia=None, augmentation_rho=0.05):
     """
-    Run projected gradient descent.
+    Run L-BFGS-B optimisation with box constraints.
+
+    When *utopia* is provided, uses augmented Tchebycheff scalarisation
+    (smooth-max approximation) so the Pareto sweep can reach non-convex
+    frontier regions.  Otherwise uses the standard weighted sum.
 
     Returns {
         optimized_durations, optimized_resources,
@@ -41,69 +48,122 @@ def optimize(dag_state, params, project_ctx, config, deadline=None):
 
     # Initial objectives and normalisation scales
     initial = compute_objectives(dag_state, params, project_ctx, disciplines)
-    # Floor of 1.0 prevents near-zero objectives (e.g. quality=0 at
-    # baseline) from producing enormous normalisation coefficients that
-    # would artificially dominate the weighted sum.
     scales = {d: max(abs(initial.get(d, 0.0)), 1.0) for d in disciplines}
 
-    lr = config.learning_rate
     history = []
-    converged = False
-    timed_out = False
-    prev_w = None
+    _best = {'x': None, 'f': float('inf')}
 
-    logger.info("Optimizer start: %d activities, %d disciplines, "
-                "max_iter=%d, lr=%.4f",
-                n, len(disciplines), config.max_iterations, lr)
+    # ---- Pack / unpack durations + resources into a flat vector ----------
+    def pack():
+        return np.concatenate([params.durations.copy(),
+                               params.resource_counts.copy()])
 
-    for it in range(config.max_iterations):
-        # Wall-time guard
+    def unpack(x):
+        params.durations[:] = x[:n]
+        params.resource_counts[:] = x[n:]
+
+    # ---- Box bounds ------------------------------------------------------
+    bounds = list(zip(
+        np.concatenate([params.min_durations, np.ones(n)]),
+        np.concatenate([params.baseline_durations, np.full(n, 1e12)]),
+    ))
+
+    # ---- Tchebycheff constants -------------------------------------------
+    _kappa = 20.0    # smooth-max sharpness (log-sum-exp)
+
+    # ---- Objective + gradient callback -----------------------------------
+    def func_and_grad(x):
         if time.time() > deadline:
-            logger.warning("Optimizer hit wall-time limit after %d iterations "
-                           "(%.1fs)", it, time.time() - t0)
-            timed_out = True
-            break
+            raise _Timeout()
+
+        unpack(x)
+        run_cpm(dag_state, params.durations)
 
         objs = compute_objectives(dag_state, params, project_ctx, disciplines)
-        w_obj = sum(weights.get(d, 0.0) * objs.get(d, 0.0) / scales[d]
-                    for d in disciplines)
+        grads = compute_gradients(dag_state, params, project_ctx, disciplines)
+
+        dur_g = np.zeros(n, dtype=np.float64)
+        res_g = np.zeros(n, dtype=np.float64)
+
+        if utopia is not None:
+            # Augmented Tchebycheff: smooth_max(terms) + rho * sum(terms)
+            terms = np.array([
+                weights.get(d, 0.0)
+                * (objs.get(d, 0.0) - utopia.get(d, 0.0))
+                / scales[d]
+                for d in disciplines
+            ])
+            # Numerically stable log-sum-exp
+            t_max = np.max(terms)
+            exp_s = np.exp(_kappa * (terms - t_max))
+            sum_exp = np.sum(exp_s)
+            lse = t_max + np.log(sum_exp) / _kappa
+            w_obj = float(lse + augmentation_rho * np.sum(terms))
+
+            softmax = exp_s / sum_exp
+            for idx, d in enumerate(disciplines):
+                coeff = ((softmax[idx] + augmentation_rho)
+                         * weights.get(d, 0.0) / scales[d])
+                if d in grads:
+                    dur_g += coeff * grads[d]['duration']
+                    res_g += coeff * grads[d]['resources']
+        else:
+            # Standard weighted sum
+            w_obj = float(sum(
+                weights.get(d, 0.0) * objs.get(d, 0.0) / scales[d]
+                for d in disciplines
+            ))
+            for d in disciplines:
+                coeff = weights.get(d, 0.0) / scales[d]
+                if d in grads:
+                    dur_g += coeff * grads[d]['duration']
+                    res_g += coeff * grads[d]['resources']
 
         history.append({
-            'iteration': it,
-            'weighted_objective': float(w_obj),
+            'iteration': len(history),
+            'weighted_objective': w_obj,
             'objectives': {d: float(objs.get(d, 0.0)) for d in disciplines},
         })
 
-        # Convergence
-        if prev_w is not None:
-            rel = abs(w_obj - prev_w) / max(abs(prev_w), 1e-12)
-            if rel < config.convergence_threshold:
-                converged = True
-                logger.info("Optimizer converged at iteration %d "
-                            "(rel_change=%.2e)", it, rel)
-                break
-        prev_w = w_obj
+        if w_obj < _best['f']:
+            _best['x'] = x.copy()
+            _best['f'] = w_obj
 
-        # Gradients
-        grads = compute_gradients(dag_state, params, project_ctx, disciplines)
-        dur_g = np.zeros(n, dtype=np.float64)
-        res_g = np.zeros(n, dtype=np.float64)
-        for d in disciplines:
-            coeff = weights.get(d, 0.0) / scales[d]
-            if d in grads:
-                dur_g += coeff * grads[d]['duration']
-                res_g += coeff * grads[d]['resources']
+        return w_obj, np.concatenate([dur_g, res_g])
 
-        # Step
-        params.durations      -= lr * dur_g
-        params.resource_counts -= lr * res_g
+    # ---- Run L-BFGS-B ----------------------------------------------------
+    logger.info("Optimizer start (L-BFGS-B): %d activities, %d disciplines, "
+                "max_iter=%d, tchebycheff=%s",
+                n, len(disciplines), config.max_iterations,
+                utopia is not None)
 
-        # Project onto feasible set
+    x0 = pack()
+    converged = False
+
+    try:
+        result = sp_minimize(
+            func_and_grad, x0, method='L-BFGS-B', jac=True,
+            bounds=bounds,
+            options={
+                'maxiter': config.max_iterations,
+                'ftol': config.convergence_threshold,
+                'gtol': config.convergence_threshold,
+                'maxfun': config.max_iterations * 5,
+            },
+        )
+        unpack(result.x)
+        run_cpm(dag_state, params.durations)
+        converged = result.success
+    except _Timeout:
+        logger.warning("Optimizer hit wall-time limit after %d evaluations "
+                       "(%.1fs)", len(history), time.time() - t0)
+        if _best['x'] is not None:
+            unpack(_best['x'])
         _project(params)
         run_cpm(dag_state, params.durations)
 
     elapsed = time.time() - t0
-    logger.info("Optimizer done: %d iterations, converged=%s, %.1fs",
+    logger.info("Optimizer done: %d evaluations, converged=%s, %.1fs",
                 len(history), converged, elapsed)
 
     final = compute_objectives(dag_state, params, project_ctx, disciplines)
@@ -119,8 +179,12 @@ def optimize(dag_state, params, project_ctx, config, deadline=None):
     }
 
 
+class _Timeout(Exception):
+    """Raised when wall-time limit is exceeded during optimisation."""
+
+
 def _project(params):
-    """Box-constraint projection."""
+    """Box-constraint projection (safety net for timeout recovery)."""
     np.clip(params.durations,
             params.min_durations, params.baseline_durations,
             out=params.durations)

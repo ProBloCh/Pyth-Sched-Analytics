@@ -77,6 +77,7 @@ class ActivityParams:
     crash_max_fractions: np.ndarray   # max fractional reduction in duration
     risk_scores: np.ndarray           # combined risk score per activity
     quality_sensitivities: np.ndarray # how quality degrades with crashing
+    activity_types: list = field(default_factory=list)  # supply-chain type per activity
 
     @property
     def n(self):
@@ -136,7 +137,8 @@ def build_activity_params(nodes, activity_metadata):
     if not activity_metadata:
         activity_metadata = {}
 
-    ids, durs, rcs, bcosts, rates, crash, risk = [], [], [], [], [], [], []
+    ids, durs, rcs, bcosts, rates, crash, risk, atypes = (
+        [], [], [], [], [], [], [], [])
     for node in nodes:
         aid = str(node.get('ID', node.get('id', '')))
         ids.append(aid)
@@ -151,6 +153,10 @@ def build_activity_params(nodes, activity_metadata):
         risk.append(_safe_float(
             meta.get('combined_risk_score', meta.get('external_risk_score', 0.5)),
             0.5, lo=0.0, hi=10.0))
+        atypes.append(str(meta.get(
+            'activity_type', meta.get(
+                'supply_chain_type', node.get('TaskType', 'standard'))
+        )).lower())
 
     durs_arr = np.array(durs, dtype=np.float64)
     return ActivityParams(
@@ -163,4 +169,5 @@ def build_activity_params(nodes, activity_metadata):
         crash_max_fractions=np.array(crash, dtype=np.float64),
         risk_scores=np.array(risk, dtype=np.float64),
         quality_sensitivities=np.ones(len(ids), dtype=np.float64),
+        activity_types=atypes,
     )

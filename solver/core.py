@@ -78,9 +78,13 @@ def run_sensitivity(nodes, links, solver_config_dict,
 
     if stochastic:
         result['stochastic'] = {
-            'objectives_mean': stochastic['objectives_mean'],
-            'objectives_std':  stochastic['objectives_std'],
-            'n_samples':       stochastic['n_samples'],
+            'objectives_mean':      stochastic['objectives_mean'],
+            'objectives_std':       stochastic['objectives_std'],
+            'n_samples':            stochastic['n_samples'],
+            'black_swans':          stochastic.get('black_swans', []),
+            'dragon_kings':         stochastic.get('dragon_kings', []),
+            'sra':                  stochastic.get('sra', {}),
+            'cost_schedule_joint':  stochastic.get('cost_schedule_joint'),
         }
 
     return result
@@ -155,9 +159,13 @@ def run_optimize(nodes, links, solver_config_dict,
 
     if stochastic:
         result['stochastic'] = {
-            'objectives_mean': stochastic['objectives_mean'],
-            'objectives_std':  stochastic['objectives_std'],
-            'n_samples':       stochastic['n_samples'],
+            'objectives_mean':      stochastic['objectives_mean'],
+            'objectives_std':       stochastic['objectives_std'],
+            'n_samples':            stochastic['n_samples'],
+            'black_swans':          stochastic.get('black_swans', []),
+            'dragon_kings':         stochastic.get('dragon_kings', []),
+            'sra':                  stochastic.get('sra', {}),
+            'cost_schedule_joint':  stochastic.get('cost_schedule_joint'),
         }
 
     logger.info("Optimize done: %d iterations, converged=%s, "

@@ -198,9 +198,9 @@ def detect_repeating_patterns(nodes_df):
     # Create pattern key more efficiently with discretized duration
     # Round duration to avoid float precision issues
     duration_discrete = (sample_df['Duration'].round(1) * 10).astype(int)
-    pattern_key = (sample_df['TaskType'].cat.codes * 100000 + 
-                  duration_discrete * 100 + 
-                  sample_df['Resources'].cat.codes)
+    pattern_key = (sample_df['TaskType'].cat.codes.astype('int64') * 100000 +
+                  duration_discrete * 100 +
+                  sample_df['Resources'].cat.codes.astype('int64'))
     
     sample_df['pattern_id'] = pd.factorize(pattern_key)[0]
     
@@ -219,7 +219,7 @@ def create_templates_from_patterns(pattern_records):
     for index, pattern_df in enumerate(pattern_records):
         template = {
             'average_duration': float(pattern_df['Duration'].mean()),
-            'duration_variance': float(pattern_df['Duration'].var()),
+            'duration_variance': float(pattern_df['Duration'].var()) if len(pattern_df) > 1 else 0.0,
             'most_common_resources': pattern_df['Resources'].mode().tolist(),
             'dependency_links': pattern_df['Dependencies'].mode().tolist() if 'Dependencies' in pattern_df.columns else [],
             'task_frequency': len(pattern_df)
@@ -232,12 +232,39 @@ def create_templates_from_patterns(pattern_records):
 ###############################################################################
 
 def calculate_critical_path(G):
-    """Calculate critical path using NetworkX DAG algorithms"""
-    # Note: NetworkKit doesn't have direct critical path support
-    # so we use NetworkX which is optimized for this
+    """Calculate critical path using full CPM with FS/SS/FF/SF + lag.
+
+    Delegates to solver.dag for correct precedence-relationship handling,
+    then extracts the critical path from the solved state.  Falls back
+    to NetworkX dag_longest_path if the solver import fails.
+    """
+    try:
+        from solver.dag import build_dag as _build_dag, get_critical_path_indices
+        cpm_nodes = [{'ID': str(nd), 'Duration': float(G.nodes[nd].get('duration', 1))}
+                     for nd in G.nodes()]
+        cpm_links = []
+        for u, v in G.edges():
+            edge = G.edges[u, v]
+            try:
+                lag = float(edge.get('lag', 0))
+            except (TypeError, ValueError):
+                lag = 0.0
+            cpm_links.append({
+                'source': str(u), 'target': str(v),
+                'type': edge.get('type', 'FS'), 'lag': lag,
+            })
+        dag_state, _ = _build_dag(cpm_nodes, cpm_links)
+        cp_ids = [cpm_nodes[i]['ID'] for i in get_critical_path_indices(dag_state)]
+        tf_map = {cpm_nodes[i]['ID']: float(dag_state.TF[i])
+                  for i in range(dag_state.n)}
+        return cp_ids, dag_state.makespan, tf_map
+    except ImportError:
+        pass
+    except Exception as e:
+        logging.warning(f"CPM critical path failed ({e}); falling back to NetworkX")
     critical_path = nx.dag_longest_path(G, weight='duration')
     critical_path_length = nx.dag_longest_path_length(G, weight='duration')
-    return critical_path, critical_path_length
+    return critical_path, critical_path_length, {}
 
 def identify_critical_activities_and_milestones(G):
     critical_activities = [
@@ -506,12 +533,12 @@ def ensure_dag(G: nx.DiGraph):
 # Analytics – Optimized algorithms                                           #
 ###############################################################################
 
-def _cluster_risk_kmeans(df: pd.DataFrame):
-    """K-means clustering with optional silhouette optimization"""
+def _cluster_risk(df: pd.DataFrame):
+    """Density-based clustering (HDBSCAN primary, K-means fallback)."""
     if 'importanceScore' not in df.columns or 'riskScore' not in df.columns:
         df['Cluster'] = 0
         return df
-        
+
     feats = df[['importanceScore', 'riskScore']].values
     n = len(df)
 
@@ -519,23 +546,50 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
         df['Cluster'] = 0
         return df
 
-    # O(n) short-circuit when all feature points are identical (KMeans
-    # would produce convergence warnings and meaningless clusters).
+    # O(n) short-circuit when all feature points are identical.
     if (feats == feats[0]).all():
         df['Cluster'] = 0
         return df
 
-    # O(n log n) unique count for k-bounding — negligible vs KMeans cost.
+    # O(n log n) unique count for k-bounding — negligible vs clustering cost.
     unique_count = len(np.unique(feats, axis=0))
 
-    # Fast heuristic path (default)
+    # ---- HDBSCAN primary path ----
+    if n >= 15 and unique_count >= 5:
+        try:
+            from sklearn.cluster import HDBSCAN as _HDBSCAN
+            min_cluster_size = max(5, n // 20)
+            labels = _HDBSCAN(
+                min_cluster_size=min_cluster_size, min_samples=3
+            ).fit_predict(feats)
+
+            noise_ratio = np.sum(labels == -1) / n
+            n_clusters = len(set(labels) - {-1})
+            if noise_ratio <= 0.5 and n_clusters >= 2:
+                # Reassign noise points to nearest cluster
+                if np.any(labels == -1):
+                    from sklearn.neighbors import NearestNeighbors
+                    clustered = labels != -1
+                    nn = NearestNeighbors(n_neighbors=1).fit(feats[clustered])
+                    _, idx = nn.kneighbors(feats[~clustered])
+                    labels[~clustered] = labels[clustered][idx.ravel()]
+                df['Cluster'] = labels
+                if DEBUG:
+                    logging.info(f"HDBSCAN: {n_clusters} clusters, "
+                                 f"noise={noise_ratio:.0%}")
+                return df
+            if DEBUG:
+                logging.info(f"HDBSCAN produced {n_clusters} clusters with "
+                             f"{noise_ratio:.0%} noise; falling back to K-means")
+        except Exception as e:
+            if DEBUG:
+                logging.info(f"HDBSCAN unavailable ({e}); using K-means")
+
+    # ---- K-means fallback ----
     if not ENABLE_SILHOUETTE_OPTIMIZATION:
-        # Heuristic: sqrt(n/2) clusters, bounded by [2, 10] and unique_count
         k = max(2, min(10, int(np.sqrt(n / 2)), unique_count))
-
         if DEBUG:
-            logging.info(f"Using heuristic k={k} for {n} nodes (silhouette optimization disabled)")
-
+            logging.info(f"K-means heuristic k={k} for {n} nodes")
         try:
             df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
         except ValueError:
@@ -543,10 +597,6 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
         return df
 
     # Silhouette optimization path (only if explicitly enabled)
-    if DEBUG:
-        logging.info(f"Running silhouette optimization for {n} nodes")
-
-    # Early exit for small datasets
     if n <= 15:
         k = min(3, n, unique_count)
         try:
@@ -555,7 +605,6 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
             df['Cluster'] = 0
         return df
 
-    # Full silhouette optimization
     max_clusters = min(10, n, unique_count)
     best, k = -1, min(3, n, unique_count)
 
@@ -567,14 +616,11 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
             lbl = kmeans.fit_predict(feats)
             if len(set(lbl)) > 1:
                 sc = silhouette_score(feats, lbl)
-                if DEBUG:
-                    logging.info(f"Silhouette Score for {c} clusters: {sc:.3f}")
                 if sc > best:
                     best, k = sc, c
         except Exception:
             continue
 
-    # Guard against edge cases
     k = min(k, max(1, n), unique_count)
     try:
         df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
@@ -601,8 +647,10 @@ def _pca(df):
 def _dependency_groups_big(G_nx: nx.DiGraph, df: pd.DataFrame):
     """Big graph dependency grouping using NetworkKit Louvain"""
     if not _NK:
-        # Fallback to small graph method
-        return _dependency_groups_small(G_nx, df)
+        # Without NetworkKit, the O(n²) sparse-distance fallback is too
+        # slow for large graphs.  Use NetworkX Louvain as a lightweight
+        # alternative that stays O(n·e).
+        return _dependency_groups_nx_louvain(G_nx, df)
     
     try:
         # Convert to undirected for community detection
@@ -631,15 +679,48 @@ def _dependency_groups_big(G_nx: nx.DiGraph, df: pd.DataFrame):
             
     except Exception as e:
         logging.warning(f"NetworkKit dependency clustering failed: {e}")
-        return _dependency_groups_small(G_nx, df)
-    
+        return _dependency_groups_nx_louvain(G_nx, df)
+
+    return df
+
+def _dependency_groups_nx_louvain(G_nx: nx.DiGraph, df: pd.DataFrame):
+    """Lightweight dependency grouping via NetworkX Louvain.
+
+    Used as fallback when NetworkKit is unavailable for large graphs
+    (> SMALL_GRAPH_THRESHOLD).  O(n·e) vs the O(n²) sparse-distance +
+    agglomerative path in _dependency_groups_small, which becomes
+    prohibitively slow above ~5K activities.
+    """
+    try:
+        G_undirected = G_nx.to_undirected()
+        if G_undirected.number_of_edges() == 0:
+            df['DependencyCluster'] = 0
+            return df
+        communities = nx.algorithms.community.louvain_communities(
+            G_undirected, weight='weight', seed=0)
+        node_to_comm = {}
+        for cid, members in enumerate(communities):
+            for node in members:
+                node_to_comm[node] = cid
+        df['DependencyCluster'] = df['ID'].astype(str).map(node_to_comm).fillna(0).astype(int)
+    except Exception as e:
+        logging.warning(f"NetworkX Louvain dependency grouping failed: {e}")
+        df['DependencyCluster'] = 0
     return df
 
 def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
-    """Small graph dependency clustering using sparse matrices"""
+    """Small graph dependency clustering using sparse matrices.
+
+    Uses O(n²) shortest-path distance matrix + agglomerative clustering.
+    Only appropriate for n <= SMALL_GRAPH_THRESHOLD; above that the
+    distance matrix becomes prohibitively large.
+    """
     ids = df['ID'].astype(str).tolist()
     n = len(ids)
-    
+
+    if n > SMALL_GRAPH_THRESHOLD:
+        return _dependency_groups_nx_louvain(G, df)
+
     if n < 2:
         df['DependencyCluster'] = 0
         return df
@@ -804,6 +885,92 @@ def _centralities_nx(G: nx.DiGraph, df: pd.DataFrame):
     df['degree_centrality'] = df['ID'].astype(str).map(deg).fillna(0)
     df['Clustering_Coefficient'] = df['ID'].astype(str).map(clust).fillna(0)
 
+def _risk_propagation(G: nx.DiGraph, df: pd.DataFrame):
+    """Propagate risk through the dependency network.
+
+    Each activity's propagated_risk combines its intrinsic riskScore
+    with risk inherited from predecessors, averaged over immediate
+    predecessor count at convergence points.  This models the cascade mechanism that generates
+    fat-tailed overrun distributions (Natarajan et al., PMJ 2022;
+    Flyvbjerg et al., JMIS 2022).
+
+    Adds three columns:
+      propagated_risk:      intrinsic + inherited risk (topological sum)
+      risk_transmission:    outgoing risk flow (how much risk this node
+                            transmits to its successors)
+      coupling_density:     fraction of community members that are
+                            direct neighbours — high values indicate
+                            Thunderhorse-class tight coupling
+    """
+    if 'riskScore' not in df.columns:
+        df['propagated_risk'] = 0.0
+        df['risk_transmission'] = 0.0
+        df['coupling_density'] = 0.0
+        return df
+
+    # Map riskScore from df to activity/node id
+    risk_map = dict(zip(df['ID'].astype(str), df['riskScore'].fillna(0).values))
+
+    # Topological propagation: propagated_risk[j] = risk[j] + Σ propagated_risk[pred] / in_degree[j]
+    # This gives activities deeper in the dependency chain higher propagated risk.
+    try:
+        topo = list(nx.topological_sort(G))
+    except nx.NetworkXUnfeasible:
+        topo = list(G.nodes())
+
+    prop = {}
+    for node in topo:
+        intrinsic = float(risk_map.get(str(node), 0.0))
+        preds = list(G.predecessors(node))
+        if preds:
+            inherited = sum(prop.get(p, 0.0) for p in preds) / len(preds)
+        else:
+            inherited = 0.0
+        prop[node] = intrinsic + inherited
+
+    # Risk transmission: how much risk a node sends forward
+    # = propagated_risk × out_degree (more successors = more risk spread)
+    trans = {}
+    for node in G.nodes():
+        out_deg = G.out_degree(node)
+        trans[node] = prop.get(node, 0.0) * out_deg
+
+    # Coupling density: for each node, what fraction of its community
+    # neighbours are also its direct graph neighbours (in or out).
+    # High coupling_density = tightly coupled = cascade-prone.
+    coupling = {}
+    if 'CommunityGroup' in df.columns:
+        comm_map = dict(zip(df['ID'].astype(str), df['CommunityGroup'].values))
+        comm_members = {}
+        for aid, cid in comm_map.items():
+            comm_members.setdefault(cid, set()).add(aid)
+
+        for node in G.nodes():
+            snode = str(node)
+            cid = comm_map.get(snode, -1)
+            members = comm_members.get(cid, set())
+            if len(members) <= 1:
+                coupling[node] = 0.0
+                continue
+            neighbours = set(str(n) for n in G.predecessors(node))
+            neighbours |= set(str(n) for n in G.successors(node))
+            shared = len(neighbours & members)
+            coupling[node] = shared / (len(members) - 1)
+    else:
+        for node in G.nodes():
+            coupling[node] = 0.0
+
+    # Map back to dataframe
+    str_ids = df['ID'].astype(str)
+    df['propagated_risk'] = str_ids.map(
+        {str(k): round(v, 4) for k, v in prop.items()}).fillna(0)
+    df['risk_transmission'] = str_ids.map(
+        {str(k): round(v, 4) for k, v in trans.items()}).fillna(0)
+    df['coupling_density'] = str_ids.map(
+        {str(k): round(v, 4) for k, v in coupling.items()}).fillna(0)
+
+    return df
+
 def _community_detection(G: nx.DiGraph, df: pd.DataFrame):
     """Community detection using NetworkKit when available"""
     if _NK and len(G) > 100:
@@ -873,6 +1040,105 @@ def _community_detection_nx(G: nx.DiGraph, df: pd.DataFrame):
         df['CommunityGroup'] = 0
 
 ###############################################################################
+# Schedule Health (DCMA 14-Point / GAO Schedule Assessment)                   #
+###############################################################################
+
+def _schedule_health(G: nx.DiGraph, df: pd.DataFrame, critical_path, critical_path_length):
+    """DCMA-style schedule health metrics computed from the dependency graph.
+
+    Based on the Defense Contract Management Agency 14-Point Assessment
+    and the GAO Schedule Assessment Guide.  Only includes checks that
+    can be computed from the plan (no execution data required).
+    """
+    n_tasks = len(df)
+    n_links = G.number_of_edges()
+    if n_tasks == 0:
+        return {}
+
+    # 1. Logic (relationship) density — target: 1.5–2.5 per task
+    logic_density = round(n_links / max(n_tasks, 1), 2)
+
+    # 2. Missing predecessors / successors (DCMA definition: non-start/end
+    #    tasks with no logical ties).  One start and one end are expected;
+    #    extras are treated as missing logic.
+    starts = [nd for nd in G.nodes() if G.in_degree(nd) == 0]
+    ends   = [nd for nd in G.nodes() if G.out_degree(nd) == 0]
+    n_no_pred = max(0, len(starts) - 1)
+    n_no_succ = max(0, len(ends) - 1)
+
+    # 3. Relationship type breakdown
+    rel_counts = {'FS': 0, 'SS': 0, 'FF': 0, 'SF': 0}
+    lag_count = 0
+    negative_lag_count = 0
+    for u, v, data in G.edges(data=True):
+        rel = str(data.get('type', 'FS')).upper()
+        if rel in rel_counts:
+            rel_counts[rel] += 1
+        else:
+            rel_counts['FS'] += 1
+        try:
+            lag = float(data.get('lag', 0))
+        except (TypeError, ValueError):
+            lag = 0.0
+        if abs(lag) > 1e-9:
+            lag_count += 1
+        if lag < -1e-9:
+            negative_lag_count += 1
+
+    # 4. High float — activities with TF > 44 working days (DCMA threshold)
+    high_float_threshold = 44.0
+    high_float = []
+    if 'total_float' in df.columns:
+        hf_mask = df['total_float'] > high_float_threshold
+        high_float = df.loc[hf_mask, 'ID'].astype(str).tolist()
+
+    # 5. High duration — activities > 44 working days (DCMA threshold)
+    high_dur_threshold = 44.0
+    high_dur = df.loc[df['Duration'] > high_dur_threshold, 'ID'].astype(str).tolist()
+
+    # 6. Resource assignment gaps
+    resource_gaps = []
+    if 'Resources' in df.columns:
+        empty_res = df['Resources'].fillna('').astype(str).str.strip() == ''
+        resource_gaps = df.loc[empty_res, 'ID'].astype(str).tolist()
+
+    # 7. Critical path metrics
+    cp_length = len(critical_path) if critical_path else 0
+    cp_ratio = round(cp_length / max(n_tasks, 1), 3)
+
+    # Overall health score (percentage of checks passing)
+    checks = {
+        'logic_density_ok':     1.5 <= logic_density <= 2.5,
+        'missing_predecessors': n_no_pred <= max(1, int(n_tasks * 0.05)),
+        'missing_successors':   n_no_succ <= max(1, int(n_tasks * 0.05)),
+        'no_negative_lags':     negative_lag_count == 0,
+        'high_float_ok':        len(high_float) <= int(n_tasks * 0.05),
+        'high_duration_ok':     len(high_dur) <= int(n_tasks * 0.05),
+        'resources_assigned':   len(resource_gaps) <= int(n_tasks * 0.05),
+        'critical_path_exists': cp_length > 0,
+    }
+    n_passing = sum(checks.values())
+
+    return {
+        'logic_density': logic_density,
+        'n_tasks': n_tasks,
+        'n_relationships': n_links,
+        'relationship_types': rel_counts,
+        'n_lags': lag_count,
+        'n_negative_lags': negative_lag_count,
+        'missing_predecessors': n_no_pred,
+        'missing_successors': n_no_succ,
+        'high_float_activities': len(high_float),
+        'high_duration_activities': len(high_dur),
+        'resource_gaps': len(resource_gaps),
+        'critical_path_length_tasks': cp_length,
+        'critical_path_length_duration': float(critical_path_length),
+        'critical_path_ratio': cp_ratio,
+        'checks': checks,
+        'health_score': round(n_passing / max(len(checks), 1), 2),
+    }
+
+###############################################################################
 # Main analysis function                                                      #
 ###############################################################################
 
@@ -920,7 +1186,7 @@ def analyse(nodes, links):
         
         # Risk/importance clustering + PCA
         clustering_start = time.time() if DEBUG else None
-        df_nodes = _cluster_risk_kmeans(df_nodes)
+        df_nodes = _cluster_risk(df_nodes)
         df_nodes = _pca(df_nodes)
         if DEBUG:
             logging.info(f"Risk/importance clustering took {time.time() - clustering_start:.2f}s")
@@ -934,22 +1200,46 @@ def analyse(nodes, links):
         if DEBUG:
             logging.info(f"Dependency clustering took {time.time() - dep_start:.2f}s")
         
-        # Community detection
+        # Community detection (single-resolution — populates CommunityGroup column)
         df_nodes = _community_detection(G, df_nodes)
+
+        # Multi-resolution community detection (additive — new response key).
+        # Reduce n_runs for large graphs to keep latency bounded:
+        # ~5 Louvain runs × 4 resolutions = 20 runs at default; at 2 runs
+        # for large graphs that drops to 8.
+        multi_res = None
+        n_nodes = len(df_nodes)
+        if n_nodes >= 50 and G.number_of_edges() > 0:
+            try:
+                from multi_resolution_pipeline import run_multi_resolution
+                mr_runs = 2 if n_nodes > SMALL_GRAPH_THRESHOLD else 5
+                multi_res = run_multi_resolution(G.to_undirected(),
+                                                 n_runs=mr_runs)
+            except Exception as e:
+                logging.warning(f"Multi-resolution community detection failed: {e}")
         
         # Centrality metrics
         df_nodes = _centralities(G, df_nodes)
-        
+
+        # Risk propagation through dependency network
+        df_nodes = _risk_propagation(G, df_nodes)
+
         # Work packages
         work_packages = define_work_packages(df_nodes, G)
         work_packages_serialized = serialize_work_packages(work_packages)
         
-        # Critical path
+        # Critical path (CPM with FS/SS/FF/SF + lag)
         if nx.is_directed_acyclic_graph(G) and len(G) > 0:
-            critical_path, critical_path_length = calculate_critical_path(G)
+            critical_path, critical_path_length, tf_map = calculate_critical_path(G)
+            if tf_map:
+                df_nodes['total_float'] = df_nodes['ID'].astype(str).map(tf_map).fillna(0)
         else:
             critical_path, critical_path_length = [], 0
         
+        # Schedule health (DCMA 14-Point)
+        health = _schedule_health(G, df_nodes, critical_path,
+                                  critical_path_length)
+
         # Build response
         response = {
             'nodes': df_nodes.replace({np.nan: None}).to_dict('records'),
@@ -957,8 +1247,11 @@ def analyse(nodes, links):
             'work_packages': work_packages_serialized,
             'critical_path': critical_path,
             'critical_path_length': float(critical_path_length),
-            'templates': templates
+            'templates': templates,
+            'schedule_health': health,
         }
+        if multi_res:
+            response['multi_resolution_communities'] = multi_res
         
         # Garbage collection for large graphs
         if len(nodes) > 5000:

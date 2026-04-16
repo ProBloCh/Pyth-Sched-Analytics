@@ -49,7 +49,14 @@ def cost_adj_res(dag_state, params, project_ctx=None):
 # ---------------------------------------------------------------------------
 
 def risk_adj_dur(dag_state, params, project_ctx=None):
-    """dR/dd_i = risk_i * criticality_i."""
+    """dR/dd_i ≈ risk_i * criticality_i  (first-order approximation).
+
+    Ignores the second-order term  risk_i * d_i * d(crit_i)/dd_i
+    that arises because criticality depends on makespan (for critical
+    activities) and on TF (for all activities via the backward pass).
+    The omitted term is bounded by the risk weight in the scalarisation
+    and empirically does not prevent convergence.
+    """
     if dag_state.n == 0:
         return np.zeros(0, dtype=np.float64)
     makespan = max(dag_state.makespan, 1e-9)

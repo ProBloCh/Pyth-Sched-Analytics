@@ -19,7 +19,7 @@ from app import (
     create_templates_from_patterns,
     define_work_packages,
     serialize_work_packages,
-    _cluster_risk_kmeans,
+    _cluster_risk,
     _pca,
     _centralities,
     _community_detection,
@@ -191,16 +191,16 @@ class TestCriticalPath:
         nodes, links = simple_chain
         G = build_nx_graph(nodes, links)
         G = ensure_dag(G)
-        path, length = calculate_critical_path(G)
+        path, length, tf_map = calculate_critical_path(G)
         assert path == ['A', 'B', 'C']
-        assert length == 30  # edge durations: 10 + 20
+        assert length == 35  # CPM makespan: A(10) + B(20) + C(5)
 
     def test_diamond(self, diamond):
         nodes, links = diamond
         G = build_nx_graph(nodes, links)
         G = ensure_dag(G)
-        path, length = calculate_critical_path(G)
-        assert length == 25  # edge durations: A->B(10) + B->D(15)
+        path, length, tf_map = calculate_critical_path(G)
+        assert length == 30  # CPM makespan: A(10) + B(15) + D(5)
         assert 'A' in path and 'D' in path
 
 
@@ -215,13 +215,13 @@ class TestClusterRiskKmeans:
             'importanceScore': [1, 1, 9, 9, 5],
             'riskScore': [1, 2, 8, 9, 5],
         })
-        result = _cluster_risk_kmeans(df)
+        result = _cluster_risk(df)
         assert 'Cluster' in result.columns
         assert result['Cluster'].nunique() >= 2
 
     def test_single_node(self):
         df = pd.DataFrame({'importanceScore': [5], 'riskScore': [5]})
-        result = _cluster_risk_kmeans(df)
+        result = _cluster_risk(df)
         assert result['Cluster'].iloc[0] == 0
 
     def test_identical_points(self):
@@ -230,12 +230,12 @@ class TestClusterRiskKmeans:
             'importanceScore': [5, 5, 5, 5],
             'riskScore': [3, 3, 3, 3],
         })
-        result = _cluster_risk_kmeans(df)
+        result = _cluster_risk(df)
         assert 'Cluster' in result.columns
 
     def test_missing_columns(self):
         df = pd.DataFrame({'other': [1, 2, 3]})
-        result = _cluster_risk_kmeans(df)
+        result = _cluster_risk(df)
         assert (result['Cluster'] == 0).all()
 
 
@@ -424,12 +424,12 @@ class TestAnalyse:
     def test_critical_path_length(self, simple_chain):
         nodes, links = simple_chain
         result = analyse(nodes, links)
-        assert result['critical_path_length'] == 30.0  # edge durations: 10 + 20
+        assert result['critical_path_length'] == 35.0  # CPM makespan: A(10)+B(20)+C(5)
 
     def test_diamond_critical_path(self, diamond):
         nodes, links = diamond
         result = analyse(nodes, links)
-        assert result['critical_path_length'] == 25.0  # A->B(10) + B->D(15)
+        assert result['critical_path_length'] == 30.0  # CPM makespan: A(10)+B(15)+D(5)
 
     def test_handles_missing_optional_fields(self):
         """Nodes with only ID and Duration should not crash."""

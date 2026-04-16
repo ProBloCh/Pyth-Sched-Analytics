@@ -3,22 +3,31 @@
 ## Project Overview
 
 Flask-based API for analyzing schedule dependency networks in capital project
-management. Two capability layers:
+management.  Grounded in Natarajan et al. (PMJ, 2022) on reference class
+forecasting for offshore O&G megaprojects and Flyvbjerg et al. (JMIS, 2022)
+on fat-tailed overrun distributions.  Two capability layers:
 
-1. **Descriptive analytics** (`POST /graph-metrics`) — community detection,
-   centrality, clustering, critical path, work packages.
+1. **Descriptive analytics** (`POST /graph-metrics`) — community detection
+   (single + multi-resolution), centrality, HDBSCAN clustering, full CPM
+   with FS/SS/FF/SF + lag, risk propagation through the dependency network,
+   DCMA schedule health metrics, work packages, pattern detection.
 2. **Prescriptive analytics** (`solver/` package) — CADJ-P multi-objective
-   sensitivity analysis, gradient-descent optimization, and Pareto frontier
-   generation across schedule/cost/risk/resources/quality.
+   sensitivity analysis, L-BFGS-B optimization with Tchebycheff Pareto
+   sweeps, five-tier risk distributions (triangular → normal →
+   Birnbaum-Saunders → Pareto power-law), SRA criticality/cruciality
+   indices, black swan / dragon king detection, and 2D cost-schedule
+   extreme-event clustering.
 
 Deployed to Azure via GitHub Actions.
 
 **Tech stack:** Python 3.12, Flask, NetworkX + NetworkKit (C++ acceleration),
 NumPy, Pandas, scikit-learn, SciPy, Redis (optional caching).
 
-**Architecture:** `app.py` (~1,070 LOC) handles descriptive analytics.
-`solver/` (10 modules, ~1,480 LOC) is a Flask Blueprint registered in
-`app.py` that provides three prescriptive endpoints plus a health check.
+**Architecture:** `app.py` (~1,400 LOC) handles descriptive analytics.
+`multi_resolution_pipeline.py` (~335 LOC) handles hierarchical community
+detection.  `solver/` (10 modules, ~2,400 LOC) is a Flask Blueprint
+registered in `app.py` that provides three prescriptive endpoints plus a
+health check.  157 tests across 4 test files.
 
 ## Four Principles
 
@@ -49,8 +58,8 @@ Maintain the existing simplicity. Don't add speculative complexity.
 
 ### 3. Surgical Changes
 
-Touch only what you must. This is critical — the codebase is a single file
-with no test suite to catch collateral damage.
+Touch only what you must.  The test suite (157 tests) catches regressions,
+but collateral damage in untested paths is still possible.
 
 - Don't "improve" adjacent code, comments, or formatting.
 - Don't refactor things that aren't broken.
@@ -73,11 +82,10 @@ Define success criteria. Verify before declaring done.
   1. [Step] -> verify: [check]
   2. [Step] -> verify: [check]
 
-**Note:** This project currently has no automated tests. Verification means
-running the app and checking endpoint responses, reviewing outputs for
-correctness, or adding tests when the scope warrants it. The CI pipeline has
-a placeholder for tests — prefer filling that gap over working without a
-safety net.
+**Note:** The project has 157 automated tests (pytest).  Run with
+`python -m pytest tests/ -v`.  Verification means running the tests,
+checking endpoint responses, and reviewing outputs for correctness.
+When adding new features, add corresponding tests.
 
 ## Running Locally
 
@@ -134,11 +142,16 @@ dependencies — do not convert this to a top-level import.
 
 ### Multi-Resolution Pipeline
 
-The guidance doc (`docs/cybereum-multiresolution-guidance.md`) describes a
-planned multi-resolution community detection pipeline. This is a design
-document — it is **not implemented** in the current codebase. The current code
-runs single-resolution Louvain at `gamma=1.0` only. Do not confuse planned
-design with current state.
+The guidance doc (`docs/cybereum-multiresolution-guidance.md`) describes the
+multi-resolution community detection pipeline.  The implementation lives in
+`multi_resolution_pipeline.py` and is called from `analyse()` in `app.py`
+for graphs with ≥ 50 nodes.  It runs Louvain at an adaptive resolution
+ladder (γ = 0.3, 1.0, 2.5, 4.0), performs NMI stability analysis across
+multiple runs per tier, and builds a containment hierarchy.  The result is
+added to the `/graph-metrics` response under the `multi_resolution_communities`
+key (additive — does not affect the existing `CommunityGroup` column, which
+remains single-resolution at `COMMUNITY_RESOLUTION`).  Uses NetworkKit
+when available; falls back to NetworkX.
 
 ### Performance Awareness
 
@@ -160,7 +173,7 @@ reorder the top of `app.py`.
 
 ### Caching and API Contract
 
-Response dicts are serialized with `pickle` into Redis (or LRU in-memory).
+Response dicts are serialized with JSON into Redis (or LRU in-memory).
 Changing the structure of values returned by analytical functions can make
 cached entries incompatible — callers may get stale or malformed data until
 the cache expires or is flushed.
@@ -178,10 +191,26 @@ existing ones.
 
 ### Solver-Specific Rules
 
+- **L-BFGS-B optimizer** (`optimizer.py`): Uses `scipy.optimize.minimize`
+  with box constraints.  Supports augmented Tchebycheff scalarization
+  (via `utopia` parameter) for Pareto sweeps.  The `learning_rate` config
+  field is accepted but unused by L-BFGS-B (retained for API compat).
+- **CPM with relationship types** (`dag.py`): Forward/backward passes
+  handle FS/SS/FF/SF + lag.  Per-edge metadata stored in `pred_edges`
+  and `succ_edges` lists on `DAGState`.  The aliasing contract (see
+  docstring on `run_cpm`) must be preserved — finite-difference gradients
+  depend on it.
+- **Five-tier risk distributions** (`stochastic.py`): Noise floor →
+  triangular → normal → Birnbaum-Saunders → Pareto power-law.  The BS
+  tier is empirically validated for offshore O&G overruns (Natarajan et
+  al., PMJ 2022, KS p=.89).  The Pareto tier uses α=2.0+1.5*(1-risk),
+  calibrated to Flyvbjerg's IT project α≈2.35.  Supply-chain activities
+  (equipment/material/services) hit fat-tail thresholds earlier.
 - **Numerical correctness in adjoints:** The resource adjoint uses finite
   differences (review section 1.5) because the smoothed trapezoidal profile
-  has non-differentiable step boundaries. Do not replace with analytical
-  gradients without verifying equivalence.
+  has non-differentiable step boundaries.  The risk adjoint is a first-order
+  approximation that ignores the d(criticality)/d(makespan) feedback term
+  (documented in the docstring).
 - **Cost adjoint cross-terms:** `dC/dd` includes the resource factor and
   `dC/dr` includes the duration factor (review section 1.3). These are not
   bugs — they are the correct partial derivatives for `C = rate * r * d`.
@@ -189,14 +218,102 @@ existing ones.
   `adjoints.py` temporarily mutates `DAGState` via `run_cpm` and restores
   it. This is safe for single-threaded Flask/Gunicorn workers but is not
   thread-safe. Do not call from concurrent threads on the same state object.
-- **Stochastic seed:** Monte Carlo uses `seed=42` for reproducibility. The
-  antithetic variates pattern (section 1.8) relies on `z` and `-z` pairing;
-  do not shuffle the sample order.
+- **Sobol QMC:** Monte Carlo uses Sobol quasi-random sequences (`seed=42`)
+  with `scipy.special.ndtri` precomputed once for the full sample matrix.
+  Antithetic variates use `u` and `1-u` pairs (not `z`/`-z`).  Sample
+  counts match the requested M exactly (Sobol generated at power-of-2,
+  then truncated).
+
+### Performance Benchmarks (with NetworkKit)
+
+| Module | 2,500 | 5,000 | 10,000 | 15,000 |
+|---|---|---|---|---|
+| Full `analyse()` | 1.4s | 2.7s | 6.5s | 11.3s |
+| Community detection | 96ms | 84ms | 193ms | 277ms |
+| Multi-resolution | 131ms | 284ms | 749ms | 1.0s |
+| Centralities | 136ms | 320ms | 785ms | 1.5s |
+| Solver: sensitivity | 37ms | 73ms | 235ms | 436ms |
+| Solver: optimize (20 iter) | 125ms | 192ms | 312ms | 441ms |
+| Solver: MC ensemble (M=32) | 423ms | 574ms | 1.2s | 1.7s |
+
+**NetworkKit is essential for production.**  Without it, `analyse()` at
+15K activities takes ~12s (Louvain fallback) instead of 11.3s — acceptable.
+But the old O(n²) dependency-grouping fallback (now guarded) would have
+taken ~164s, exceeding the Gunicorn timeout.
 
 ### Deployment
 
 Pushes to `main` trigger automatic deployment to Azure production. Treat
 `main` accordingly — no experimental changes, no untested algorithm rewrites.
+
+## Research Foundations
+
+| Component | Method | Source |
+|---|---|---|
+| CPM with PDM | FS/SS/FF/SF + lag | Elmaghraby (1977), PMI Practice Standard |
+| Birnbaum-Saunders distribution | Fatigue-life model for O&G overruns | Natarajan et al. (PMJ 2022), KS p=.89 |
+| Pareto power-law | Fat-tailed overruns (α≈2.35 IT) | Flyvbjerg et al. (JMIS 2022) |
+| Dragon king detection | Outlier-among-outliers | Sornette (2009), Natarajan et al. (PMJ 2022) |
+| 2D cost-schedule clustering | K-means on joint overrun space | Natarajan et al. (PMJ 2022, Figs 15-17) |
+| Criticality Index | MC critical-path frequency | Van Slyke (1963) |
+| Cruciality Index | Duration-makespan correlation | Williams (1992) |
+| DCMA schedule health | 14-point assessment | DCMA, GAO Schedule Assessment Guide |
+| Multi-resolution communities | NMI stability + hierarchy | Lancichinetti & Fortunato (2012) |
+| L-BFGS-B optimizer | Quasi-Newton with box constraints | Nocedal & Wright (2006) |
+| Augmented Tchebycheff | Non-convex Pareto points | Steuer & Choo (1983) |
+| Sobol QMC | Low-discrepancy sampling | Sobol' (1967) |
+| HDBSCAN | Density-based clustering | Campello et al. (2013) |
+
+## Future Improvements
+
+### High priority (use data already flowing in)
+
+- **Calendar-aware scheduling:** `hours_per_day` and `working_days` are
+  parsed into `ProjectContext` but never applied.  Durations are treated
+  as abstract time units.  Implementing calendar conversion would make
+  the CPM output match real-world dates.
+- **Hard constraint enforcement:** `max_end_date` and `max_budget` are
+  parsed but never enforced in the optimizer.  These could be added as
+  penalty terms or hard bounds in L-BFGS-B.
+- **Link type awareness in app.py graph construction:** `build_nx_graph`
+  stores `type` and `lag` as edge attributes, and `calculate_critical_path`
+  now uses them via solver.dag.  But other analytics (dependency grouping,
+  work packages) still treat all edges as uniform.
+- **Resource-pool analytics:** The `Resources` field is only used for
+  pattern detection.  Grouping activities by resource pool and computing
+  per-pool criticality would leverage data already flowing in.
+- **Temporal risk clustering:** `Start`/`End` dates are only used for
+  work-package temporal bounds.  Date-based risk clustering (groups of
+  high-risk activities bunched in time) would surface schedule hot spots.
+
+### Medium priority (extend existing capabilities)
+
+- **Earned Value Management (EVM):** SPI(t), CPI, EAC metrics.  Requires
+  execution data (actual start/finish/cost), not just the plan.
+- **Reference class integration:** The user's PMJ paper demonstrates RCF
+  uplifts for O&G offshore projects (P10: 89% cost, 72% schedule).  The
+  reference class dataset lives in a separate app; the solver should
+  accept externally-provided uplift distributions as prior corrections.
+- **Copulas for joint cost-schedule dependence:** Replace the K-means
+  clustering with proper copula models (Clayton, Gumbel) for more
+  rigorous dependence structure modeling.
+- **Leiden algorithm:** Provably avoids Louvain's resolution limit
+  (Traag et al., 2019).  Not yet in NetworkKit; would need a separate
+  `leidenalg` dependency.
+
+### Lower priority (deeper architectural changes)
+
+- **Activity-type-specific crash curves:** Different cost-duration
+  trade-offs for equipment vs labor activities.  Requires extending
+  the solver's crash model beyond the current uniform `crash_max_fraction`.
+- **Bayesian Network risk propagation:** Replace the topological
+  averaging with conditional probability inference for more rigorous
+  cascade modeling.
+- **NSGA-II / MOEA/D:** Evolutionary multi-objective optimization as
+  an alternative to the Tchebycheff sweep for very high-dimensional
+  objective spaces.
+- **Stochastic scheduling with resource constraints:** Full resource-
+  constrained project scheduling under uncertainty (RCPSP/max).
 
 ## Tradeoff Note
 
