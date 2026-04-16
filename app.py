@@ -637,8 +637,10 @@ def _pca(df):
 def _dependency_groups_big(G_nx: nx.DiGraph, df: pd.DataFrame):
     """Big graph dependency grouping using NetworkKit Louvain"""
     if not _NK:
-        # Fallback to small graph method
-        return _dependency_groups_small(G_nx, df)
+        # Without NetworkKit, the O(n²) sparse-distance fallback is too
+        # slow for large graphs.  Use NetworkX Louvain as a lightweight
+        # alternative that stays O(n·e).
+        return _dependency_groups_nx_louvain(G_nx, df)
     
     try:
         # Convert to undirected for community detection
@@ -667,15 +669,48 @@ def _dependency_groups_big(G_nx: nx.DiGraph, df: pd.DataFrame):
             
     except Exception as e:
         logging.warning(f"NetworkKit dependency clustering failed: {e}")
-        return _dependency_groups_small(G_nx, df)
-    
+        return _dependency_groups_nx_louvain(G_nx, df)
+
+    return df
+
+def _dependency_groups_nx_louvain(G_nx: nx.DiGraph, df: pd.DataFrame):
+    """Lightweight dependency grouping via NetworkX Louvain.
+
+    Used as fallback when NetworkKit is unavailable for large graphs
+    (> SMALL_GRAPH_THRESHOLD).  O(n·e) vs the O(n²) sparse-distance +
+    agglomerative path in _dependency_groups_small, which becomes
+    prohibitively slow above ~5K activities.
+    """
+    try:
+        G_undirected = G_nx.to_undirected()
+        if G_undirected.number_of_edges() == 0:
+            df['DependencyCluster'] = 0
+            return df
+        communities = nx.algorithms.community.louvain_communities(
+            G_undirected, weight='weight', seed=0)
+        node_to_comm = {}
+        for cid, members in enumerate(communities):
+            for node in members:
+                node_to_comm[node] = cid
+        df['DependencyCluster'] = df['ID'].astype(str).map(node_to_comm).fillna(0).astype(int)
+    except Exception as e:
+        logging.warning(f"NetworkX Louvain dependency grouping failed: {e}")
+        df['DependencyCluster'] = 0
     return df
 
 def _dependency_groups_small(G: nx.DiGraph, df: pd.DataFrame):
-    """Small graph dependency clustering using sparse matrices"""
+    """Small graph dependency clustering using sparse matrices.
+
+    Uses O(n²) shortest-path distance matrix + agglomerative clustering.
+    Only appropriate for n <= SMALL_GRAPH_THRESHOLD; above that the
+    distance matrix becomes prohibitively large.
+    """
     ids = df['ID'].astype(str).tolist()
     n = len(ids)
-    
+
+    if n > SMALL_GRAPH_THRESHOLD:
+        return _dependency_groups_nx_louvain(G, df)
+
     if n < 2:
         df['DependencyCluster'] = 0
         return df
