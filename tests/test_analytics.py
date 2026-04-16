@@ -529,3 +529,12 @@ class TestGraphMetricsEndpoint:
         # If this parses, the response is valid JSON
         parsed = json.loads(raw)
         assert isinstance(parsed, dict)
+
+    def test_oversized_request_returns_413(self, client):
+        """MAX_CONTENT_LENGTH should reject oversized requests."""
+        from app import MAX_REQUEST_BYTES
+        # Send a body larger than the configured limit
+        oversized = b'x' * (MAX_REQUEST_BYTES + 1)
+        resp = client.post('/graph-metrics', data=oversized,
+                           content_type='application/json')
+        assert resp.status_code == 413

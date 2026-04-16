@@ -47,6 +47,7 @@ MAX_PATTERNS = int(os.getenv("MAX_PATTERNS", 10))
 # Cache sizing: With multi-minute requests, consider CACHE_SIZE=128+ if hit rate drops below 80%
 CACHE_SIZE = int(os.getenv("CACHE_SIZE", 32))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 120))
+MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", 10 * 1024 * 1024))  # 10 MB
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 ENABLE_SILHOUETTE_OPTIMIZATION = os.getenv("ENABLE_SILHOUETTE_OPTIMIZATION", "false").lower() == "true"
 COMMUNITY_RESOLUTION = float(os.getenv("COMMUNITY_RESOLUTION", 1.0))
@@ -61,6 +62,7 @@ REDIS_CACHE_TTL = int(os.getenv('REDIS_CACHE_TTL', 3600))  # 1 hour default
 ###############################################################################
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = MAX_REQUEST_BYTES
 
 # Set production log level
 log_level = logging.DEBUG if DEBUG else logging.WARNING
@@ -507,44 +509,51 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
         
     feats = df[['importanceScore', 'riskScore']].values
     n = len(df)
-    
+
     if n < 2:
         df['Cluster'] = 0
         return df
-    
+
+    # Short-circuit when all feature points are identical (KMeans would
+    # produce convergence warnings and meaningless clusters).
+    unique_count = len(np.unique(feats, axis=0))
+    if unique_count < 2:
+        df['Cluster'] = 0
+        return df
+
     # Fast heuristic path (default)
     if not ENABLE_SILHOUETTE_OPTIMIZATION:
-        # Heuristic: sqrt(n/2) clusters, bounded between 2 and 10
-        k = max(2, min(10, int(np.sqrt(n / 2))))
-        
+        # Heuristic: sqrt(n/2) clusters, bounded by [2, 10] and unique_count
+        k = max(2, min(10, int(np.sqrt(n / 2)), unique_count))
+
         if DEBUG:
             logging.info(f"Using heuristic k={k} for {n} nodes (silhouette optimization disabled)")
-        
+
         try:
             df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
         except ValueError:
             df['Cluster'] = 0
         return df
-    
+
     # Silhouette optimization path (only if explicitly enabled)
     if DEBUG:
         logging.info(f"Running silhouette optimization for {n} nodes")
-    
+
     # Early exit for small datasets
     if n <= 15:
-        k = min(3, n)
+        k = min(3, n, unique_count)
         try:
             df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
         except ValueError:
             df['Cluster'] = 0
         return df
-    
+
     # Full silhouette optimization
-    max_clusters = min(10, n)
-    best, k = -1, min(3, n)
-    
+    max_clusters = min(10, n, unique_count)
+    best, k = -1, min(3, n, unique_count)
+
     for c in range(2, max_clusters + 1):
-        if c >= n: 
+        if c >= n:
             break
         try:
             kmeans = KMeans(c, n_init='auto', random_state=0)
@@ -557,14 +566,14 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
                     best, k = sc, c
         except Exception:
             continue
-    
+
     # Guard against edge cases
-    k = min(k, max(1, n))
+    k = min(k, max(1, n), unique_count)
     try:
         df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
     except ValueError:
         df['Cluster'] = 0
-    
+
     return df
 
 def _pca(df):
@@ -575,7 +584,7 @@ def _pca(df):
         return df
         
     arr = df[['importanceScore', 'riskScore']].values
-    if len(arr) > 1:
+    if len(arr) > 1 and len(np.unique(arr, axis=0)) > 1:
         df[['pca1', 'pca2']] = PCA(2).fit_transform(arr)
     else:
         df['pca1'] = 0
