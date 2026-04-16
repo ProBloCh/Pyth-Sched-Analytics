@@ -232,12 +232,29 @@ def create_templates_from_patterns(pattern_records):
 ###############################################################################
 
 def calculate_critical_path(G):
-    """Calculate critical path using NetworkX DAG algorithms"""
-    # Note: NetworkKit doesn't have direct critical path support
-    # so we use NetworkX which is optimized for this
-    critical_path = nx.dag_longest_path(G, weight='duration')
-    critical_path_length = nx.dag_longest_path_length(G, weight='duration')
-    return critical_path, critical_path_length
+    """Calculate critical path using full CPM with FS/SS/FF/SF + lag.
+
+    Delegates to solver.dag for correct precedence-relationship handling,
+    then extracts the critical path from the solved state.  Falls back
+    to NetworkX dag_longest_path if the solver import fails.
+    """
+    try:
+        from solver.dag import build_dag as _build_dag, get_critical_path_indices
+        nodes = [{'ID': str(nd), 'Duration': float(G.nodes[nd].get('duration', 1))}
+                 for nd in G.nodes()]
+        links = [{'source': str(u), 'target': str(v),
+                  'type': G.edges[u, v].get('type', 'FS'),
+                  'lag':  float(G.edges[u, v].get('lag', 0))}
+                 for u, v in G.edges()]
+        dag_state, _ = _build_dag(nodes, links)
+        cp_ids = [nodes[i]['ID'] for i in get_critical_path_indices(dag_state)]
+        return cp_ids, dag_state.makespan
+    except Exception as e:
+        if DEBUG:
+            logging.warning(f"CPM critical path failed ({e}); falling back to NetworkX")
+        critical_path = nx.dag_longest_path(G, weight='duration')
+        critical_path_length = nx.dag_longest_path_length(G, weight='duration')
+        return critical_path, critical_path_length
 
 def identify_critical_activities_and_milestones(G):
     critical_activities = [
@@ -982,6 +999,110 @@ def _community_detection_nx(G: nx.DiGraph, df: pd.DataFrame):
         df['CommunityGroup'] = 0
 
 ###############################################################################
+# Schedule Health (DCMA 14-Point / GAO Schedule Assessment)                   #
+###############################################################################
+
+def _schedule_health(G: nx.DiGraph, df: pd.DataFrame, critical_path, critical_path_length):
+    """DCMA-style schedule health metrics computed from the dependency graph.
+
+    Based on the Defense Contract Management Agency 14-Point Assessment
+    and the GAO Schedule Assessment Guide.  Only includes checks that
+    can be computed from the plan (no execution data required).
+    """
+    n_tasks = len(df)
+    n_links = G.number_of_edges()
+    if n_tasks == 0:
+        return {}
+
+    # 1. Logic (relationship) density — target: 1.5–2.5 per task
+    logic_density = round(n_links / max(n_tasks, 1), 2)
+
+    # 2. Missing predecessors (excluding start nodes)
+    missing_pred = []
+    for nd in G.nodes():
+        if G.in_degree(nd) == 0 and G.out_degree(nd) > 0:
+            # Start nodes are expected to have no predecessors
+            pass
+        elif G.in_degree(nd) == 0 and G.out_degree(nd) == 0:
+            missing_pred.append(str(nd))  # Orphan — no pred or succ
+    # Also check for non-start nodes with no predecessors
+    for nd in G.nodes():
+        if G.in_degree(nd) == 0 and G.out_degree(nd) > 0:
+            # This is a start node — only flag if there are multiple
+            pass
+    n_no_pred = sum(1 for nd in G.nodes() if G.in_degree(nd) == 0)
+    n_no_succ = sum(1 for nd in G.nodes() if G.out_degree(nd) == 0)
+
+    # 3. Relationship type breakdown
+    rel_counts = {'FS': 0, 'SS': 0, 'FF': 0, 'SF': 0}
+    lag_count = 0
+    negative_lag_count = 0
+    for u, v, data in G.edges(data=True):
+        rel = str(data.get('type', 'FS')).upper()
+        if rel in rel_counts:
+            rel_counts[rel] += 1
+        else:
+            rel_counts['FS'] += 1
+        lag = float(data.get('lag', 0))
+        if abs(lag) > 1e-9:
+            lag_count += 1
+        if lag < -1e-9:
+            negative_lag_count += 1
+
+    # 4. High float — activities with TF > 44 working days (DCMA threshold)
+    high_float_threshold = 44.0
+    high_float = []
+    if 'total_float' in df.columns:
+        hf_mask = df['total_float'] > high_float_threshold
+        high_float = df.loc[hf_mask, 'ID'].astype(str).tolist()
+
+    # 5. High duration — activities > 44 working days (DCMA threshold)
+    high_dur_threshold = 44.0
+    high_dur = df.loc[df['Duration'] > high_dur_threshold, 'ID'].astype(str).tolist()
+
+    # 6. Resource assignment gaps
+    resource_gaps = []
+    if 'Resources' in df.columns:
+        empty_res = df['Resources'].fillna('').astype(str).str.strip() == ''
+        resource_gaps = df.loc[empty_res, 'ID'].astype(str).tolist()
+
+    # 7. Critical path metrics
+    cp_length = len(critical_path) if critical_path else 0
+    cp_ratio = round(cp_length / max(n_tasks, 1), 3)
+
+    # Overall health score (percentage of checks passing)
+    checks = {
+        'logic_density_ok':     1.5 <= logic_density <= 2.5,
+        'missing_predecessors': n_no_pred <= max(1, int(n_tasks * 0.05)),
+        'missing_successors':   n_no_succ <= max(1, int(n_tasks * 0.05)),
+        'no_negative_lags':     negative_lag_count == 0,
+        'high_float_ok':        len(high_float) <= int(n_tasks * 0.05),
+        'high_duration_ok':     len(high_dur) <= int(n_tasks * 0.05),
+        'resources_assigned':   len(resource_gaps) <= int(n_tasks * 0.05),
+        'critical_path_exists': cp_length > 0,
+    }
+    n_passing = sum(checks.values())
+
+    return {
+        'logic_density': logic_density,
+        'n_tasks': n_tasks,
+        'n_relationships': n_links,
+        'relationship_types': rel_counts,
+        'n_lags': lag_count,
+        'n_negative_lags': negative_lag_count,
+        'missing_predecessors': n_no_pred,
+        'missing_successors': n_no_succ,
+        'high_float_activities': len(high_float),
+        'high_duration_activities': len(high_dur),
+        'resource_gaps': len(resource_gaps),
+        'critical_path_length_tasks': cp_length,
+        'critical_path_length_duration': float(critical_path_length),
+        'critical_path_ratio': cp_ratio,
+        'checks': checks,
+        'health_score': round(n_passing / max(len(checks), 1), 2),
+    }
+
+###############################################################################
 # Main analysis function                                                      #
 ###############################################################################
 
@@ -1077,6 +1198,10 @@ def analyse(nodes, links):
         else:
             critical_path, critical_path_length = [], 0
         
+        # Schedule health (DCMA 14-Point)
+        health = _schedule_health(G, df_nodes, critical_path,
+                                  critical_path_length)
+
         # Build response
         response = {
             'nodes': df_nodes.replace({np.nan: None}).to_dict('records'),
@@ -1084,7 +1209,8 @@ def analyse(nodes, links):
             'work_packages': work_packages_serialized,
             'critical_path': critical_path,
             'critical_path_length': float(critical_path_length),
-            'templates': templates
+            'templates': templates,
+            'schedule_health': health,
         }
         if multi_res:
             response['multi_resolution_communities'] = multi_res

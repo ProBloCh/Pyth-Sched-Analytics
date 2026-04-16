@@ -440,3 +440,183 @@ class TestMultiResolution:
                 assert 'child' in edge
                 assert 'overlap' in edge
                 assert edge['overlap'] >= 0.7
+
+
+# ---------------------------------------------------------------------------
+# Relationship types (FS/SS/FF/SF) + lag
+# ---------------------------------------------------------------------------
+
+class TestRelationshipTypes:
+    """Tests for the four standard CPM precedence relationships + lag."""
+
+    def test_fs_default(self):
+        """FS (default): ES[B] = EF[A] + 0 = 10."""
+        nodes = [{'ID': 'A', 'Duration': 10}, {'ID': 'B', 'Duration': 5}]
+        links = [{'source': 'A', 'target': 'B'}]  # no type → defaults to FS
+        dag, _ = build_dag(nodes, links)
+        assert dag.ES[1] == 10.0
+        assert dag.makespan == 15.0
+
+    def test_fs_with_lag(self):
+        """FS with lag=3: ES[B] = EF[A] + 3 = 13."""
+        nodes = [{'ID': 'A', 'Duration': 10}, {'ID': 'B', 'Duration': 5}]
+        links = [{'source': 'A', 'target': 'B', 'type': 'FS', 'lag': 3}]
+        dag, _ = build_dag(nodes, links)
+        assert dag.ES[1] == 13.0
+        assert dag.makespan == 18.0
+
+    def test_fs_with_negative_lag(self):
+        """FS with lag=-2 (fast-tracking): ES[B] = EF[A] - 2 = 8."""
+        nodes = [{'ID': 'A', 'Duration': 10}, {'ID': 'B', 'Duration': 5}]
+        links = [{'source': 'A', 'target': 'B', 'type': 'FS', 'lag': -2}]
+        dag, _ = build_dag(nodes, links)
+        assert dag.ES[1] == 8.0
+        assert dag.makespan == 13.0
+
+    def test_ss_relationship(self):
+        """SS with lag=5: ES[B] = ES[A] + 5 = 5."""
+        nodes = [{'ID': 'A', 'Duration': 10}, {'ID': 'B', 'Duration': 10}]
+        links = [{'source': 'A', 'target': 'B', 'type': 'SS', 'lag': 5}]
+        dag, _ = build_dag(nodes, links)
+        assert dag.ES[1] == 5.0
+        assert dag.makespan == 15.0  # B ends at 5+10=15
+
+    def test_ff_relationship(self):
+        """FF with lag=0: EF[B] = EF[A] → ES[B] = EF[A] - d[B]."""
+        nodes = [{'ID': 'A', 'Duration': 20}, {'ID': 'B', 'Duration': 10}]
+        links = [{'source': 'A', 'target': 'B', 'type': 'FF', 'lag': 0}]
+        dag, _ = build_dag(nodes, links)
+        assert dag.ES[1] == 10.0  # B starts at 20-10=10
+        assert dag.makespan == 20.0
+
+    def test_ff_with_lag(self):
+        """FF with lag=5: EF[B] >= EF[A] + 5."""
+        nodes = [{'ID': 'A', 'Duration': 20}, {'ID': 'B', 'Duration': 10}]
+        links = [{'source': 'A', 'target': 'B', 'type': 'FF', 'lag': 5}]
+        dag, _ = build_dag(nodes, links)
+        assert dag.ES[1] == 15.0  # B starts at 25-10=15
+        assert dag.makespan == 25.0
+
+    def test_sf_relationship(self):
+        """SF: EF[B] >= ES[A] + lag."""
+        nodes = [{'ID': 'A', 'Duration': 10}, {'ID': 'B', 'Duration': 15}]
+        links = [{'source': 'A', 'target': 'B', 'type': 'SF', 'lag': 5}]
+        dag, _ = build_dag(nodes, links)
+        # EF[B] >= ES[A]+5 = 0+5 = 5 → ES[B] >= 5-15 = -10 → clamped to 0
+        assert dag.ES[1] == 0.0
+        assert dag.makespan == 15.0
+
+    def test_mixed_relationships(self):
+        """Diamond with mixed relationship types."""
+        nodes = [
+            {'ID': 'A', 'Duration': 10},
+            {'ID': 'B', 'Duration': 20},
+            {'ID': 'C', 'Duration': 15},
+            {'ID': 'D', 'Duration': 5},
+        ]
+        links = [
+            {'source': 'A', 'target': 'B', 'type': 'FS', 'lag': 0},
+            {'source': 'A', 'target': 'C', 'type': 'SS', 'lag': 5},
+            {'source': 'B', 'target': 'D', 'type': 'FS', 'lag': 0},
+            {'source': 'C', 'target': 'D', 'type': 'FF', 'lag': 0},
+        ]
+        dag, _ = build_dag(nodes, links)
+        # A: ES=0, EF=10
+        # B: ES=10 (FS from A), EF=30
+        # C: ES=5 (SS from A, lag=5), EF=20
+        # D: ES = max(EF[B]+0, EF[C]+0-5) = max(30, 15) = 30, EF=35
+        assert dag.ES[0] == 0.0
+        assert dag.ES[1] == 10.0
+        assert dag.ES[2] == 5.0
+        assert dag.ES[3] == 30.0
+        assert dag.makespan == 35.0
+
+    def test_total_float_with_ss(self):
+        """Total float computed correctly for SS relationships."""
+        nodes = [
+            {'ID': 'A', 'Duration': 10},
+            {'ID': 'B', 'Duration': 5},
+            {'ID': 'C', 'Duration': 20},
+        ]
+        links = [
+            {'source': 'A', 'target': 'B', 'type': 'SS', 'lag': 0},
+            {'source': 'A', 'target': 'C', 'type': 'FS', 'lag': 0},
+        ]
+        dag, _ = build_dag(nodes, links)
+        # A: ES=0, EF=10
+        # B: ES=0 (SS from A, lag=0), EF=5
+        # C: ES=10 (FS from A), EF=30
+        # Makespan=30
+        # Backward: LF[C]=30, LS[C]=10
+        #   LF[B]=30 (no succ), LS[B]=25
+        #   LF[A] = min(LS[C]-0=10, LS[B]-0+10=35) = 10
+        #   LS[A] = 0
+        assert dag.TF[0] == 0.0   # A critical
+        assert dag.TF[2] == 0.0   # C critical
+        assert dag.TF[1] == 25.0  # B has 25 days float
+
+    def test_backward_compat_no_type_field(self):
+        """Links without type field default to FS(0)."""
+        nodes = [{'ID': 'A', 'Duration': 10}, {'ID': 'B', 'Duration': 5}]
+        links = [{'source': 'A', 'target': 'B'}]
+        dag, _ = build_dag(nodes, links)
+        assert dag.makespan == 15.0
+
+    def test_invalid_type_defaults_to_fs(self):
+        """Unknown relationship types should default to FS."""
+        nodes = [{'ID': 'A', 'Duration': 10}, {'ID': 'B', 'Duration': 5}]
+        links = [{'source': 'A', 'target': 'B', 'type': 'XY'}]
+        dag, _ = build_dag(nodes, links)
+        assert dag.makespan == 15.0
+
+
+# ---------------------------------------------------------------------------
+# Schedule Health (DCMA)
+# ---------------------------------------------------------------------------
+
+class TestScheduleHealth:
+
+    def test_health_returned_in_response(self):
+        """analyse() should include schedule_health in response."""
+        from app import analyse
+        nodes = [
+            {'ID': 'A', 'Duration': 10, 'importanceScore': 5, 'riskScore': 3},
+            {'ID': 'B', 'Duration': 20, 'importanceScore': 5, 'riskScore': 3},
+        ]
+        links = [{'source': 'A', 'target': 'B'}]
+        result = analyse(nodes, links)
+        assert 'schedule_health' in result
+        health = result['schedule_health']
+        assert 'logic_density' in health
+        assert 'health_score' in health
+        assert 'checks' in health
+        assert 'relationship_types' in health
+
+    def test_logic_density(self):
+        """Logic density = n_links / n_tasks."""
+        from app import _schedule_health, build_nx_graph
+        G = build_nx_graph(
+            [{'ID': 'A', 'Duration': 10}, {'ID': 'B', 'Duration': 5},
+             {'ID': 'C', 'Duration': 8}],
+            [{'source': 'A', 'target': 'B'}, {'source': 'B', 'target': 'C'}]
+        )
+        import pandas as pd
+        df = pd.DataFrame({'ID': ['A', 'B', 'C'], 'Duration': [10, 5, 8]})
+        health = _schedule_health(G, df, ['A', 'B', 'C'], 23.0)
+        assert health['logic_density'] == round(2 / 3, 2)
+
+    def test_relationship_type_breakdown(self):
+        """Relationship types counted correctly."""
+        from app import _schedule_health, build_nx_graph
+        G = build_nx_graph(
+            [{'ID': 'A', 'Duration': 10}, {'ID': 'B', 'Duration': 5},
+             {'ID': 'C', 'Duration': 8}],
+            [{'source': 'A', 'target': 'B', 'type': 'SS'},
+             {'source': 'B', 'target': 'C', 'type': 'FF'}]
+        )
+        import pandas as pd
+        df = pd.DataFrame({'ID': ['A', 'B', 'C'], 'Duration': [10, 5, 8]})
+        health = _schedule_health(G, df, ['A', 'B', 'C'], 18.0)
+        assert health['relationship_types']['SS'] == 1
+        assert health['relationship_types']['FF'] == 1
+        assert health['relationship_types']['FS'] == 0

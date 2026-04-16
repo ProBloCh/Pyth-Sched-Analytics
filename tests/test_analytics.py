@@ -193,14 +193,14 @@ class TestCriticalPath:
         G = ensure_dag(G)
         path, length = calculate_critical_path(G)
         assert path == ['A', 'B', 'C']
-        assert length == 30  # edge durations: 10 + 20
+        assert length == 35  # CPM makespan: A(10) + B(20) + C(5)
 
     def test_diamond(self, diamond):
         nodes, links = diamond
         G = build_nx_graph(nodes, links)
         G = ensure_dag(G)
         path, length = calculate_critical_path(G)
-        assert length == 25  # edge durations: A->B(10) + B->D(15)
+        assert length == 30  # CPM makespan: A(10) + B(15) + D(5)
         assert 'A' in path and 'D' in path
 
 
@@ -424,12 +424,12 @@ class TestAnalyse:
     def test_critical_path_length(self, simple_chain):
         nodes, links = simple_chain
         result = analyse(nodes, links)
-        assert result['critical_path_length'] == 30.0  # edge durations: 10 + 20
+        assert result['critical_path_length'] == 35.0  # CPM makespan: A(10)+B(20)+C(5)
 
     def test_diamond_critical_path(self, diamond):
         nodes, links = diamond
         result = analyse(nodes, links)
-        assert result['critical_path_length'] == 25.0  # A->B(10) + B->D(15)
+        assert result['critical_path_length'] == 30.0  # CPM makespan: A(10)+B(15)+D(5)
 
     def test_handles_missing_optional_fields(self):
         """Nodes with only ID and Duration should not crash."""
