@@ -198,9 +198,9 @@ def detect_repeating_patterns(nodes_df):
     # Create pattern key more efficiently with discretized duration
     # Round duration to avoid float precision issues
     duration_discrete = (sample_df['Duration'].round(1) * 10).astype(int)
-    pattern_key = (sample_df['TaskType'].cat.codes * 100000 + 
-                  duration_discrete * 100 + 
-                  sample_df['Resources'].cat.codes)
+    pattern_key = (sample_df['TaskType'].cat.codes.astype('int64') * 100000 +
+                  duration_discrete * 100 +
+                  sample_df['Resources'].cat.codes.astype('int64'))
     
     sample_df['pattern_id'] = pd.factorize(pattern_key)[0]
     
@@ -219,7 +219,7 @@ def create_templates_from_patterns(pattern_records):
     for index, pattern_df in enumerate(pattern_records):
         template = {
             'average_duration': float(pattern_df['Duration'].mean()),
-            'duration_variance': float(pattern_df['Duration'].var()),
+            'duration_variance': float(pattern_df['Duration'].var()) if len(pattern_df) > 1 else 0.0,
             'most_common_resources': pattern_df['Resources'].mode().tolist(),
             'dependency_links': pattern_df['Dependencies'].mode().tolist() if 'Dependencies' in pattern_df.columns else [],
             'task_frequency': len(pattern_df)
@@ -823,6 +823,96 @@ def _centralities_nx(G: nx.DiGraph, df: pd.DataFrame):
     df['degree_centrality'] = df['ID'].astype(str).map(deg).fillna(0)
     df['Clustering_Coefficient'] = df['ID'].astype(str).map(clust).fillna(0)
 
+def _risk_propagation(G: nx.DiGraph, df: pd.DataFrame):
+    """Propagate risk through the dependency network.
+
+    Each activity's propagated_risk combines its intrinsic riskScore
+    with risk inherited from predecessors, weighted by the number of
+    dependency paths.  This models the cascade mechanism that generates
+    fat-tailed overrun distributions (Natarajan et al., PMJ 2022;
+    Flyvbjerg et al., JMIS 2022).
+
+    Adds three columns:
+      propagated_risk:      intrinsic + inherited risk (topological sum)
+      risk_transmission:    outgoing risk flow (how much risk this node
+                            transmits to its successors)
+      coupling_density:     fraction of community members that are
+                            direct neighbours — high values indicate
+                            Thunderhorse-class tight coupling
+    """
+    if 'riskScore' not in df.columns:
+        df['propagated_risk'] = 0.0
+        df['risk_transmission'] = 0.0
+        df['coupling_density'] = 0.0
+        return df
+
+    ids = df['ID'].astype(str).tolist()
+    id_to_idx = {aid: i for i, aid in enumerate(ids)}
+    n = len(ids)
+
+    # Map riskScore from df to array indexed by graph node order
+    risk_map = dict(zip(df['ID'].astype(str), df['riskScore'].fillna(0).values))
+
+    # Topological propagation: propagated_risk[j] = risk[j] + Σ propagated_risk[pred] / in_degree[j]
+    # This gives activities deeper in the dependency chain higher propagated risk.
+    try:
+        topo = list(nx.topological_sort(G))
+    except nx.NetworkXUnfeasible:
+        topo = list(G.nodes())
+
+    prop = {}
+    for node in topo:
+        intrinsic = float(risk_map.get(str(node), 0.0))
+        preds = list(G.predecessors(node))
+        if preds:
+            inherited = sum(prop.get(p, 0.0) for p in preds) / len(preds)
+        else:
+            inherited = 0.0
+        prop[node] = intrinsic + inherited
+
+    # Risk transmission: how much risk a node sends forward
+    # = propagated_risk × out_degree (more successors = more risk spread)
+    trans = {}
+    for node in G.nodes():
+        out_deg = G.out_degree(node)
+        trans[node] = prop.get(node, 0.0) * out_deg
+
+    # Coupling density: for each node, what fraction of its community
+    # neighbours are also its direct graph neighbours (in or out).
+    # High coupling_density = tightly coupled = cascade-prone.
+    coupling = {}
+    if 'CommunityGroup' in df.columns:
+        comm_map = dict(zip(df['ID'].astype(str), df['CommunityGroup'].values))
+        comm_members = {}
+        for aid, cid in comm_map.items():
+            comm_members.setdefault(cid, set()).add(aid)
+
+        for node in G.nodes():
+            snode = str(node)
+            cid = comm_map.get(snode, -1)
+            members = comm_members.get(cid, set())
+            if len(members) <= 1:
+                coupling[node] = 0.0
+                continue
+            neighbours = set(str(n) for n in G.predecessors(node))
+            neighbours |= set(str(n) for n in G.successors(node))
+            shared = len(neighbours & members)
+            coupling[node] = shared / (len(members) - 1)
+    else:
+        for node in G.nodes():
+            coupling[node] = 0.0
+
+    # Map back to dataframe
+    str_ids = df['ID'].astype(str)
+    df['propagated_risk'] = str_ids.map(
+        {str(k): round(v, 4) for k, v in prop.items()}).fillna(0)
+    df['risk_transmission'] = str_ids.map(
+        {str(k): round(v, 4) for k, v in trans.items()}).fillna(0)
+    df['coupling_density'] = str_ids.map(
+        {str(k): round(v, 4) for k, v in coupling.items()}).fillna(0)
+
+    return df
+
 def _community_detection(G: nx.DiGraph, df: pd.DataFrame):
     """Community detection using NetworkKit when available"""
     if _NK and len(G) > 100:
@@ -973,7 +1063,10 @@ def analyse(nodes, links):
         
         # Centrality metrics
         df_nodes = _centralities(G, df_nodes)
-        
+
+        # Risk propagation through dependency network
+        df_nodes = _risk_propagation(G, df_nodes)
+
         # Work packages
         work_packages = define_work_packages(df_nodes, G)
         work_packages_serialized = serialize_work_packages(work_packages)
