@@ -60,7 +60,9 @@ def _generate_samples(M, n, antithetic, seed=42):
     Generate uniform [0,1] samples using Sobol QMC when feasible.
 
     Antithetic variates use u and (1-u) pairs, which map to opposite
-    tails regardless of the target distribution.
+    tails regardless of the target distribution.  Sobol sequences are
+    generated at power-of-2 counts for optimal discrepancy, then
+    truncated to the requested M to avoid inflating computation time.
     """
     if n <= _SOBOL_MAX_DIM:
         from scipy.stats.qmc import Sobol
@@ -69,14 +71,14 @@ def _generate_samples(M, n, antithetic, seed=42):
             half = max(M // 2, 1)
             half_pow2 = 1 << max(int(np.ceil(np.log2(max(half, 1)))), 0)
             sobol = Sobol(d=n, scramble=True, seed=seed)
-            u = sobol.random(half_pow2)
+            u = sobol.random(half_pow2)[:half]  # truncate to requested
             u_all = np.concatenate([u, 1.0 - u], axis=0)
-            M_actual = 2 * half_pow2
+            M_actual = 2 * half
         else:
             M_pow2 = 1 << max(int(np.ceil(np.log2(max(M, 1)))), 0)
             sobol = Sobol(d=n, scramble=True, seed=seed)
-            u_all = sobol.random(M_pow2)
-            M_actual = M_pow2
+            u_all = sobol.random(M_pow2)[:M]  # truncate to requested
+            M_actual = M
 
         logger.info("Sobol QMC: requested M=%d, actual M=%d, n=%d, "
                      "antithetic=%s", M, M_actual, n, antithetic)

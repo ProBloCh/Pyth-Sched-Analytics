@@ -134,11 +134,16 @@ dependencies — do not convert this to a top-level import.
 
 ### Multi-Resolution Pipeline
 
-The guidance doc (`docs/cybereum-multiresolution-guidance.md`) describes a
-planned multi-resolution community detection pipeline. This is a design
-document — it is **not implemented** in the current codebase. The current code
-runs single-resolution Louvain at `gamma=1.0` only. Do not confuse planned
-design with current state.
+The guidance doc (`docs/cybereum-multiresolution-guidance.md`) describes the
+multi-resolution community detection pipeline.  The implementation lives in
+`multi_resolution_pipeline.py` and is called from `analyse()` in `app.py`
+for graphs with ≥ 50 nodes.  It runs Louvain at an adaptive resolution
+ladder (γ = 0.3, 1.0, 2.5, 4.0), performs NMI stability analysis across
+multiple runs per tier, and builds a containment hierarchy.  The result is
+added to the `/graph-metrics` response under the `multi_resolution_communities`
+key (additive — does not affect the existing `CommunityGroup` column, which
+remains single-resolution at `COMMUNITY_RESOLUTION`).  Uses NetworkKit
+when available; falls back to NetworkX.
 
 ### Performance Awareness
 

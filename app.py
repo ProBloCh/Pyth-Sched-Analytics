@@ -956,12 +956,18 @@ def analyse(nodes, links):
         # Community detection (single-resolution — populates CommunityGroup column)
         df_nodes = _community_detection(G, df_nodes)
 
-        # Multi-resolution community detection (additive — new response key)
+        # Multi-resolution community detection (additive — new response key).
+        # Reduce n_runs for large graphs to keep latency bounded:
+        # ~5 Louvain runs × 4 resolutions = 20 runs at default; at 2 runs
+        # for large graphs that drops to 8.
         multi_res = None
-        if len(df_nodes) >= 50 and G.number_of_edges() > 0:
+        n_nodes = len(df_nodes)
+        if n_nodes >= 50 and G.number_of_edges() > 0:
             try:
                 from multi_resolution_pipeline import run_multi_resolution
-                multi_res = run_multi_resolution(G.to_undirected())
+                mr_runs = 2 if n_nodes > SMALL_GRAPH_THRESHOLD else 5
+                multi_res = run_multi_resolution(G.to_undirected(),
+                                                 n_runs=mr_runs)
             except Exception as e:
                 logging.warning(f"Multi-resolution community detection failed: {e}")
         
