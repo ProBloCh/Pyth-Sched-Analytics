@@ -53,6 +53,13 @@
         monteCarloIterations: 1500,
         monteCarloSeed: 42,
         monteCarloMaxActivities: 12000,
+        // Backend Monte Carlo offload (Pyth-Sched-Analytics /completion/monte-carlo).
+        // When true and the endpoint responds, the backend runs the five-tier
+        // risk-distribution MC and the JS version is used only as a fallback.
+        // Set to false to force the legacy in-browser MC.
+        useBackendCompletion: true,
+        completionEndpoint: '/completion/monte-carlo',
+        completionRequestTimeoutMs: 15000,
         // Add to CONFIG object:
         mcNoRiskBelow: 0.06,    // Below this risk score, no inflation
         mcNormalFrom: 0.18,     // Above this, use normal distribution
@@ -1654,6 +1661,219 @@
 
         return results;
 
+    }
+
+    // =========================================================================
+    // BACKEND-FIRST MONTE CARLO WRAPPER
+    // =========================================================================
+    //
+    // Offloads the remaining-work MC to Pyth-Sched-Analytics'
+    // /completion/monte-carlo endpoint when available.  The backend uses
+    // the same five-tier risk-distribution model (triangular -> normal ->
+    // Birnbaum-Saunders -> Pareto; Natarajan et al. PMJ 2022, Flyvbjerg
+    // et al. JMIS 2022) but with Sobol QMC instead of Murmur3/FNV-1a
+    // hashing, and full working-calendar support.
+    //
+    // Returns the same shape as runMonteCarloRemaining() -- Date objects,
+    // camelCase keys -- so downstream code (buildRiskSchedules, etc.) is
+    // unchanged.  On any failure (disabled, endpoint missing, non-200,
+    // network error, timeout) the JS MC runs as a transparent fallback.
+    //
+    // finishSamples is intentionally omitted from the backend response
+    // (raw samples can balloon payloads into the MB range).  Callers that
+    // rely on finishSamples already guard with ``mc.finishSamples?.length``.
+
+    async function runMonteCarloRemainingAsync(nodes, links, maps, expected,
+                                               reachability, drivingChain, opts = {}) {
+        const disabled = !CONFIG.useBackendCompletion
+            || typeof fetch !== 'function'
+            || !CONFIG.completionEndpoint;
+        if (disabled) {
+            return runMonteCarloRemaining(nodes, links, maps, expected,
+                                          reachability, drivingChain, opts);
+        }
+
+        // If prerequisites that the sync path also requires are missing, the
+        // sync path returns null -- mirror that without ever hitting the network.
+        const scope = reachability?.scopeToEnd;
+        if (!maps?.statusDate || !maps?.endNode || !scope || scope.size === 0
+            || scope.size > CONFIG.monteCarloMaxActivities) {
+            return runMonteCarloRemaining(nodes, links, maps, expected,
+                                          reachability, drivingChain, opts);
+        }
+
+        try {
+            const body = _buildCompletionRequestBody(
+                nodes, links, maps, reachability, opts);
+
+            const controller = (typeof AbortController === 'function')
+                ? new AbortController() : null;
+            const timer = controller ? setTimeout(
+                () => controller.abort(),
+                +CONFIG.completionRequestTimeoutMs || 15000) : null;
+
+            const resp = await fetch(CONFIG.completionEndpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                signal: controller ? controller.signal : undefined,
+            });
+
+            if (timer) clearTimeout(timer);
+
+            if (!resp.ok) {
+                console.warn('[CompletionPrediction] Backend MC returned',
+                             resp.status, '-- falling back to JS MC');
+                return runMonteCarloRemaining(nodes, links, maps, expected,
+                                              reachability, drivingChain, opts);
+            }
+
+            const payload = await resp.json();
+            const mapped = _mapCompletionResponse(payload);
+
+            console.log('[CompletionPrediction] Backend MC results:', {
+                p20: mapped.p20Finish?.toISOString?.().split?.('T')?.[0],
+                p50: mapped.p50Finish?.toISOString?.().split?.('T')?.[0],
+                p80: mapped.p80Finish?.toISOString?.().split?.('T')?.[0],
+                iterations: mapped.iterations,
+                spreadDays: mapped.spreadDays,
+                scopeSize: payload.scope_size,
+                computationMs: payload.computation_ms,
+                cacheHit: payload.cache_hit,
+            });
+            return mapped;
+
+        } catch (err) {
+            console.warn('[CompletionPrediction] Backend MC failed (',
+                         err?.name || 'error', err?.message || err,
+                         ') -- falling back to JS MC');
+            return runMonteCarloRemaining(nodes, links, maps, expected,
+                                          reachability, drivingChain, opts);
+        }
+    }
+
+    function _buildCompletionRequestBody(nodes, links, maps, reachability, opts) {
+        const scope = reachability?.scopeToEnd;
+        const statusDate = maps?.statusDate;
+
+        // Send only nodes in the MC scope -- plus any predecessor to preserve
+        // DAG integrity when the scope is a subset of the full graph.
+        const includeIds = new Set();
+        if (scope && scope.size > 0) {
+            for (const id of scope) includeIds.add(String(id));
+            // Pull in direct predecessors so lag propagation has something to
+            // chain off.  Backend will treat ActualFinish-bearing nodes as
+            // out-of-scope anchors.
+            for (const id of Array.from(includeIds)) {
+                const preds = maps?.predMap?.get(id);
+                if (preds) for (const p of preds) includeIds.add(String(p.source));
+            }
+        } else {
+            for (const n of nodes || EMPTY_ARRAY) includeIds.add(String(n.ID));
+        }
+
+        const sentNodes = [];
+        for (const n of nodes || EMPTY_ARRAY) {
+            const nid = String(n.ID);
+            if (!includeIds.has(nid)) continue;
+            sentNodes.push({
+                ID: nid,
+                Duration: n.Duration,
+                TimeUnits: n.TimeUnits,
+                PercentComplete: n.PercentComplete ?? n.percentComplete,
+                ExpectedStart: _isoOrNull(n.ExpectedStart),
+                ActualFinish: _isoOrNull(n.ActualFinish),
+                riskScore: n.riskScore ?? n.ComputedRiskScore,
+                SupplierType: n.SupplierType || n.supplierType,
+                ActivityPhase: n.ActivityPhase || n.activityPhase,
+            });
+        }
+
+        const sentLinks = [];
+        for (const l of links || EMPTY_ARRAY) {
+            const src = String(typeof l.source === 'object' ? l.source.ID : l.source);
+            const tgt = String(typeof l.target === 'object' ? l.target.ID : l.target);
+            if (!includeIds.has(src) || !includeIds.has(tgt)) continue;
+            sentLinks.push({
+                source: src,
+                target: tgt,
+                type: (l.type || 'FS').toUpperCase(),
+                lag: getLagInHours(l),
+            });
+        }
+
+        const teamCal = (typeof window !== 'undefined'
+                         && window.cybereumState?.teamCalendar) || null;
+        const holidays = Array.isArray(teamCal?.holidays)
+            ? teamCal.holidays.map(h => (h && h.date) ? h.date : h).filter(Boolean)
+            : [];
+
+        const body = {
+            nodes: sentNodes,
+            links: sentLinks,
+            status_date: _isoOrNull(statusDate) || new Date(statusDate).toISOString(),
+            project_context: {
+                calendar: {
+                    hours_per_day: CONFIG.workingHoursPerDay || 8,
+                    working_days: Array.isArray(teamCal?.workingDays) && teamCal.workingDays.length
+                        ? teamCal.workingDays
+                        : [1, 2, 3, 4, 5],
+                    holidays: holidays,
+                },
+            },
+            config: {
+                iterations: opts.iterations ?? CONFIG.monteCarloIterations,
+                seed: (opts.seed ?? CONFIG.monteCarloSeed) >>> 0,
+                enable_risk: !!CONFIG.riskEnabled,
+                thresholds: {
+                    no_risk_below: opts.noRiskBelow ?? CONFIG.mcNoRiskBelow,
+                    normal_from: opts.normalFrom ?? CONFIG.mcNormalFrom,
+                    fat_tail_from: opts.fatTailFrom ?? CONFIG.mcFatTailFrom,
+                },
+                caps: {
+                    min_mult: opts.minMult ?? CONFIG.mcMinMult,
+                    max_mult_base: opts.maxMultBase ?? CONFIG.mcMaxMultBase,
+                    max_mult_high: opts.maxMultHigh ?? CONFIG.mcMaxMultHigh,
+                },
+            },
+        };
+        return body;
+    }
+
+    function _mapCompletionResponse(payload) {
+        const toDate = (iso) => {
+            if (!iso) return null;
+            const d = new Date(iso);
+            return Number.isFinite(d.getTime()) ? clampDate(d) : null;
+        };
+        return {
+            p20Finish: toDate(payload.p20_finish),
+            p50Finish: toDate(payload.p50_finish),
+            p80Finish: toDate(payload.p80_finish),
+            spreadDays: Number.isFinite(payload.spread_days)
+                ? Math.round(payload.spread_days) : 0,
+            iterations: payload.iterations ?? 0,
+            seed: payload.seed ?? 0,
+            // finishSamples intentionally empty -- downstream consumers guard
+            // on .length > 0 and degrade gracefully.
+            finishSamples: [],
+            // Extras the backend provides; downstream ignores unknown keys.
+            expectedFinish: toDate(payload.expected_finish),
+            p20ImpactDays: payload.p20_impact_days,
+            p50ImpactDays: payload.p50_impact_days,
+            p80ImpactDays: payload.p80_impact_days,
+            activityPercentiles: payload.activity_percentiles,
+            source: 'backend',
+        };
+    }
+
+    function _isoOrNull(value) {
+        if (!value) return null;
+        if (value instanceof Date) {
+            return Number.isFinite(value.getTime()) ? value.toISOString() : null;
+        }
+        const d = safeDate(value);
+        return d ? d.toISOString() : null;
     }
 
     // =========================================================================
@@ -4765,7 +4985,7 @@
         const selectedMitigations = new Set();
 
         container.querySelectorAll('.cp7-risk-card').forEach(card => {
-            card.addEventListener('click', (e) => {
+            card.addEventListener('click', async (e) => {
                 // Toggle selection
                 const id = card.dataset.id;
                 if (!id) return;
@@ -4778,10 +4998,18 @@
                     card.classList.add('cp7-risk-selected');
                 }
 
-                // Recalculate Monte Carlo with mitigations
+                // Recalculate Monte Carlo with mitigations -- backend-first
+                // with JS fallback (see recalculateWithMitigationsAsync).
                 if (selectedMitigations.size > 0) {
-                    const newRisk = recalculateWithMitigations(analysis, selectedMitigations);
-                    updateRiskDisplay(containerId, newRisk, selectedMitigations.size);
+                    try {
+                        const newRisk = await recalculateWithMitigationsAsync(
+                            analysis, selectedMitigations);
+                        updateRiskDisplay(containerId, newRisk, selectedMitigations.size);
+                    } catch (err) {
+                        console.warn('[CompletionPrediction] Async mitigation recalc failed; using sync path:', err);
+                        const newRisk = recalculateWithMitigations(analysis, selectedMitigations);
+                        updateRiskDisplay(containerId, newRisk, selectedMitigations.size);
+                    }
                 } else {
                     // Restore original
                     updateRiskDisplay(containerId, analysis.risk, 0);
@@ -4837,6 +5065,50 @@
 
         return newRisk;
     }
+
+    // -------------------------------------------------------------------------
+    // Backend-aware mitigation recalculation.  Identical shape to
+    // recalculateWithMitigations() but awaits the /completion/monte-carlo
+    // endpoint (with JS fallback) so mitigated-risk P20/P50/P80s stay
+    // consistent with the initial analysis.
+    // -------------------------------------------------------------------------
+    async function recalculateWithMitigationsAsync(analysis, selectedMitigationIds) {
+        if (!selectedMitigationIds || selectedMitigationIds.size === 0) {
+            return analysis.risk;
+        }
+
+        const { nodes, links, maps, expected, reachability, drivingChain } = analysis;
+
+        // The backend reads risk from node.riskScore / node.ComputedRiskScore
+        // directly, so we build a modified *nodes list* (parallel to the
+        // modifiedNodeMap) rather than trying to serialise a Map.  Nodes not
+        // in the mitigation set pass through unchanged by reference.
+        const modifiedNodeMap = new Map(maps.nodeMap);
+        const modifiedNodes = (nodes || []).map((n) => {
+            const mitigationId = 'risk_' + String(n.ID);
+            if (!selectedMitigationIds.has(mitigationId)) return n;
+            const originalInternal = +(n.riskScore ?? n.ComputedRiskScore ?? 0);
+            const originalExternal = +(n.externalScheduleRisk ?? n.ExternalScheduleRisk ?? 0);
+            const mitigated = {
+                ...n,
+                riskScore: originalInternal * 0.4,
+                ComputedRiskScore: originalInternal * 0.4,
+                externalScheduleRisk: originalExternal * 0.4,
+                ExternalScheduleRisk: originalExternal * 0.4,
+                _mitigated: true
+            };
+            modifiedNodeMap.set(String(n.ID), mitigated);
+            return mitigated;
+        });
+
+        const modifiedMaps = { ...maps, nodeMap: modifiedNodeMap };
+
+        return await runMonteCarloRemainingAsync(
+            modifiedNodes, links, modifiedMaps, expected, reachability, drivingChain,
+            { seed: CONFIG.monteCarloSeed + selectedMitigationIds.size }
+        );
+    }
+
     function updateRiskDisplay(containerId, risk, mitigationCount) {
         const container = document.getElementById(containerId);
         if (!container) return;
@@ -5365,6 +5637,150 @@
         return analysis;
     }
 
+    // -------------------------------------------------------------------------
+    // analyzeAsync: identical to analyze() except the Monte Carlo call is
+    // awaited against the Pyth-Sched-Analytics /completion/monte-carlo
+    // backend (with the in-browser MC as a transparent fallback).  Exposed
+    // as a separate function so the sync entry point (initSync) and any
+    // other sync callers continue to work unchanged.
+    // -------------------------------------------------------------------------
+    async function analyzeAsync(nodes, links, opts = {}) {
+        _cachedWeights = null;
+        _holidaySet = null;
+
+        const teamCal = window.cybereumState?.teamCalendar;
+        if (teamCal) {
+            CONFIG.workingHoursPerDay = teamCal.hoursPerDay || 8;
+            CONFIG.workingDaysPerWeek = teamCal.workingDays?.length || 5;
+        }
+
+        if (typeof convertToHours !== 'function') {
+            console.error('[CompletionPrediction] convertToHours not available — PathScripts.js may not be loaded');
+            return null;
+        }
+
+        const maps = getStateMaps(nodes, links || []);
+        if (!maps) {
+            console.error('[CompletionPrediction] Analysis failed: could not build state maps.');
+            return null;
+        }
+        console.log('[CompletionPrediction] Maps Initialized:', {
+            nodeCount: maps.nodeMap.size,
+            statusDate: maps.statusDate,
+            hasCycle: maps.hasCycle
+        });
+
+        const expected = computeExpectedSchedule(nodes, links || [], maps, null);
+        console.log('[CompletionPrediction] Expected Schedule:', {
+            plannedFinish: expected.plannedProjectFinish,
+            expectedFinish: expected.expectedProjectFinish,
+            varianceDays: expected.projectVariance
+        });
+
+        const drivingChain = getExpectedDrivingChain(maps.endNode, maps.nodeMap);
+        console.log('[CompletionPrediction] Driving Chain length:', drivingChain.length, drivingChain);
+
+        if (drivingChain.length > 0) {
+            console.log('[CompletionPrediction] Driving Chain Details:');
+            const chainTable = drivingChain.map((n, idx) => {
+                const expF = safeDate(n.ExpectedFinish);
+                const plnF = safeDate(n.Finish);
+                const pct = effectivePercentComplete(n, maps);
+                const durH = convertToHours(n.Duration, n.TimeUnits);
+                return {
+                    seq: idx + 1,
+                    id: n.ID,
+                    name: (n.Name || '').substring(0, 30),
+                    pct: Math.round(pct * 100) + '%',
+                    durDays: Math.round(durH / CONFIG.workingHoursPerDay),
+                    plannedFinish: plnF ? formatDate(plnF) : '—',
+                    expectedFinish: expF ? formatDate(expF) : '—',
+                    slipDays: (plnF && expF) ? daysBetween(plnF, expF) : 0
+                };
+            });
+            console.table(chainTable);
+        }
+
+        const activeActivities = identifyActiveActivities(nodes, maps);
+        const reachability = buildReachabilitySets(maps, nodes, drivingChain);
+        console.log('[CompletionPrediction] Scope identified:', {
+            activeCount: activeActivities.length,
+            nodesInScope: reachability.scopeToEnd.size
+        });
+
+        const mc = await runMonteCarloRemainingAsync(
+            nodes, links, maps, expected, reachability, drivingChain, opts);
+        if (mc) {
+            console.log('[CompletionPrediction] Monte Carlo Results:', {
+                p50: mc.p50Finish,
+                p80: mc.p80Finish,
+                iterations: mc.iterations,
+                source: mc.source || 'js'
+            });
+        }
+
+        const risk = buildRiskSchedules(nodes, links || [], maps, expected, reachability, mc);
+        console.log('[CompletionPrediction] Risk Schedules built:', {
+            p50Impact: risk.p50ImpactDays,
+            p80Impact: risk.p80ImpactDays
+        });
+
+        const crashPlan = buildCrashOptions(nodes, maps, expected, risk, reachability, drivingChain);
+        console.log('[CompletionPrediction] Recovery Optimizer:', {
+            targetDays: crashPlan.targetDays,
+            achievableDays: crashPlan.achievedDays,
+            optionsFound: crashPlan.recoveryOptions.length + crashPlan.lagOptions.length
+        });
+
+        const curves = buildCurves(nodes, maps, expected, risk);
+        console.log('[CompletionPrediction] Curve Diagnostics:', {
+            totalBudgetHours: Math.round(curves.totalBudgetHours),
+            completedHours: Math.round(curves.completedHours),
+            inProgressEarned: Math.round(curves.inProgressEarnedHours),
+            actualEarnedHours: Math.round(curves.actualEarnedHours),
+            statusPct: curves.statusPct.toFixed(1) + '%',
+            plannedCurvePoints: curves.plannedCurve.length,
+            expectedCurvePoints: curves.expectedCurve.length
+        });
+
+        const summary = buildSummary(expected, risk, crashPlan, drivingChain, maps);
+        console.log('[CompletionPrediction] Final Summary:', summary.headline);
+
+        const analysis = {
+            maps,
+            nodes,
+            links: links || [],
+            expected,
+            risk,
+            mc,
+            crashPlan,
+            curves,
+            summary,
+            activeActivities,
+            reachability,
+            drivingChain
+        };
+
+        analysis.recoveryActionCardPayload = buildRecoveryActionCardPayload(analysis);
+        _lastAnalysis = analysis;
+
+        try {
+            const globalState = (typeof window !== 'undefined' ? window.cybereumState : global.cybereumState) || {};
+            globalState.completionPrediction = {
+                statusDate: maps.statusDate,
+                plannedFinish: summary.plannedFinish,
+                expectedFinish: summary.expectedFinish,
+                p50Finish: summary.p50Finish,
+                p80Finish: summary.p80Finish
+            };
+            console.log('[CompletionPrediction] Global state updated.');
+        } catch (e) {
+            console.warn('[CompletionPrediction] Could not update global state:', e);
+        }
+
+        return analysis;
+    }
+
     /** @private Paint yield — lets the loader animate before blocking computation */
     function _yield() { return new Promise(function (r) { requestAnimationFrame(function () { setTimeout(r, 0); }); }); }
 
@@ -5416,7 +5832,10 @@
             if (_loaderReady && useLoader) { try { loader.markStep(0, 'working'); loader.markSource('schedule', true); } catch (_) { } }
             else if (_loaderReady && useInline && el) _advanceInlineStep(el, 0);
 
-            const analysis = analyze(nodes, links);
+            // Async analyze -- Monte Carlo is offloaded to /completion/monte-carlo
+            // when CONFIG.useBackendCompletion is true.  Falls back to in-browser
+            // MC automatically on any backend failure.
+            const analysis = await analyzeAsync(nodes, links);
 
             if (!analysis) {
                 if (_loaderReady && useLoader) { try { loader.status('ERROR'); setTimeout(() => loader.hide(), 1500); } catch (_) { } }
