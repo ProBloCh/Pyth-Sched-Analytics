@@ -1,0 +1,17 @@
+.git
+.github
+.vs
+.gitignore
+.dockerignore
+.env
+.env.*
+tests/
+docs/
+CLAUDE.md
+README.md
+*.pyc
+__pycache__
+venv/
+.venv/
+antenv/
+*.md

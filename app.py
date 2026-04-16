@@ -8,7 +8,6 @@ vectorized operations, and Python 3.12 optimizations
 import os, json, logging, hashlib, time, gc
 from functools import lru_cache
 from datetime import datetime, timezone
-import pickle
 
 # Set BLAS threads to prevent CPU contention with Gunicorn
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -48,6 +47,7 @@ MAX_PATTERNS = int(os.getenv("MAX_PATTERNS", 10))
 # Cache sizing: With multi-minute requests, consider CACHE_SIZE=128+ if hit rate drops below 80%
 CACHE_SIZE = int(os.getenv("CACHE_SIZE", 32))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 120))
+MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", 10 * 1024 * 1024))  # 10 MB
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 ENABLE_SILHOUETTE_OPTIMIZATION = os.getenv("ENABLE_SILHOUETTE_OPTIMIZATION", "false").lower() == "true"
 COMMUNITY_RESOLUTION = float(os.getenv("COMMUNITY_RESOLUTION", 1.0))
@@ -62,6 +62,7 @@ REDIS_CACHE_TTL = int(os.getenv('REDIS_CACHE_TTL', 3600))  # 1 hour default
 ###############################################################################
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = MAX_REQUEST_BYTES
 
 # Set production log level
 log_level = logging.DEBUG if DEBUG else logging.WARNING
@@ -116,7 +117,7 @@ def get_cached_result(key):
             if cached:
                 if DEBUG:
                     logging.info(f"Redis cache hit for key: {key[:8]}...")
-                return pickle.loads(cached)
+                return json.loads(cached)
         except Exception as e:
             if DEBUG:
                 logging.warning(f"Redis get failed: {e}")
@@ -126,7 +127,8 @@ def set_cached_result(key, value, ttl=None):
     """Store in Redis if available"""
     if redis_client:
         try:
-            serialized = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+            serialized = json.dumps(value, default=_json_default,
+                                     separators=(',', ':')).encode('utf-8')
             redis_client.setex(key, ttl or REDIS_CACHE_TTL, serialized)
             if DEBUG:
                 logging.info(f"Cached result in Redis: {key[:8]}...")
@@ -139,6 +141,25 @@ def set_cached_result(key, value, ttl=None):
 ###############################################################################
 # Helpers                                                                     #
 ###############################################################################
+
+def _json_default(obj):
+    """JSON serializer for numpy/pandas types in cache values.
+
+    Raises TypeError for unrecognised types so json.dumps fails fast
+    and the caller's except block skips caching rather than storing
+    silently corrupted data.
+    """
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (datetime, pd.Timestamp)):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 def _sha(payload):
     """Generate cache key from payload"""
@@ -358,13 +379,19 @@ def build_nx_graph(nodes, links):
     if 'ID' not in nodes_df.columns:
         nodes_df['ID'] = range(len(nodes_df))
     
-    # Vectorized date parsing
-    nodes_df['start_date'] = pd.to_datetime(nodes_df.get('Start'), errors='coerce', utc=False)
-    # Remove timezone info if present (future-compatible check)
-    if getattr(nodes_df['start_date'].dtype, 'tz', None) is not None:
-        nodes_df['start_date'] = nodes_df['start_date'].dt.tz_localize(None)
-    
-    nodes_df['duration'] = pd.to_numeric(nodes_df.get('Duration', 1), errors='coerce').fillna(1)
+    # Vectorized date parsing (guard against missing columns)
+    if 'Start' in nodes_df.columns:
+        nodes_df['start_date'] = pd.to_datetime(nodes_df['Start'], errors='coerce', utc=False)
+        # Remove timezone info if present (future-compatible check)
+        if getattr(nodes_df['start_date'].dtype, 'tz', None) is not None:
+            nodes_df['start_date'] = nodes_df['start_date'].dt.tz_localize(None)
+    else:
+        nodes_df['start_date'] = pd.NaT
+
+    if 'Duration' in nodes_df.columns:
+        nodes_df['duration'] = pd.to_numeric(nodes_df['Duration'], errors='coerce').fillna(1)
+    else:
+        nodes_df['duration'] = 1
     
     # Vectorized end date calculation
     nodes_df['end_date'] = nodes_df['start_date'] + pd.to_timedelta(nodes_df['duration'], unit='D', errors='coerce')
@@ -423,9 +450,10 @@ def ensure_dag(G: nx.DiGraph):
             if DEBUG:
                 logging.warning(f"NetworkKit DAG check failed: {e}")
     
-    # Remove cycles using NetworkX
+    # Remove cycles using NetworkX (cap iterations to avoid runaway loops)
+    max_cycle_removals = max(len(G.edges) // 2, 1)
     cycles_removed = 0
-    while True:
+    while cycles_removed < max_cycle_removals:
         try:
             cycle = nx.find_cycle(G, orientation='original')
             u, v = cycle[0][0], cycle[0][1]
@@ -435,6 +463,15 @@ def ensure_dag(G: nx.DiGraph):
                 logging.info(f"Removed edge to break cycle: {u} -> {v}")
         except nx.NetworkXNoCycle:
             break
+
+    if cycles_removed >= max_cycle_removals:
+        # Verify the graph actually still has cycles before warning
+        try:
+            nx.find_cycle(G, orientation='original')
+            logging.warning(f"Cycle removal capped at {max_cycle_removals}. "
+                            f"Graph may still contain cycles.")
+        except nx.NetworkXNoCycle:
+            pass  # all cycles resolved despite hitting the cap
     
     if DEBUG and cycles_removed > 0:
         logging.info(f"Removed {cycles_removed} edges to break cycles")
@@ -477,44 +514,53 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
         
     feats = df[['importanceScore', 'riskScore']].values
     n = len(df)
-    
+
     if n < 2:
         df['Cluster'] = 0
         return df
-    
+
+    # O(n) short-circuit when all feature points are identical (KMeans
+    # would produce convergence warnings and meaningless clusters).
+    if (feats == feats[0]).all():
+        df['Cluster'] = 0
+        return df
+
+    # O(n log n) unique count for k-bounding — negligible vs KMeans cost.
+    unique_count = len(np.unique(feats, axis=0))
+
     # Fast heuristic path (default)
     if not ENABLE_SILHOUETTE_OPTIMIZATION:
-        # Heuristic: sqrt(n/2) clusters, bounded between 2 and 10
-        k = max(2, min(10, int(np.sqrt(n / 2))))
-        
+        # Heuristic: sqrt(n/2) clusters, bounded by [2, 10] and unique_count
+        k = max(2, min(10, int(np.sqrt(n / 2)), unique_count))
+
         if DEBUG:
             logging.info(f"Using heuristic k={k} for {n} nodes (silhouette optimization disabled)")
-        
+
         try:
             df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
         except ValueError:
             df['Cluster'] = 0
         return df
-    
+
     # Silhouette optimization path (only if explicitly enabled)
     if DEBUG:
         logging.info(f"Running silhouette optimization for {n} nodes")
-    
+
     # Early exit for small datasets
     if n <= 15:
-        k = min(3, n)
+        k = min(3, n, unique_count)
         try:
             df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
         except ValueError:
             df['Cluster'] = 0
         return df
-    
+
     # Full silhouette optimization
-    max_clusters = min(10, n)
-    best, k = -1, min(3, n)
-    
+    max_clusters = min(10, n, unique_count)
+    best, k = -1, min(3, n, unique_count)
+
     for c in range(2, max_clusters + 1):
-        if c >= n: 
+        if c >= n:
             break
         try:
             kmeans = KMeans(c, n_init='auto', random_state=0)
@@ -527,14 +573,14 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
                     best, k = sc, c
         except Exception:
             continue
-    
+
     # Guard against edge cases
-    k = min(k, max(1, n))
+    k = min(k, max(1, n), unique_count)
     try:
         df['Cluster'] = KMeans(k, n_init='auto', random_state=0).fit_predict(feats)
     except ValueError:
         df['Cluster'] = 0
-    
+
     return df
 
 def _pca(df):
@@ -545,7 +591,7 @@ def _pca(df):
         return df
         
     arr = df[['importanceScore', 'riskScore']].values
-    if len(arr) > 1:
+    if len(arr) > 1 and len(np.unique(arr, axis=0)) > 1:
         df[['pca1', 'pca2']] = PCA(2).fit_transform(arr)
     else:
         df['pca1'] = 0
@@ -945,9 +991,10 @@ def graph_metrics():
     if not nodes:
         return jsonify({'error': 'No nodes provided'}), 400
     
-    # Generate cache key
+    # Generate cache key (v2 prefix avoids reading stale pickle-serialized
+    # entries left by the pre-JSON caching code during a rolling deploy)
     key = _sha([nodes, links])
-    redis_key = f"graph:{key}"
+    redis_key = f"graph:v2:{key}"
     
     # Try Redis cache first
     cached_result = get_cached_result(redis_key)
@@ -961,17 +1008,20 @@ def graph_metrics():
         logging.info(f"Processing graph with {len(nodes)} nodes and {len(links)} links")
     
     try:
-        # Use in-memory LRU cache as second level
-        res = _cached(
+        # Use in-memory LRU cache as second level.
+        # Build a NEW dict via {**...} so the @lru_cache'd object is never
+        # mutated — not even at the top level.  Nested values (nodes list,
+        # work_packages dict) are shared references, which is safe because
+        # jsonify() only reads.
+        cached_res = _cached(
             json.dumps(nodes, sort_keys=True, default=str),
             json.dumps(links, sort_keys=True, default=str)
         )
-        res['cache_key'] = key
-        res['cache_hit'] = False
-        
+        res = {**cached_res, 'cache_key': key, 'cache_hit': False}
+
         # Store in Redis for other instances
         set_cached_result(redis_key, res)
-        
+
         # Log processing time
         elapsed = time.time() - start_time
         if DEBUG or elapsed > 5:
