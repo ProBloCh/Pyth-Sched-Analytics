@@ -519,12 +519,14 @@ def _cluster_risk_kmeans(df: pd.DataFrame):
         df['Cluster'] = 0
         return df
 
-    # Short-circuit when all feature points are identical (KMeans would
-    # produce convergence warnings and meaningless clusters).
-    unique_count = len(np.unique(feats, axis=0))
-    if unique_count < 2:
+    # O(n) short-circuit when all feature points are identical (KMeans
+    # would produce convergence warnings and meaningless clusters).
+    if (feats == feats[0]).all():
         df['Cluster'] = 0
         return df
+
+    # O(n log n) unique count for k-bounding — negligible vs KMeans cost.
+    unique_count = len(np.unique(feats, axis=0))
 
     # Fast heuristic path (default)
     if not ENABLE_SILHOUETTE_OPTIMIZATION:
