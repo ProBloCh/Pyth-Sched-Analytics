@@ -90,52 +90,56 @@ Content-Type: application/json
 Each object in the `nodes` array contains all original input fields plus
 computed fields.  NaN values are serialized as `null`.
 
+#### Input Fields (preserved)
+
 | Key | Type | Description |
 |---|---|---|
 | `ID` | `string` | Activity identifier. |
 | `Duration` | `float` | Activity duration. |
-| `importanceScore` | `float` | Importance score (input or default). |
-| `riskScore` | `float` | Risk score (input or default). |
-| `avgWeightedRisk` | `float` | Average weighted risk (input or default). |
+| `importanceScore` | `float` | Importance score (input or default 5). |
+| `riskScore` | `float` | Risk score (input or default 5). |
+| `avgWeightedRisk` | `float` | Average weighted risk (input or default 0). |
 | `Resources` | `string` | Resource assignment text. |
 | `Dependencies` | `string` | Comma-separated predecessor IDs. |
 | `TaskType` | `string` | Activity type label. |
-| `CommunityGroup` | `int` or `string` | Single-resolution community ID (Louvain at `COMMUNITY_RESOLUTION`). |
-| `DependencyGroup` | `string` | Dependency-based group label. |
-| `DependencyGroupType` | `string` | Grouping method used (`"component"`, `"louvain"`, etc.). |
-| `PC1` | `float` | First PCA component (risk/importance space). |
-| `PC2` | `float` | Second PCA component. |
-| `PC3` | `float` | Third PCA component. |
-| `hdbscan_cluster` | `int` | HDBSCAN cluster ID. `-1` for outliers. |
-| `is_outlier` | `boolean` | `true` if classified as HDBSCAN outlier. |
-| `centrality_betweenness` | `float` | Betweenness centrality. |
-| `centrality_closeness` | `float` | Closeness centrality. |
-| `centrality_pagerank` | `float` | PageRank centrality. |
-| `centrality_eigenvector` | `float` | Eigenvector centrality. |
-| `risk_propagated` | `float` | Risk score after network propagation. |
-| `total_float` | `float` | Total float (slack) from CPM. `0` if CPM did not run. |
 
-**Note:** Any additional fields present in the input nodes are preserved
-and returned as-is.
+Any additional fields present in the input nodes are preserved and
+returned as-is.
+
+#### Computed Fields
+
+| Key | Type | Description |
+|---|---|---|
+| `Cluster` | `int` | HDBSCAN cluster ID (falls back to K-means). Noise points are reassigned to nearest cluster. |
+| `pca1` | `float` | First PCA component (risk/importance space). |
+| `pca2` | `float` | Second PCA component. |
+| `DependencyCluster` | `int` | Dependency-based group ID (Louvain on dependency graph). |
+| `CommunityGroup` | `int` | Single-resolution community ID (Louvain at `COMMUNITY_RESOLUTION`). |
+| `PageRank` | `float` | PageRank centrality (damping 0.9). |
+| `closeness_centrality` | `float` | Closeness centrality (harmonic for directed graphs). |
+| `degree_centrality` | `float` | Normalized degree centrality. |
+| `Clustering_Coefficient` | `float` | Local clustering coefficient (on undirected projection). |
+| `propagated_risk` | `float` | Risk after network propagation (intrinsic + inherited). |
+| `risk_transmission` | `float` | Outgoing risk flow to successors. |
+| `coupling_density` | `float` | Fraction of community members that are direct neighbours. |
+| `total_float` | `float` | Total float (slack) from CPM. `0` if CPM did not run. |
 
 ---
 
 ### Work Packages
 
-Object keyed by work package name.
+Object keyed by package name (`Package_{cluster_id}`).  Packages are
+derived from HDBSCAN clustering — each cluster becomes a work package.
+Packages are only created for clusters that have valid start/end dates.
 
 ```jsonc
 {
-  "WP-001": {
-    "activities": ["A1", "A2", "A3"],       // Activity IDs in this package.
-    "duration": 45.0,                        // Sum of activity durations.
-    "float": 5.0,                            // Minimum float in the package.
-    "critical": true,                        // true if any activity is on the critical path.
-    "start_date": "2024-01-15",              // Earliest start date (from input Start fields).
-    "end_date": "2024-03-01",                // Latest end date (from input End fields).
-    "dependencies": ["A0", "B2"],            // All predecessor IDs outside this package.
-    "external_dependencies": ["A0", "B2"],   // Same as dependencies (external only).
-    "internal_dependencies": ["A1"]          // Predecessors within this package.
+  "Package_0": {
+    "tasks": ["A1", "A2", "A3"],             // Activity IDs in this package.
+    "critical_path": ["A1", "A3"],           // Longest path within the package subgraph.
+    "critical_path_length": 25.0,            // Duration of the package's internal critical path.
+    "start": "2024-01-15T00:00:00",          // Earliest start date (ISO 8601). null if no dates.
+    "end": "2024-03-01T00:00:00"             // Latest end date (ISO 8601). null if no dates.
   }
 }
 ```
@@ -144,14 +148,17 @@ Object keyed by work package name.
 
 ### Templates
 
-Object keyed by template name.  Contains repeating activity patterns
-detected via name/type similarity.
+Object keyed by template name (`Template_{index}`).  Contains repeating
+activity patterns detected via name/type similarity.
 
 ```jsonc
 {
-  "Install Equipment": {
-    "instances": ["A1", "A5", "A9"],  // Activity IDs matching this pattern.
-    "similarity_score": 0.85          // Cosine similarity of the group.
+  "Template_0": {
+    "average_duration": 12.5,                  // Mean duration of matched activities.
+    "duration_variance": 4.2,                  // Variance of durations (0.0 if single match).
+    "most_common_resources": ["Crew A"],       // Mode of resource assignments.
+    "dependency_links": ["A0"],                // Mode of dependency strings.
+    "task_frequency": 5                        // Number of activities matching this pattern.
   }
 }
 ```
@@ -202,11 +209,43 @@ DCMA-based schedule health assessment.
 
 | Key | Type | Description |
 |---|---|---|
-| `hierarchy` | `array` | Containment hierarchy across resolution tiers. |
-| `resolutions` | `array` | Community assignments at each resolution level. |
-| `resolution_values` | `array<float>` | Gamma values used (default: `[0.3, 1.0, 2.5, 4.0]`). |
-| `stability_scores` | `array<float>` | NMI stability score for each resolution. |
-| `best_resolution` | `int` | Index of the most stable resolution in `resolution_values`. |
+| `graph_stats` | `object` | `{n_nodes, n_edges, density}` — basic graph statistics. |
+| `levels` | `array<object>` | Community assignments at each resolution level (see below). |
+| `hierarchy` | `object` | Containment hierarchy across adjacent tiers (see below). |
+| `stable_cores` | `array<array<string>>` | Groups of activity IDs that cluster together at every resolution tier. |
+
+**Level entry** (one per resolution in the adaptive ladder, default
+gamma = 0.3, 1.0, 2.5, 4.0):
+
+```jsonc
+{
+  "resolution": 1.0,                          // Louvain gamma value
+  "n_communities": 8,                         // Number of communities at this resolution
+  "modularity": 0.42,                         // Louvain modularity score
+  "stability_nmi": 0.85,                      // NMI stability across n_runs
+  "membership": {"A1": 0, "A2": 0, "A3": 1}, // Node-to-community mapping
+  "group_metrics": {                          // Per-community metrics
+    "0": {
+      "size": 15,                             // Number of members
+      "internal_edges": 28,                   // Edges within community
+      "boundary_edges": 12,                   // Edges crossing community boundary
+      "density": 0.267                        // Internal edge density
+    }
+  }
+}
+```
+
+**Hierarchy** — keyed by `tier_{i}_to_{i+1}`, each value is an array of
+containment edges between adjacent resolution tiers:
+
+```jsonc
+{
+  "tier_0_to_1": [
+    {"parent": 0, "child": 2, "overlap": 0.85},
+    {"parent": 0, "child": 3, "overlap": 0.72}
+  ]
+}
+```
 
 ---
 

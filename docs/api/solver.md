@@ -259,6 +259,7 @@ Content-Type: application/json
 ```jsonc
 {
   "iteration": 1,
+  "weighted_objective": 0.853,     // Scalar weighted-sum objective value
   "objectives": {
     "schedule": 140.0,
     "cost": 2550000.0
@@ -330,26 +331,37 @@ Uses Sobol quasi-Monte Carlo with five-tier risk distributions.
 | `black_swans` | `array<object>` | Activities with extreme tail behavior (see below). |
 | `dragon_kings` | `array<object>` | Outlier-among-outliers per Sornette (2009) (see below). |
 | `sra` | `object` | Schedule Risk Analysis indices (see [SRA](#sra)). |
-| `cost_schedule_joint` | `object` or `null` | 2D cost-schedule clustering. `null` if `cost` not in disciplines. See [Cost-Schedule Joint](#cost-schedule-joint). |
+| `cost_schedule_joint` | `object` or `null` | 2D cost-schedule clustering. `null` if `cost` or `schedule` not in disciplines, or fewer than 6 MC samples. See [Cost-Schedule Joint](#cost-schedule-joint). |
 
 ### Black Swan Entry
+
+Activities that regularly hit the duration cap (within 5% of cap value)
+in >= 10% of MC scenarios.
 
 ```jsonc
 {
   "activity_id": "A5",
-  "max_multiplier": 3.2,       // Largest raw duration multiplier observed
-  "exceedance_count": 12,      // Samples near the cap (>= 95% of cap)
-  "cap_hit_fraction": 0.12     // Fraction of samples near cap
+  "risk_score": 7.5,            // Original risk score (0-10)
+  "risk_tier": "birnbaum_saunders", // Distribution tier label
+  "cap_hit_rate": 0.12,         // Fraction of samples near cap (>= 95% of cap)
+  "max_multiplier": 3.2,        // Largest raw duration multiplier observed
+  "mean_multiplier": 1.45,      // Mean multiplier across all samples
+  "cap_value": 3.5              // Duration cap for this activity
 }
 ```
 
 ### Dragon King Entry
 
+Activities where the worst-case multiplier exceeds mean + 4 sigma AND
+the multiplier exceeds 2x (Sornette, 2009).
+
 ```jsonc
 {
   "activity_id": "A5",
-  "multiplier": 3.2,            // The extreme multiplier value
-  "sigma_above_mean": 4.1       // Standard deviations above the mean multiplier
+  "risk_score": 7.5,            // Original risk score (0-10)
+  "max_multiplier": 3.2,        // The extreme multiplier value
+  "mean_multiplier": 1.3,       // Mean multiplier for this activity
+  "sigma_excess": 4.1           // Standard deviations above the mean multiplier
 }
 ```
 
@@ -367,14 +379,30 @@ Schedule Risk Analysis indices from Monte Carlo simulation.
 ### Cost-Schedule Joint
 
 2D clustering of cost and schedule overruns (Natarajan et al., PMJ 2022).
-`null` when `cost` is not in the active disciplines.
+`null` when `cost` or `schedule` is not in the active disciplines, or when
+fewer than 6 MC samples are available.
 
 | Key | Type | Description |
 |---|---|---|
-| `clusters` | `array` | K-means cluster assignments and centroids. |
+| `clusters` | `array<object>` | K-means cluster results (3 clusters). See below. |
 | `correlation` | `float` | Pearson correlation between schedule and cost overruns. |
-| `schedule_overrun` | `object` | `{mean, std, p95}` — schedule overrun statistics. |
-| `cost_overrun` | `object` | `{mean, std, p95}` — cost overrun statistics. |
+| `schedule_overrun` | `object` | `{mean, std, p95}` — schedule overrun ratio statistics. |
+| `cost_overrun` | `object` | `{mean, std, p95}` — cost overrun ratio statistics. |
+
+**Cluster entry:**
+
+```jsonc
+{
+  "cluster_id": 0,
+  "label": "nominal",                   // "nominal", "schedule_dominated", "cost_dominated", or "coupled"
+  "n_scenarios": 65,                     // Number of MC samples in this cluster
+  "pct_scenarios": 0.65,                 // Fraction of total samples
+  "schedule_overrun_mean": 0.02,         // Mean schedule overrun ratio in cluster
+  "schedule_overrun_max": 0.15,          // Max schedule overrun ratio in cluster
+  "cost_overrun_mean": 0.03,             // Mean cost overrun ratio in cluster
+  "cost_overrun_max": 0.18               // Max cost overrun ratio in cluster
+}
+```
 
 ---
 
