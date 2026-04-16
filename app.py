@@ -451,7 +451,7 @@ def ensure_dag(G: nx.DiGraph):
                 logging.warning(f"NetworkKit DAG check failed: {e}")
     
     # Remove cycles using NetworkX (cap iterations to avoid runaway loops)
-    max_cycle_removals = max(len(G.edges) // 2, 100)
+    max_cycle_removals = max(len(G.edges) // 2, 1)
     cycles_removed = 0
     while cycles_removed < max_cycle_removals:
         try:
@@ -465,8 +465,13 @@ def ensure_dag(G: nx.DiGraph):
             break
 
     if cycles_removed >= max_cycle_removals:
-        logging.warning(f"Cycle removal capped at {max_cycle_removals}. "
-                        f"Graph may still contain cycles.")
+        # Verify the graph actually still has cycles before warning
+        try:
+            nx.find_cycle(G, orientation='original')
+            logging.warning(f"Cycle removal capped at {max_cycle_removals}. "
+                            f"Graph may still contain cycles.")
+        except nx.NetworkXNoCycle:
+            pass  # all cycles resolved despite hitting the cap
     
     if DEBUG and cycles_removed > 0:
         logging.info(f"Removed {cycles_removed} edges to break cycles")

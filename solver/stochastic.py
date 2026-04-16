@@ -91,7 +91,7 @@ def run_ensemble(dag_state, params, project_ctx, config):
     # were excluded from the per-sample loop to avoid O(M*n) CPM runs.
     if expensive_fd:
         logger.info("Resource FD budget exceeded (n*M=%d > %d); "
-                    "computing resource gradients on mean state",
+                    "computing resource gradients on original/nominal state",
                     n * M, _FD_BUDGET)
         res_grads = compute_gradients(dag_state, params, project_ctx,
                                       ['resources'])
