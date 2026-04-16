@@ -352,3 +352,137 @@ class TestConfig:
         assert c.iterations == 250
         assert c.fat_tail_from == 0.45
         assert c.max_mult_high == 10.0
+
+
+# =====================================================================
+# Working calendar
+# =====================================================================
+
+from completion.calendar import WorkingCalendar, advance_working_ms
+
+MON_EPOCH = 1736121600000.0  # 2025-01-06 00:00 UTC (Monday)
+
+
+class TestWorkingCalendar:
+
+    def test_advance_weekdays_no_holidays(self):
+        cal = WorkingCalendar.build(8.0, {1, 2, 3, 4, 5}, [],
+                                    MON_EPOCH, horizon_days=30)
+        # 40 working hours = 5 working days -> next Mon 00:00
+        finish = advance_working_ms(MON_EPOCH, 40.0, cal)
+        assert _ms_to_iso(finish).startswith('2025-01-13')
+
+    def test_weekend_start_normalizes_forward(self):
+        cal = WorkingCalendar.build(8.0, {1, 2, 3, 4, 5}, [],
+                                    MON_EPOCH, horizon_days=30)
+        sat_ms = MON_EPOCH + 5 * 86_400_000.0  # Saturday 2025-01-11
+        finish = advance_working_ms(sat_ms, 40.0, cal)
+        # Start Sat (no hours accrued), 5 working days -> Mon 2025-01-20
+        assert _ms_to_iso(finish).startswith('2025-01-20')
+
+    def test_holiday_skipped(self):
+        cal = WorkingCalendar.build(8.0, {1, 2, 3, 4, 5},
+                                    ['2025-01-08'], MON_EPOCH, 30)
+        # Wed is holiday: 40h = Mon+Tue+Thu+Fri+Mon -> Tue 01-14 start
+        finish = advance_working_ms(MON_EPOCH, 40.0, cal)
+        assert _ms_to_iso(finish).startswith('2025-01-14')
+
+    def test_zero_hours_is_passthrough(self):
+        cal = WorkingCalendar.build(8.0, {1, 2, 3, 4, 5}, [],
+                                    MON_EPOCH, horizon_days=30)
+        # On a weekend, zero work should stay on the weekend (JS semantics).
+        sat_ms = MON_EPOCH + 5 * 86_400_000.0
+        assert advance_working_ms(sat_ms, 0.0, cal) == sat_ms
+
+    def test_vectorised_advance_broadcasts(self):
+        import numpy as np
+        cal = WorkingCalendar.build(8.0, {1, 2, 3, 4, 5}, [],
+                                    MON_EPOCH, horizon_days=30)
+        starts = np.full(4, MON_EPOCH)
+        works = np.array([0.0, 8.0, 16.0, 40.0])
+        finishes = advance_working_ms(starts, works, cal)
+        assert finishes.shape == (4,)
+        assert finishes[0] == MON_EPOCH                     # passthrough
+        assert _ms_to_iso(finishes[1]).startswith('2025-01-07')  # +1wd
+        assert _ms_to_iso(finishes[2]).startswith('2025-01-08')  # +2wd
+        assert _ms_to_iso(finishes[3]).startswith('2025-01-13')  # +5wd
+
+
+class TestCalendarPath:
+    """End-to-end completion MC tests with calendar enabled."""
+
+    def test_days_mean_working_days_under_calendar(self):
+        """10 'days' with 5x8 calendar = 10 working days = 2 calendar weeks."""
+        r = run_completion_mc(
+            [{'ID': 'A', 'Duration': 10, 'TimeUnits': 'days'}],
+            [], '2025-01-06T00:00:00Z',
+            project_context={'calendar': {'hours_per_day': 8,
+                                          'working_days': [1, 2, 3, 4, 5]}},
+            config={'iterations': 50, 'enable_risk': False})
+        # 10 working days from Mon 01-06 -> next Mon 01-20 00:00
+        assert r['expected_finish'].startswith('2025-01-20')
+
+    def test_calendar_path_preserves_percentile_monotonicity(self):
+        r = run_completion_mc(
+            [{'ID': 'A', 'Duration': 20, 'TimeUnits': 'days',
+              'riskScore': 0.6}],
+            [], '2025-01-06T00:00:00Z',
+            project_context={'calendar': {'hours_per_day': 8,
+                                          'working_days': [1, 2, 3, 4, 5]}},
+            config={'iterations': 200, 'seed': 42})
+        p20 = _parse_iso_to_ms(r['p20_finish'])
+        p50 = _parse_iso_to_ms(r['p50_finish'])
+        p80 = _parse_iso_to_ms(r['p80_finish'])
+        assert p20 <= p50 <= p80
+
+    def test_calendar_vs_wallclock_gives_later_finish(self):
+        """Same 10 days -- calendar path should land later than wall-clock
+        (weekends delay finish), all else equal."""
+        params = {'nodes': [{'ID': 'A', 'Duration': 10, 'TimeUnits': 'days'}],
+                  'links': [], 'status_date': '2025-01-06T00:00:00Z',
+                  'config': {'iterations': 50, 'enable_risk': False}}
+        wall = run_completion_mc(**params)
+        cal = run_completion_mc(**{**params,
+                                   'project_context': {'calendar': {
+                                       'hours_per_day': 8,
+                                       'working_days': [1, 2, 3, 4, 5]}}})
+        assert _parse_iso_to_ms(cal['expected_finish']) > \
+            _parse_iso_to_ms(wall['expected_finish'])
+
+    def test_holiday_delays_calendar_finish(self):
+        base_ctx = {'calendar': {'hours_per_day': 8,
+                                 'working_days': [1, 2, 3, 4, 5]}}
+        with_hol = dict(base_ctx, calendar={**base_ctx['calendar'],
+                                            'holidays': ['2025-01-08']})
+        params = {'nodes': [{'ID': 'A', 'Duration': 5, 'TimeUnits': 'days'}],
+                  'links': [], 'status_date': '2025-01-06T00:00:00Z',
+                  'config': {'iterations': 50, 'enable_risk': False}}
+        no_hol = run_completion_mc(**params, project_context=base_ctx)
+        with_hol_r = run_completion_mc(**params, project_context=with_hol)
+        assert _parse_iso_to_ms(with_hol_r['expected_finish']) > \
+            _parse_iso_to_ms(no_hol['expected_finish'])
+
+    def test_fs_lag_routed_through_calendar(self):
+        """With calendar, a 24h lag = 3 working days (not 1 calendar day)."""
+        r = run_completion_mc(
+            nodes=[{'ID': 'A', 'Duration': 5, 'TimeUnits': 'days'},
+                   {'ID': 'B', 'Duration': 1, 'TimeUnits': 'days'}],
+            links=[{'source': 'A', 'target': 'B',
+                    'type': 'FS', 'lag': 24}],
+            status_date='2025-01-06T00:00:00Z',
+            project_context={'calendar': {'hours_per_day': 8,
+                                          'working_days': [1, 2, 3, 4, 5]}},
+            config={'iterations': 50, 'enable_risk': False})
+        # A: 5wd ends Mon 01-13 00:00; +24wh lag = Thu 01-16 00:00;
+        # B: +8h = Fri 01-17 00:00.
+        assert r['expected_finish'].startswith('2025-01-17')
+
+    def test_no_calendar_config_falls_back_to_v1(self):
+        """Without any calendar fields in project_context, behaviour is V1."""
+        r = run_completion_mc(
+            [{'ID': 'A', 'Duration': 10, 'TimeUnits': 'days'}],
+            [], '2025-01-06T00:00:00Z',
+            project_context={'phase': 'construction'},  # no calendar key
+            config={'iterations': 50, 'enable_risk': False})
+        # Wall-clock 10 days
+        assert r['expected_finish'].startswith('2025-01-16')

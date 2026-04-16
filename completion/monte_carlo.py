@@ -30,6 +30,9 @@ from solver.stochastic import (
     _compute_raw_multipliers,
     _fat_tail_thresholds,
 )
+from .calendar import (
+    WorkingCalendar, advance_working_ms, estimate_horizon_days,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -107,9 +110,8 @@ def _ms_to_iso(ms):
 def _duration_to_ms(dur, time_units):
     """Convert (Duration, TimeUnits) to wall-clock milliseconds.
 
-    V1 interprets duration as wall-clock time (no working calendar).
-    Durations in 'days' map to 24-hour calendar days, not 8-hour work
-    days.  A future working-calendar extension would plug in here.
+    Used on the no-calendar path -- durations in 'days' map to 24-hour
+    calendar days.
     """
     try:
         d = float(dur)
@@ -126,8 +128,33 @@ def _duration_to_ms(dur, time_units):
         return d * _MS_PER_DAY * 7.0
     if unit in ('m', 'mo', 'month', 'months'):
         return d * _MS_PER_DAY * 30.0
-    # Default convention matches solver/dag.py: duration treated as hours
     return d * _MS_PER_HOUR
+
+
+def _duration_to_work_hours(dur, time_units, hours_per_day):
+    """Convert (Duration, TimeUnits) to working hours.
+
+    Used on the calendar path -- durations in 'days' map to working days
+    (e.g., 8 hours under a standard 5x8 calendar).  Matches the frontend
+    convertToHours() convention (PathScripts.js): weeks = hpd * 5,
+    months = hpd * 21.
+    """
+    try:
+        d = float(dur)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(d) or d < 0:
+        return 0.0
+    unit = str(time_units or 'h').strip().lower()
+    if unit in ('h', 'hr', 'hrs', 'hour', 'hours'):
+        return d
+    if unit in ('d', 'day', 'days'):
+        return d * hours_per_day
+    if unit in ('w', 'wk', 'week', 'weeks'):
+        return d * hours_per_day * 5.0
+    if unit in ('m', 'mo', 'month', 'months'):
+        return d * hours_per_day * 21.0
+    return d  # unknown -> treat as hours
 
 
 def _risk_01(node, metadata_entry):
@@ -177,12 +204,18 @@ def _activity_type(node, metadata_entry):
 # Scope & per-activity state
 # ---------------------------------------------------------------------------
 
-def _build_scope(nodes, dag_state, id_to_idx, status_ms, activity_metadata):
+def _build_scope(nodes, dag_state, id_to_idx, status_ms, activity_metadata,
+                 calendar):
     """
     Build per-activity arrays aligned to DAG indices.
 
+    When *calendar* is None, ``remaining`` is in wall-clock milliseconds.
+    When *calendar* is a WorkingCalendar, ``remaining`` is in working
+    hours (to be advanced through the calendar by the propagation
+    helpers).
+
     Returns:
-        remaining_ms   : (n,) float64  -- 0 for finished activities
+        remaining      : (n,) float64  -- ms (no-calendar) or work-hrs (calendar)
         earliest_start : (n,) float64  -- ms, clamped to status_ms
         risk           : (n,) float64  -- 0..1
         activity_types : list[str]     -- lowercased
@@ -190,7 +223,7 @@ def _build_scope(nodes, dag_state, id_to_idx, status_ms, activity_metadata):
         actual_finish  : (n,) float64  -- NaN unless ActualFinish given
     """
     n = dag_state.n
-    remaining_ms = np.zeros(n, dtype=np.float64)
+    remaining = np.zeros(n, dtype=np.float64)
     earliest_start = np.full(n, status_ms, dtype=np.float64)
     risk = np.zeros(n, dtype=np.float64)
     activity_types = ['standard'] * n
@@ -204,18 +237,19 @@ def _build_scope(nodes, dag_state, id_to_idx, status_ms, activity_metadata):
         j = id_to_idx[nid]
         meta = (activity_metadata or {}).get(nid, {})
 
-        # Already-finished activities have no remaining uncertainty
         af = _parse_iso_to_ms(node.get('ActualFinish'))
         if af is not None:
             actual_finish_ms[j] = af
             continue
 
-        total_ms = _duration_to_ms(
-            node.get('Duration', node.get('duration', 0)),
-            node.get('TimeUnits', node.get('timeUnits')),
-        )
+        dur_val = node.get('Duration', node.get('duration', 0))
+        dur_units = node.get('TimeUnits', node.get('timeUnits'))
+        if calendar is None:
+            total = _duration_to_ms(dur_val, dur_units)
+        else:
+            total = _duration_to_work_hours(dur_val, dur_units,
+                                            calendar.hours_per_day)
 
-        # PercentComplete: accept 0..1 or 0..100
         pct_raw = node.get('PercentComplete', node.get('percentComplete', 0))
         try:
             pct = float(pct_raw)
@@ -225,11 +259,11 @@ def _build_scope(nodes, dag_state, id_to_idx, status_ms, activity_metadata):
             pct /= 100.0
         pct = max(0.0, min(1.0, pct))
 
-        remaining = total_ms * (1.0 - pct) if pct > 0 else total_ms
-        if remaining <= 0:
+        rem = total * (1.0 - pct) if pct > 0 else total
+        if rem <= 0:
             continue
 
-        remaining_ms[j] = remaining
+        remaining[j] = rem
         in_scope[j] = True
 
         exp_start = _parse_iso_to_ms(node.get('ExpectedStart',
@@ -240,7 +274,7 @@ def _build_scope(nodes, dag_state, id_to_idx, status_ms, activity_metadata):
         risk[j] = _risk_01(node, meta)
         activity_types[j] = _activity_type(node, meta)
 
-    return (remaining_ms, earliest_start, risk, activity_types, in_scope,
+    return (remaining, earliest_start, risk, activity_types, in_scope,
             actual_finish_ms)
 
 
@@ -262,12 +296,14 @@ def _duration_sensitive_cap(risk, dur_days, base, high):
     return base + (high - base) * t
 
 
-def _sample_multipliers(risk, activity_types, remaining_ms, config):
+def _sample_multipliers(risk, activity_types, remaining, calendar, config):
     """
     Generate an (M, n) matrix of capped duration multipliers via the
     five-tier model from solver/stochastic.py.
 
-    Returns (mult, M_actual).
+    ``remaining`` is either wall-clock ms (no calendar) or working hours
+    (calendar); *calendar* disambiguates when computing the per-activity
+    duration in days for the cap heuristic.
     """
     n = len(risk)
     if not config.enable_risk or n == 0:
@@ -280,9 +316,6 @@ def _sample_multipliers(risk, activity_types, remaining_ms, config):
 
     fat_thresh = _fat_tail_thresholds(activity_types, n)
 
-    # Tiled call: (M*n,) flatten gives raw multipliers for all (sample,activity)
-    # pairs in one vectorised pass.  Ravel is row-major, so element (m*n+j)
-    # corresponds to sample m, activity j -- which matches np.tile(risk, M).
     risk_tile = np.tile(risk, M)
     fat_tile = np.tile(fat_thresh, M)
     mult_flat = _compute_raw_multipliers(
@@ -290,11 +323,13 @@ def _sample_multipliers(risk, activity_types, remaining_ms, config):
     )
     mult = mult_flat.reshape(M, n)
 
-    # Duration-sensitive caps per activity (shape (n,))
-    dur_days = remaining_ms / _MS_PER_DAY
+    if calendar is None:
+        dur_days = remaining / _MS_PER_DAY
+    else:
+        # Working hours -> working-day count (matches JS durDays definition).
+        dur_days = remaining / max(calendar.hours_per_day, 1e-9)
     caps = _duration_sensitive_cap(risk, dur_days,
                                    config.max_mult_base, config.max_mult_high)
-    # Gate activities below the noise floor to exactly 1.0
     below_floor = risk <= config.no_risk_below
     if np.any(below_floor):
         mult[:, below_floor] = 1.0
@@ -309,12 +344,31 @@ def _sample_multipliers(risk, activity_types, remaining_ms, config):
 # Vectorised topological propagation
 # ---------------------------------------------------------------------------
 
-def _propagate_finish_ms(dag_state, remaining_ms, earliest_start_ms,
-                         status_ms, mult_all):
+def _advance(start_ms, work, calendar):
+    """
+    Advance start_ms by the per-activity work amount.
+
+    On the no-calendar path, *work* is milliseconds and we add directly.
+    On the calendar path, *work* is working hours and we route through
+    ``advance_working_ms``.  Link lag is always interpreted as working
+    hours when a calendar is present (matching the JS
+    lagUsesWorkingCalendar default), otherwise as wall-clock hours
+    converted to ms.  That conversion happens at the call site, not
+    here -- this helper only knows about the per-activity duration step.
+    """
+    if calendar is None:
+        return start_ms + work
+    return advance_working_ms(start_ms, work, calendar)
+
+
+def _propagate_finish_ms(dag_state, remaining, earliest_start_ms,
+                         status_ms, mult_all, calendar):
     """
     Walk the DAG in topological order, broadcasting start/finish times
-    over all M samples simultaneously.  Link lag is interpreted in hours
-    (matching the JS getLagInHours convention).
+    over all M samples simultaneously.
+
+    ``remaining`` is ms (no-calendar path) or working hours (calendar
+    path); ``mult_all`` multiplies it element-wise.
 
     Returns sim_start_ms, sim_finish_ms of shape (M, n).
     """
@@ -329,30 +383,36 @@ def _propagate_finish_ms(dag_state, remaining_ms, earliest_start_ms,
 
         for idx, p in enumerate(dag_state.pred[j]):
             lag, rel = dag_state.pred_edges[j][idx]
-            lag_ms = lag * _MS_PER_HOUR
+            if calendar is None:
+                lag_shift_from_finish = sim_finish[:, p] + lag * _MS_PER_HOUR
+                lag_shift_from_start = sim_start[:, p] + lag * _MS_PER_HOUR
+            else:
+                lag_shift_from_finish = advance_working_ms(
+                    sim_finish[:, p], lag, calendar)
+                lag_shift_from_start = advance_working_ms(
+                    sim_start[:, p], lag, calendar)
+
             if rel == 'FS':
-                np.maximum(start, sim_finish[:, p] + lag_ms, out=start)
+                np.maximum(start, lag_shift_from_finish, out=start)
             elif rel == 'SS':
-                np.maximum(start, sim_start[:, p] + lag_ms, out=start)
+                np.maximum(start, lag_shift_from_start, out=start)
             elif rel == 'FF':
-                np.maximum(req_finish, sim_finish[:, p] + lag_ms,
-                           out=req_finish)
+                np.maximum(req_finish, lag_shift_from_finish, out=req_finish)
             elif rel == 'SF':
-                np.maximum(req_finish, sim_start[:, p] + lag_ms,
-                           out=req_finish)
+                np.maximum(req_finish, lag_shift_from_start, out=req_finish)
 
         np.maximum(start, status_ms, out=start)
         sim_start[:, j] = start
 
-        finish = start + remaining_ms[j] * mult_all[:, j]
+        finish = _advance(start, remaining[j] * mult_all[:, j], calendar)
         np.maximum(finish, req_finish, out=finish)
         sim_finish[:, j] = finish
 
     return sim_start, sim_finish
 
 
-def _deterministic_finish_ms(dag_state, remaining_ms, earliest_start_ms,
-                             status_ms):
+def _deterministic_finish_ms(dag_state, remaining, earliest_start_ms,
+                             status_ms, calendar):
     """Single forward pass with multiplier = 1.0 (no risk inflation)."""
     n = dag_state.n
     start = np.empty(n, dtype=np.float64)
@@ -363,22 +423,90 @@ def _deterministic_finish_ms(dag_state, remaining_ms, earliest_start_ms,
         rf = -np.inf
         for idx, p in enumerate(dag_state.pred[j]):
             lag, rel = dag_state.pred_edges[j][idx]
-            lag_ms = lag * _MS_PER_HOUR
+            if calendar is None:
+                pf = finish[p] + lag * _MS_PER_HOUR
+                ps = start[p] + lag * _MS_PER_HOUR
+            else:
+                pf = float(advance_working_ms(finish[p], lag, calendar))
+                ps = float(advance_working_ms(start[p], lag, calendar))
             if rel == 'FS':
-                s = max(s, finish[p] + lag_ms)
+                s = max(s, pf)
             elif rel == 'SS':
-                s = max(s, start[p] + lag_ms)
+                s = max(s, ps)
             elif rel == 'FF':
-                rf = max(rf, finish[p] + lag_ms)
+                rf = max(rf, pf)
             elif rel == 'SF':
-                rf = max(rf, start[p] + lag_ms)
+                rf = max(rf, ps)
         s = max(s, status_ms)
         start[j] = s
-        f = s + remaining_ms[j]
+        f = float(_advance(np.array([s]), np.array([remaining[j]]),
+                           calendar)[0]) if calendar is not None \
+            else s + remaining[j]
         if np.isfinite(rf):
             f = max(f, rf)
         finish[j] = f
     return start, finish
+
+
+# ---------------------------------------------------------------------------
+# Calendar construction
+# ---------------------------------------------------------------------------
+
+def _maybe_build_calendar(nodes, dag_state, id_to_idx, status_ms,
+                          activity_metadata, project_context):
+    """
+    Build a WorkingCalendar if project_context.calendar is supplied with
+    sufficient information, else return None (wall-clock fall-back).
+
+    A calendar is constructed when the context contains any of
+    ``hours_per_day``, ``working_days``, or ``holidays``; if none are
+    present the endpoint behaves as V1 (wall-clock time).
+    """
+    ctx = project_context or {}
+    if not isinstance(ctx, dict):
+        return None
+    cal_cfg = ctx.get('calendar') or {}
+    if not isinstance(cal_cfg, dict):
+        return None
+    has_fields = any(k in cal_cfg for k in ('hours_per_day', 'working_days',
+                                            'holidays'))
+    if not has_fields:
+        return None
+
+    hours_per_day = float(cal_cfg.get('hours_per_day', 8.0))
+    working_days = cal_cfg.get('working_days', [1, 2, 3, 4, 5])
+    holidays = cal_cfg.get('holidays', [])
+
+    # Estimate horizon from total remaining working hours (deterministic).
+    total_work_hrs = 0.0
+    for node in nodes:
+        nid = str(node.get('ID', node.get('id', '')))
+        if nid not in id_to_idx:
+            continue
+        if _parse_iso_to_ms(node.get('ActualFinish')) is not None:
+            continue
+        dur_val = node.get('Duration', node.get('duration', 0))
+        dur_units = node.get('TimeUnits', node.get('timeUnits'))
+        total = _duration_to_work_hours(dur_val, dur_units, hours_per_day)
+        pct_raw = node.get('PercentComplete', node.get('percentComplete', 0))
+        try:
+            pct = float(pct_raw)
+        except (TypeError, ValueError):
+            pct = 0.0
+        if pct > 1.0:
+            pct /= 100.0
+        pct = max(0.0, min(1.0, pct))
+        total_work_hrs += total * (1.0 - pct)
+
+    horizon_days = estimate_horizon_days(total_work_hrs, hours_per_day)
+
+    return WorkingCalendar.build(
+        hours_per_day=hours_per_day,
+        working_days=working_days,
+        holidays=holidays,
+        start_ms=status_ms,
+        horizon_days=horizon_days,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -422,9 +550,16 @@ def run_completion_mc(nodes, links, status_date,
     if n == 0:
         return _empty_result(status_date, t0)
 
-    (remaining_ms, earliest_start_ms, risk, activity_types,
+    # Build working calendar from project_context when supplied.  Absence
+    # falls back to V1 wall-clock semantics (see _duration_to_ms).
+    calendar = _maybe_build_calendar(
+        nodes, dag_state, id_to_idx, status_ms, activity_metadata,
+        project_context)
+
+    (remaining, earliest_start_ms, risk, activity_types,
      in_scope, actual_finish_ms) = _build_scope(
-        nodes, dag_state, id_to_idx, status_ms, activity_metadata)
+        nodes, dag_state, id_to_idx, status_ms, activity_metadata,
+        calendar)
 
     if not np.any(in_scope):
         # Nothing left to simulate -- all activities have ActualFinish
@@ -454,17 +589,19 @@ def run_completion_mc(nodes, links, status_date,
 
     # Deterministic baseline for expected-finish delta
     det_start, det_finish = _deterministic_finish_ms(
-        dag_state, remaining_ms, earliest_start_ms, status_ms)
+        dag_state, remaining, earliest_start_ms, status_ms, calendar)
     expected_finish_ms = float(np.max(det_finish[in_scope]))
 
     # Sample multipliers (M, n) and propagate through DAG
     mult_all, M_actual = _sample_multipliers(
-        risk, activity_types, remaining_ms, config)
-    logger.info("Completion MC: n=%d, scope=%d, M=%d",
-                n, int(np.sum(in_scope)), M_actual)
+        risk, activity_types, remaining, calendar, config)
+    logger.info("Completion MC: n=%d, scope=%d, M=%d, calendar=%s",
+                n, int(np.sum(in_scope)), M_actual,
+                'yes' if calendar is not None else 'no')
 
     sim_start, sim_finish = _propagate_finish_ms(
-        dag_state, remaining_ms, earliest_start_ms, status_ms, mult_all)
+        dag_state, remaining, earliest_start_ms, status_ms, mult_all,
+        calendar)
 
     # Project finish per sample = max finish over in-scope activities
     scope_idx = np.where(in_scope)[0]

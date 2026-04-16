@@ -65,10 +65,20 @@ activity.
     }
   },
   "project_context": {                // Optional.  Project-level settings.
-    "calendar": {
-      "hours_per_day": 8.0            // Optional.  Reserved for a future
-                                      //   working-calendar extension.
-                                      //   V1 treats durations as wall-clock.
+    "calendar": {                     // Optional.  Enables working-calendar
+                                      //   arithmetic when present.  Omit the
+                                      //   whole "calendar" key (or all three
+                                      //   fields below) for wall-clock mode.
+      "hours_per_day": 8.0,           // Optional.  Working hours per working
+                                      //   day.  Default: 8.0.
+      "working_days": [1,2,3,4,5],    // Optional.  ISO weekdays that count as
+                                      //   working (Mon=1..Sun=7).
+                                      //   Default: [1,2,3,4,5].
+      "holidays": [                   // Optional.  Dates that are NOT working
+        "2025-07-04",                 //   days even if their weekday is.
+        "2025-12-25"                  //   Accept "YYYY-MM-DD" or objects with
+                                      //   a `.date` field.
+      ]
     }
   },
   "config": {                         // Optional.  MC configuration.
@@ -192,19 +202,43 @@ Duration-sensitive caps prevent unrealistic multipliers:
   `t = 0.6 * clamp01((risk - 0.5)/0.5) + 0.4 * clamp01((dur_days - 30)/180)`
   `cap = lerp(max_mult_base, max_mult_high, t)`
 
+## Calendar Semantics
+
+**When `project_context.calendar` is supplied** (any of `hours_per_day`,
+`working_days`, `holidays` present), durations are interpreted as working
+time and propagation skips non-working days:
+
+- `Duration: 10, TimeUnits: "days"` with `hours_per_day: 8` means 10
+  working days = 80 working hours.  At a 5×8 calendar this lands on the
+  second Monday after the start (10 Mon–Fri work days).
+- `TimeUnits: "weeks"` → `Duration × hours_per_day × 5` (working weeks).
+- `TimeUnits: "months"` → `Duration × hours_per_day × 21` (working months,
+  matching the frontend `convertToHours` convention).
+- Link `lag` is always interpreted as **working hours** when a calendar
+  is present (matching the JS `lagUsesWorkingCalendar` default).
+- Non-working `earliest_start` values are normalised forward to the start
+  of the next working day (matching JS `_normalizeWeekendForward`).
+
+**When `project_context.calendar` is absent or empty**, durations are
+wall-clock (1 day = 24 hours, 1 week = 7 days, 1 month = 30 days); lag
+is wall-clock hours.  This is the V1 backwards-compatible path.
+
+The deterministic CPM finish returned in `expected_finish` uses the same
+calendar logic as the Monte Carlo propagation, so P20/P50/P80 deltas
+(`p20_impact_days` etc.) reflect pure stochastic risk, not calendar
+drift.
+
 ## Differences From the Frontend Implementation
 
-The Python backend produces equivalent distributional results but differs
-from `Reference/Completionprediction.js` in two ways:
+The Python backend produces calendar-equivalent results to
+`Reference/Completionprediction.js` (same weekend/holiday skipping, same
+working-hour interpretation), but with one deliberate RNG difference:
 
-1. **RNG**: uses Sobol quasi-Monte Carlo (`scipy.stats.qmc.Sobol`, scrambled
-   with `seed`) instead of the Murmur3/FNV-1a hash used in the browser.
-   Sobol gives better space-filling at the same iteration count, so
-   percentile estimates stabilize faster.
-2. **Calendar**: V1 treats durations as wall-clock time (24-hour days).
-   The frontend uses a working-hour calendar (`addWorkingHours`).  A
-   future extension can plug into `_duration_to_ms` and the propagation
-   loop to add working-calendar awareness.
+- **RNG**: uses Sobol quasi-Monte Carlo (`scipy.stats.qmc.Sobol`, scrambled
+  with `seed`) instead of the Murmur3/FNV-1a hash used in the browser.
+  Sobol has lower discrepancy at the same iteration count, so percentile
+  estimates stabilise faster.  Individual sample values will differ from
+  JS, but the percentile distribution converges to the same answer.
 
 ## Limits
 

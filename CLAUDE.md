@@ -289,10 +289,13 @@ Pushes to `main` trigger automatic deployment to Azure production. Treat
 
 ### High priority (use data already flowing in)
 
-- **Calendar-aware scheduling:** `hours_per_day` and `working_days` are
-  parsed into `ProjectContext` but never applied.  Durations are treated
-  as abstract time units.  Implementing calendar conversion would make
-  the CPM output match real-world dates.
+- **Calendar-aware scheduling in the solver:** `/completion/monte-carlo`
+  now supports a full working-calendar (`completion/calendar.py`,
+  `hours_per_day` / `working_days` / `holidays`) via vectorised
+  cumulative-sum + searchsorted advancement.  The solver CPM
+  (`solver/dag.py`) still treats durations as abstract time units.
+  Extending `solver/dag.run_cpm` to accept the same `WorkingCalendar`
+  would make `/solver/*` output match real-world dates.
 - **Hard constraint enforcement:** `max_end_date` and `max_budget` are
   parsed but never enforced in the optimizer.  These could be added as
   penalty terms or hard bounds in L-BFGS-B.
