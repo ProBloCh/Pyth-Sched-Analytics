@@ -1,19 +1,26 @@
 """
 solver/stochastic.py - Monte Carlo ensemble with risk-tiered distributions.
 
-Matches the frontend's four-tier uncertainty model:
+Five-tier uncertainty model grounded in Natarajan & Flyvbjerg (PMJ, 2022)
+and Flyvbjerg et al. (JMIS, 2022):
   < 6%  risk:  no perturbation (below noise floor)
   6-18% risk:  triangular (right-skewed, bounded)
-  18-55% risk: normal (σ ∝ risk, moderate tails)
-  ≥ 55% risk:  Birnbaum-Saunders (fat tail for extreme overruns)
+  18-BS% risk: normal (σ ∝ risk, moderate tails)
+  BS-P% risk:  Birnbaum-Saunders (fat tail — best fit for offshore O&G
+               overruns per Natarajan et al., KS p=.89 schedule, p=.14 cost)
+  ≥ P%  risk:  Pareto power-law (polynomial tail decay — captures the
+               α≈2.35 regime from Flyvbjerg's IT project empirical data
+               and the infinite-variance regime of Olympics-class projects)
 
 Supply-chain activities (equipment, material, services) hit the fat-tail
-threshold earlier.  Duration-sensitive caps prevent unrealistic multipliers
-on short low-risk activities while allowing long high-risk activities
-the range they need.
+and power-law thresholds earlier.  Duration-sensitive caps prevent
+unrealistic multipliers on short low-risk activities while allowing long
+high-risk activities the range they need.
 
 Uses Sobol quasi-Monte Carlo sequences (scipy.stats.qmc) for better
-space-filling.  Includes black swan and dragon king detection.
+space-filling.  Includes black swan / dragon king detection and
+2D cost-schedule extreme-event clustering (matching Natarajan et al.
+Figures 15-17).
 """
 
 import logging
@@ -37,6 +44,11 @@ _FAT_TAIL_THRESHOLDS = {
     'service':   0.45,
 }
 _DEFAULT_FAT_TAIL = 0.55
+
+# Pareto tier activates this many points above the BS threshold.
+# Standard: BS from 0.55, Pareto from 0.80
+# Equipment: BS from 0.35, Pareto from 0.60
+_PARETO_OFFSET = 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +132,19 @@ def _bs_ppf(u, alpha, beta):
     return beta * (half_az + np.sqrt(half_az ** 2 + 1.0)) ** 2
 
 
+def _pareto_ppf(u, alpha):
+    """Vectorised Pareto (Type I) inverse CDF with x_min=1.
+
+    Power-law tails: P(X > x) ~ x^{-α}.  Empirically validated for
+    IT projects at α≈2.35 (Flyvbjerg et al., JMIS 2022).  For α < 2
+    the variance is infinite (Olympics regime).
+
+    Parameterisation:
+      α = 2.0 + 1.5*(1-risk)  →  risk 0.80 ⇒ α=2.3, risk 1.0 ⇒ α=2.0
+    """
+    return (1.0 - u) ** (-1.0 / alpha)
+
+
 # ---------------------------------------------------------------------------
 # Risk-tiered perturbation
 # ---------------------------------------------------------------------------
@@ -136,21 +161,24 @@ def _fat_tail_thresholds(activity_types, n):
 
 def _compute_raw_multipliers(u, risk, fat_thresh):
     """
-    Per-activity raw duration multipliers from the four-tier model.
+    Per-activity raw duration multipliers from the five-tier model.
 
-    Risk thresholds match the frontend (Completionprediction.js):
-      < 6%:       noise floor → multiplier = 1.0
-      6–18%:      triangular (right-skewed, bounded)
-      18–fat_t:   normal (σ = risk)
-      ≥ fat_t:    Birnbaum-Saunders (α = 0.25+0.65r, β = 1.0+0.1r)
+    Tiers (risk as fraction 0–1):
+      < 6%:             noise floor → multiplier = 1.0
+      6–18%:            triangular (right-skewed, bounded)
+      18–fat_t:         normal (σ = risk)
+      fat_t–pareto_t:   Birnbaum-Saunders (α=0.25+0.65r, β=1.0+0.1r)
+      ≥ pareto_t:       Pareto power-law (α=2.0+1.5*(1-r))
     """
     n = len(risk)
     mult = np.ones(n, dtype=np.float64)
+    pareto_thresh = fat_thresh + _PARETO_OFFSET
 
     # Tier masks
     tri_mask    = (risk >= 0.06) & (risk < 0.18)
     norm_mask   = (risk >= 0.18) & (risk < fat_thresh)
-    bs_mask     = risk >= fat_thresh
+    bs_mask     = (risk >= fat_thresh) & (risk < pareto_thresh)
+    pareto_mask = risk >= pareto_thresh
 
     # Tier 2: triangular (right-skewed)
     if np.any(tri_mask):
@@ -167,25 +195,45 @@ def _compute_raw_multipliers(u, risk, fat_thresh):
         z = _norm.ppf(u[norm_mask])
         mult[norm_mask] = np.maximum(0.5, 1.0 + z * r)
 
-    # Tier 4: Birnbaum-Saunders (fat tail)
+    # Tier 4: Birnbaum-Saunders (fat tail — best fit for O&G overruns)
     if np.any(bs_mask):
         r = risk[bs_mask]
         alpha = 0.25 + 0.65 * r
         beta  = 1.00 + 0.10 * r
         mult[bs_mask] = _bs_ppf(u[bs_mask], alpha, beta)
 
+    # Tier 5: Pareto power-law (polynomial tail — Flyvbjerg α≈2.35 regime)
+    if np.any(pareto_mask):
+        r = risk[pareto_mask]
+        alpha = 2.0 + 1.5 * (1.0 - r)
+        mult[pareto_mask] = _pareto_ppf(u[pareto_mask], alpha)
+
     return np.maximum(mult, 0.1)  # absolute floor
 
 
-def _compute_caps(risk, durations):
-    """Duration-sensitive caps: lerp(2.0, 6.0, risk * dur_fraction).
+def _compute_caps(risk, durations, fat_thresh):
+    """Duration-sensitive caps with elevated range for Pareto-tier activities.
 
-    Short low-risk activities: capped at ~2×.
-    Long high-risk activities: allowed up to 6×.
+    Standard:  lerp(2.0, 6.0, risk × dur_fraction)
+    Pareto:    lerp(4.0, 10.0, risk × dur_fraction)
+
+    Short low-risk: capped at ~2×.  Long high-risk: up to 6×.
+    Extreme coupling (Pareto tier): up to 10× — captures Thunderhorse-class
+    cascading failures (Natarajan et al., PMJ 2022).
     """
     max_dur = np.max(durations) if len(durations) > 0 else 1.0
     dur_frac = durations / max(max_dur, 1e-9)
-    return 2.0 + 4.0 * np.minimum(1.0, risk * dur_frac)
+    blend = np.minimum(1.0, risk * dur_frac)
+
+    pareto_thresh = fat_thresh + _PARETO_OFFSET
+    is_pareto = risk >= pareto_thresh
+
+    caps = np.where(
+        is_pareto,
+        4.0 + 6.0 * blend,   # Pareto tier: 4×–10×
+        2.0 + 4.0 * blend,   # Standard: 2×–6×
+    )
+    return caps
 
 
 # ---------------------------------------------------------------------------
@@ -247,18 +295,102 @@ def _detect_extremes(raw_max, raw_mean, raw_std, cap_hits, M, caps,
     return black_swans, dragon_kings
 
 
+def _detect_2d_extremes(obj_samples, disciplines, initial_objectives):
+    """
+    2D cost-schedule extreme-event clustering.
+
+    Matches Natarajan et al. (PMJ 2022, Figures 15-17): K-means on the
+    joint (schedule_overrun, cost_overrun) distribution to identify
+    whether extreme scenarios are cost-dominated, schedule-dominated,
+    or coupled.  Three clusters (optimal per the paper's WCSS elbow)
+    naturally separate the nominal region from the two overrun axes.
+    """
+    if 'schedule' not in disciplines or 'cost' not in disciplines:
+        return None
+
+    sched = np.array(obj_samples['schedule'])
+    cost = np.array(obj_samples['cost'])
+    M = len(sched)
+
+    if M < 6:
+        return None
+
+    # Overrun ratios relative to baseline (initial) objectives
+    s_base = max(initial_objectives.get('schedule', 1.0), 1e-9)
+    c_base = max(initial_objectives.get('cost', 1.0), 1e-9)
+    s_overrun = (sched - s_base) / s_base
+    c_overrun = (cost - c_base) / c_base
+
+    from sklearn.cluster import KMeans as _KMeans
+    X = np.column_stack([s_overrun, c_overrun])
+    k = min(3, M)
+    labels = _KMeans(n_clusters=k, n_init='auto', random_state=0).fit_predict(X)
+
+    clusters = []
+    for cid in range(k):
+        mask = labels == cid
+        n_k = int(np.sum(mask))
+        if n_k == 0:
+            continue
+        s_mean = float(np.mean(s_overrun[mask]))
+        c_mean = float(np.mean(c_overrun[mask]))
+
+        # Label: which overrun axis dominates?
+        if s_mean + c_mean < 0.10:
+            label = 'nominal'
+        elif s_mean > c_mean * 1.5:
+            label = 'schedule_dominated'
+        elif c_mean > s_mean * 1.5:
+            label = 'cost_dominated'
+        else:
+            label = 'coupled'
+
+        clusters.append({
+            'cluster_id':            cid,
+            'label':                 label,
+            'n_scenarios':           n_k,
+            'pct_scenarios':         round(n_k / M, 3),
+            'schedule_overrun_mean': round(s_mean, 3),
+            'schedule_overrun_max':  round(float(np.max(s_overrun[mask])), 3),
+            'cost_overrun_mean':     round(c_mean, 3),
+            'cost_overrun_max':      round(float(np.max(c_overrun[mask])), 3),
+        })
+
+    clusters.sort(key=lambda c: c['schedule_overrun_mean'] + c['cost_overrun_mean'])
+
+    corr = float(np.corrcoef(s_overrun, c_overrun)[0, 1]) if M > 2 else 0.0
+
+    return {
+        'clusters':   clusters,
+        'correlation': round(corr, 3),
+        'schedule_overrun': {
+            'mean': round(float(np.mean(s_overrun)), 3),
+            'std':  round(float(np.std(s_overrun)), 3),
+            'p95':  round(float(np.percentile(s_overrun, 95)), 3),
+        },
+        'cost_overrun': {
+            'mean': round(float(np.mean(c_overrun)), 3),
+            'std':  round(float(np.std(c_overrun)), 3),
+            'p95':  round(float(np.percentile(c_overrun, 95)), 3),
+        },
+    }
+
+
 def _tier_label(risk_norm, activity_type):
     """Human-readable risk tier label."""
     fat_t = _FAT_TAIL_THRESHOLDS.get(
         activity_type.lower() if isinstance(activity_type, str) else '',
         _DEFAULT_FAT_TAIL)
+    pareto_t = fat_t + _PARETO_OFFSET
     if risk_norm < 0.06:
         return 'noise_floor'
     if risk_norm < 0.18:
         return 'triangular'
     if risk_norm < fat_t:
         return 'normal'
-    return 'birnbaum_saunders'
+    if risk_norm < pareto_t:
+        return 'birnbaum_saunders'
+    return 'pareto'
 
 
 # ---------------------------------------------------------------------------
@@ -290,10 +422,14 @@ def run_ensemble(dag_state, params, project_ctx, config):
 
     u_all, M = _generate_samples(M, n, config.antithetic_variates)
 
+    # Baseline objectives for 2D overrun clustering
+    initial_objs = compute_objectives(dag_state, params, project_ctx,
+                                      disciplines)
+
     # Pre-compute risk parameters
     risk = np.clip(params.risk_scores / 10.0, 0.0, 1.0)
     fat_thresh = _fat_tail_thresholds(params.activity_types, n)
-    caps = _compute_caps(risk, params.durations)
+    caps = _compute_caps(risk, params.durations, fat_thresh)
 
     # Resource FD gradients are O(n) CPM runs per sample.  When the total
     # cost n*M is large, compute them once on the original state and keep
@@ -403,6 +539,10 @@ def run_ensemble(dag_state, params, project_ctx, config):
     result['black_swans']  = black_swans
     result['dragon_kings'] = dragon_kings
 
+    # 2D cost-schedule clustering (Natarajan et al., PMJ 2022, Figs. 15-17)
+    result['cost_schedule_joint'] = _detect_2d_extremes(
+        obj_samples, disciplines, initial_objs)
+
     logger.info("MC ensemble done: %d samples, %d black swans, "
                 "%d dragon kings, %.1fs",
                 M, len(black_swans), len(dragon_kings), time.time() - t0)
@@ -411,11 +551,12 @@ def run_ensemble(dag_state, params, project_ctx, config):
 
 def _empty(disciplines):
     return {
-        'objectives_mean': {d: 0.0 for d in disciplines},
-        'objectives_std':  {d: 0.0 for d in disciplines},
-        'gradients_mean':  {},
-        'gradients_std':   {},
-        'n_samples':       0,
-        'black_swans':     [],
-        'dragon_kings':    [],
+        'objectives_mean':      {d: 0.0 for d in disciplines},
+        'objectives_std':       {d: 0.0 for d in disciplines},
+        'gradients_mean':       {},
+        'gradients_std':        {},
+        'n_samples':            0,
+        'black_swans':          [],
+        'dragon_kings':         [],
+        'cost_schedule_joint':  None,
     }
