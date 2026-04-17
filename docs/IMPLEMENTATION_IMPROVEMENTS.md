@@ -1,142 +1,230 @@
 # Implementation & Improvement Backlog
 
-A practical, prioritized backlog for Pyth-Sched-Analytics based on current
-architecture and docs.
+Single source of truth for implementation tasks and improvements in
+Pyth-Sched-Analytics.
+
+## Scope
+This backlog is intentionally tied to the current repository architecture:
+- Main Flask app (`app.py`) and `/graph-metrics` endpoint.
+- Solver blueprint (`solver/`) with `/solver/sensitivity`, `/solver/optimize`,
+  `/solver/pareto`, and health endpoints.
+- API contract docs in `docs/api/`.
 
 ## How to use this file
-- Keep this list ordered by impact (P0 highest).
-- Convert selected items into GitHub issues/PRs and link them back here.
-- Mark items complete with date + PR number.
+- Keep priorities ordered (**P0 highest**).
+- Each item should include: rationale, concrete deliverables, and acceptance criteria.
+- When complete, append date + PR link in the item and the changelog section.
 
 ---
 
-## P0 — High-impact reliability and scalability
+## P0 — Must do next (reliability, safety, operability)
 
-- [ ] **Add async job pattern for long-running `/solver/pareto` requests.**
-  - Why: current docs note Pareto can run 30s–5min and suggest async for large projects.
-  - Deliverables:
-    - `POST /solver/pareto/jobs` to enqueue work and return job id.
-    - `GET /solver/pareto/jobs/<id>` for status/result.
-    - Optional webhook callback support.
-    - Redis-backed job state + TTL cleanup.
+### 1) Async execution for long `/solver/pareto` workloads
+**Rationale**
+`/solver/pareto` is documented as potentially long-running; synchronous handling
+risks request timeout and poor UX for large inputs.
 
-- [ ] **Introduce request-level idempotency keys for solver endpoints.**
-  - Why: prevent duplicate expensive computations on retries.
-  - Deliverables:
-    - `Idempotency-Key` support.
-    - Response replay from cache for matching payload + key.
+**Deliverables**
+- Add async job API:
+  - `POST /solver/pareto/jobs`
+  - `GET /solver/pareto/jobs/{job_id}`
+- Persist job state (queued/running/succeeded/failed) in Redis.
+- Return correlation id in every job response.
+- Add cleanup policy for stale jobs.
 
-- [ ] **Add rate limiting and payload guardrails.**
-  - Why: protect service from accidental overload and abuse.
-  - Deliverables:
-    - Per-IP and per-route quotas.
-    - Explicit hard limits on nodes/links for each endpoint.
-    - Structured 429/413 responses with guidance.
+**Acceptance criteria**
+- Pareto requests no longer block client connection for long-running jobs.
+- Job status endpoint exposes progress and terminal result/error.
+- Tests cover success, failure, missing job id, and expiry behavior.
 
 ---
 
-## P1 — Analytics quality and model fidelity
+### 2) Input guardrails and consistent error contracts
+**Rationale**
+The API accepts potentially large graphs; explicit limits and predictable errors
+are needed for stability and client integration quality.
 
-- [ ] **Fully integrate multi-resolution pipeline into `/graph-metrics` response.**
-  - Why: guidance expects hierarchy/stability outputs and front-end drill-down.
-  - Deliverables:
-    - Include `levels`, `hierarchy`, `stable_cores`, and timing metadata.
-    - Support request-level overrides for resolution ladder and run counts.
+**Deliverables**
+- Define maximum `nodes` / `links` per endpoint.
+- Validate required fields and types before compute-heavy stages.
+- Standardize error JSON shape across all endpoints.
+- Document limits and error examples in `docs/api/*.md`.
 
-- [ ] **Expose explainability payloads for optimization decisions.**
-  - Why: users need trustable “why” behind recommendations.
-  - Deliverables:
-    - Top positive/negative contributors per objective.
-    - Constraint binding report and shadow-price-like indicators.
-    - Human-readable intervention suggestions.
-
-- [ ] **Calibrate risk-distribution tiers by project domain.**
-  - Why: industry-specific risk behavior differs materially.
-  - Deliverables:
-    - Domain presets (e.g., data center, O&G, infrastructure).
-    - Validation notebook + calibration dataset contract.
+**Acceptance criteria**
+- Oversized or malformed payloads fail fast with clear 4xx responses.
+- Error body schema is identical across app and solver routes.
+- Contract tests enforce documented error structure.
 
 ---
 
-## P2 — Performance and operations
+### 3) Idempotency support for solver POST endpoints
+**Rationale**
+Retries from clients/load balancers can duplicate expensive computations.
 
-- [ ] **Add benchmark suite and performance budgets in CI.**
-  - Why: prevent regressions as features grow.
-  - Deliverables:
-    - Baseline scenarios (1K/5K/10K/15K activities).
-    - Max latency budgets per endpoint.
-    - Trend report artifact per CI run.
+**Deliverables**
+- Support `Idempotency-Key` on:
+  - `/solver/sensitivity`
+  - `/solver/optimize`
+  - `/solver/pareto` (sync and async submission)
+- Cache/replay responses for same `(key + normalized payload + route)`.
+- Define conflict behavior when same key is reused with different payload.
 
-- [ ] **Add OpenTelemetry tracing + structured metrics.**
-  - Why: better production diagnostics.
-  - Deliverables:
-    - Trace spans for graph build, community, solver phases, Monte Carlo.
-    - Prometheus metrics for latency, cache hit rate, queue depth, error classes.
+**Acceptance criteria**
+- Duplicate submissions with same key return same response body + status.
+- Key reuse with different payload returns deterministic conflict response.
+- Behavior is documented and covered by integration tests.
 
-- [ ] **Improve cache strategy with versioned keys.**
-  - Why: safer schema evolution without manual flushes.
-  - Deliverables:
-    - Cache key prefix by API/schema version.
-    - Optional per-endpoint TTL overrides.
+---
+
+## P1 — High value (analytics depth and explainability)
+
+### 4) Complete multi-resolution community output in `/graph-metrics`
+**Rationale**
+The repo contains guidance and a dedicated `multi_resolution_pipeline.py`; this
+should be a first-class response component for frontend drill-down.
+
+**Deliverables**
+- Include these fields in `/graph-metrics` response when enabled:
+  - `levels`
+  - `hierarchy`
+  - `stable_cores`
+  - computation timing metadata
+- Add request-level config overrides (resolution ladder, run count).
+- Add schema docs and response examples in `docs/api/graph-metrics.md`.
+
+**Acceptance criteria**
+- Response contract is stable and documented.
+- Existing clients remain compatible (additive changes only).
+- Endpoint tests verify shape and basic semantic validity.
+
+---
+
+### 5) Explainability payloads for optimization outputs
+**Rationale**
+Users need to understand why recommendations changed objective values.
+
+**Deliverables**
+- Add per-objective contribution summaries for top changed activities.
+- Add optimization diagnostics:
+  - convergence status
+  - stopping reason
+  - final gradient norm
+  - iteration count
+- Add human-readable intervention summary block.
+
+**Acceptance criteria**
+- `/solver/optimize` returns machine-readable and human-readable explanation fields.
+- Explanations are deterministic for fixed seed/config.
+- API docs include a worked example.
+
+---
+
+## P2 — Performance & observability
+
+### 6) Benchmark harness and CI performance budgets
+**Rationale**
+Need regression detection as compute logic evolves.
+
+**Deliverables**
+- Add benchmark runner with standard dataset sizes (1k/5k/10k+ activities).
+- Persist benchmark artifact in CI.
+- Define per-endpoint latency budgets and fail CI on severe regressions.
+
+**Acceptance criteria**
+- CI reports median/p95 latency trends.
+- Budget breaches are visible and block merge when above threshold.
+
+---
+
+### 7) Tracing and runtime metrics
+**Rationale**
+Current behavior is hard to diagnose without structured telemetry.
+
+**Deliverables**
+- Add tracing spans for: parse/validate, graph build, community detection,
+  solver core, stochastic loop, caching.
+- Export service metrics (latency, cache hit rate, error classes, payload size).
+- Add basic dashboard/runbook in `docs/`.
+
+**Acceptance criteria**
+- Each request has trace correlation id in logs and response headers.
+- Key SLO metrics are visible without code inspection.
 
 ---
 
 ## P3 — API and developer experience
 
-- [ ] **Publish an OpenAPI spec and generate client SDKs.**
-  - Why: improves integration quality for C# and JS consumers.
-  - Deliverables:
-    - `openapi.yaml` checked into repo.
-    - Generated typed clients and usage examples.
+### 8) Publish OpenAPI contract for all endpoints
+**Rationale**
+A single machine-readable contract reduces integration drift.
 
-- [ ] **Expand docs with cookbook examples and failure modes.**
-  - Why: reduce integration ambiguity.
-  - Deliverables:
-    - “Small/medium/large schedule” request templates.
-    - Error-handling matrix for 4xx/5xx.
+**Deliverables**
+- Add `docs/api/openapi.yaml` covering all current routes.
+- Generate and commit example clients/types for JS + C# usage.
+- Validate OpenAPI in CI.
 
-- [ ] **Add typed schema validation for all payloads.**
-  - Why: fail fast and produce predictable error responses.
-  - Deliverables:
-    - Centralized validator module.
-    - Consistent error envelope format.
+**Acceptance criteria**
+- OpenAPI file is complete, valid, and versioned.
+- Contract tests compare runtime responses to OpenAPI schema.
 
 ---
 
-## P4 — Testing and quality gates
+### 9) Strengthen request/response schema validation
+**Rationale**
+Validation is currently spread across route logic and implicit assumptions.
 
-- [ ] **Increase property-based and fuzz tests for graph + solver inputs.**
-  - Why: schedule data can be messy and adversarial.
-  - Deliverables:
-    - Hypothesis tests for DAG/link edge cases.
-    - Randomized payload stress tests.
+**Deliverables**
+- Centralize schema definitions for payloads and key responses.
+- Add uniform validation middleware/helpers.
+- Return standardized field-level validation errors.
 
-- [ ] **Add deterministic replay tests for stochastic modes.**
-  - Why: ensure reproducibility under fixed seeds.
-  - Deliverables:
-    - Seeded regression fixtures.
-    - Tolerance bands for probabilistic outputs.
-
-- [ ] **Add contract tests for documented API structures.**
-  - Why: keep `docs/api/` and live responses in sync.
-  - Deliverables:
-    - Response key/type assertions per endpoint.
-    - CI check that fails on undocumented response drift.
+**Acceptance criteria**
+- Invalid payloads consistently return actionable field messages.
+- Validation logic is reusable across app and solver routes.
 
 ---
 
-## Nice-to-have innovation items
+## P4 — Test maturity and change safety
 
-- [ ] **Scenario manager for what-if planning bundles.**
-  - Save/compare optimization scenarios with versioned assumptions.
+### 10) Property-based/fuzz coverage for graph and solver inputs
+**Deliverables**
+- Add Hypothesis tests for DAG edge cases, relationship types, and lag handling.
+- Add fuzz tests for malformed/partial payloads.
 
-- [ ] **Human-in-the-loop recommendation ranking.**
-  - Capture user acceptance/rejection to improve intervention ranking over time.
-
-- [ ] **Portfolio-level optimizer (multi-project coupling).**
-  - Extend from single schedule to cross-project shared-resource optimization.
+**Acceptance criteria**
+- Tests catch invalid graph states without crashing service.
+- Coverage includes both `/graph-metrics` and `/solver/*` paths.
 
 ---
 
-## Changelog for this backlog
-- 2026-04-17: Initial backlog created.
+### 11) Deterministic stochastic regression suite
+**Deliverables**
+- Seeded fixtures for stochastic solver modes.
+- Numeric tolerance checks for key output metrics.
+
+**Acceptance criteria**
+- Re-runs on same commit remain within tolerance bounds.
+- Drift alerts are clear when algorithm changes are intentional/unintentional.
+
+---
+
+### 12) API contract drift checks
+**Deliverables**
+- Add tests that assert `docs/api/` examples match runtime response keys/types.
+- Add CI step that fails on undocumented response changes.
+
+**Acceptance criteria**
+- No breaking API change merges without docs update.
+
+---
+
+## Icebox (not committed to roadmap yet)
+- Portfolio-level cross-project optimization.
+- Learning-to-rank for intervention recommendation feedback.
+- Scenario library/versioning UI support.
+
+---
+
+## Changelog
+- 2026-04-17: Initial backlog document added.
+- 2026-04-17: Backlog rewritten with acceptance criteria and repository-grounded deliverables.
