@@ -232,5 +232,4 @@ Validation is currently spread across route logic and implicit assumptions.
 ---
 
 ## Changelog
-- 2026-04-17: Initial backlog document added.
-- 2026-04-17: Backlog rewritten with acceptance criteria and repository-grounded deliverables.
+- 2026-04-17: Initial backlog document added, including acceptance criteria and repository-grounded deliverables.
