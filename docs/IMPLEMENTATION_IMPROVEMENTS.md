@@ -78,24 +78,30 @@ Retries from clients/load balancers can duplicate expensive computations.
 
 ## P1 — High value (analytics depth and explainability)
 
-### 4) Complete multi-resolution community output in `/graph-metrics`
+### 4) Standardize multi-resolution community output in `/graph-metrics`
 **Rationale**
-The repo contains guidance and a dedicated `multi_resolution_pipeline.py`; this
-should be a first-class response component for frontend drill-down.
+`/graph-metrics` already returns multi-resolution community data via
+`multi_resolution_communities`, including `levels`, `hierarchy`, and
+`stable_cores`. The remaining work is to make this a clearly documented,
+stable first-class contract for frontend drill-down and client integrations.
 
 **Deliverables**
-- Include these fields in `/graph-metrics` response when enabled:
-  - `levels`
-  - `hierarchy`
-  - `stable_cores`
-  - computation timing metadata
+- Explicitly document that `levels`, `hierarchy`, and `stable_cores` are
+  already present under `multi_resolution_communities`, and define whether
+  they should remain nested there or be promoted/aliased as standardized
+  `/graph-metrics` response fields.
+- Add computation timing metadata for the multi-resolution stage.
 - Add request-level config overrides (resolution ladder, run count).
-- Add schema docs and response examples in `docs/api/graph-metrics.md`.
+- Add schema docs, compatibility notes, and response examples in
+  `docs/api/graph-metrics.md`.
 
 **Acceptance criteria**
-- Response contract is stable and documented.
-- Existing clients remain compatible (additive changes only).
-- Endpoint tests verify shape and basic semantic validity.
+- Response contract for multi-resolution output is explicit, stable, and
+  documented.
+- Existing clients remain compatible (additive changes only, or documented
+  aliasing/promotion strategy).
+- Endpoint tests verify shape, timing metadata presence, and basic semantic
+  validity.
 
 ---
 
