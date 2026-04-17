@@ -15,9 +15,11 @@ consumers).
 | `/solver/pareto` | POST | [solver.md](solver.md#post-solverpareto) | Pareto frontier sweep (Tchebycheff scalarization) |
 | `/completion/monte-carlo` | POST | [completion.md](completion.md#post-completionmonte-carlo) | Remaining-work MC finish-date forecast (P20/P50/P80) |
 | `/completion/recovery-options` | POST | [completion.md](completion.md#post-completionrecovery-options) | Ranked crash + lag-compression options |
+| `/evm/analyze` | POST | [evm.md](evm.md#post-evmanalyze) | EVM analysis: CPI/SPI/EAC + time-phased distributions |
 | `/health` | GET | [health.md](health.md#get-health) | Main app health check |
 | `/solver/health` | GET | [health.md](health.md#get-solverhealth) | Solver module health check |
 | `/completion/health` | GET | [completion.md](completion.md#get-completionhealth) | Completion module health check |
+| `/evm/health` | GET | [evm.md](evm.md#get-evmhealth) | EVM module health check |
 
 ## API Stability Rules
 

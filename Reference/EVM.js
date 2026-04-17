@@ -695,6 +695,18 @@ function findValueAtDate(distribution, date, key) {
     return point ? (point[key] || point.value || 0) : null;
 }
 
+// Backend EVM service configuration (Pyth-Sched-Analytics /evm/analyze).
+// When true and the endpoint responds successfully, metrics and
+// distributions are computed backend-side; the in-browser EVM functions
+// (getCumulativeDistribution, createActualEVMChart) are used as
+// transparent fallback on any failure (network, non-200, timeout).
+// Set useBackendEVM = false to force the legacy in-browser path.
+const evmBackendConfig = {
+    useBackendEVM: true,
+    evmEndpoint: '/evm/analyze',
+    evmRequestTimeoutMs: 15000,
+};
+
 // Configuration object for customization
 const evmConfig = {
     bounds: {
@@ -2123,6 +2135,231 @@ function createActualEVMChart(nodes, links) {
     }, 'createActualEVMChart');
 
     processActualChart();
+}
+
+/********************
+ * BACKEND-FIRST EVM WRAPPERS (Pyth-Sched-Analytics /evm/analyze)
+ *
+ * Transparent offload of metric + distribution computation to the
+ * backend service.  Both entry points (getCumulativeDistribution,
+ * createActualEVMChart) have async siblings (...Async) that:
+ *   1. Short-circuit to the sync JS path when disabled / unavailable.
+ *   2. Otherwise POST to /evm/analyze and populate window.evmMetrics
+ *      with BOTH branches (forecasted + actual) in a single round trip.
+ *   3. Fall through to the original sync implementation on ANY error
+ *      (network, non-200, timeout, parse failure).
+ *
+ * Shape parity: the response maps directly onto the existing
+ * window.evmMetrics contract (camelCase keys, same nested layout,
+ * same top-level distributionPlanned / allDates / currency).  This
+ * means Completionprediction.js:4871 (which reads
+ * window.evmMetrics.actual.CPIcum) works unchanged.
+ *
+ * Fetch dedup: both async wrappers share a single in-flight Promise
+ * keyed on a cheap fingerprint.  When the user clicks between the
+ * "Forecasted" and "Actual" tabs in rapid succession, only one HTTP
+ * request goes out; the second wrapper awaits the same promise.
+ ********************/
+
+// Module-scoped dedup cache: { fingerprint: string, promise: Promise }
+let _evmInFlight = null;
+
+function _evmFingerprint(nodes, links) {
+    // Cheap fingerprint that changes when the project data changes but
+    // not when the user just switches tabs.  Includes a monotonic
+    // version flag that callers can bump to force-refresh.
+    const statusDate = (window.cybereumState && window.cybereumState.dataDate)
+        ? String(window.cybereumState.dataDate) : 'now';
+    const sector = (window.cybereumState && window.cybereumState.project
+                    && window.cybereumState.project.sector) || '';
+    return JSON.stringify({
+        n: (nodes || []).length,
+        l: (links || []).length,
+        sd: statusDate,
+        sc: sector,
+        v: window.evmInvalidationKey || 0,
+    });
+}
+
+function _evmBuildRequestBody(nodes, links) {
+    const teamCal = (window.cybereumState && window.cybereumState.teamCalendar) || null;
+    const hpd = (teamCal && teamCal.hoursPerDay) || evmConfig.WORKING_HOURS_PER_DAY
+        || CONFIG?.WORKING_HOURS_PER_DAY || 8;
+    const dpw = (teamCal && Array.isArray(teamCal.workingDays) && teamCal.workingDays.length)
+        || evmConfig.WORKING_DAYS_PER_WEEK || CONFIG?.WORKING_DAYS_PER_WEEK || 5;
+    const startNode = (nodes || []).find(n => String(n.ID) === '0') || (nodes || [])[0] || {};
+    const statusDate = (window.cybereumState && window.cybereumState.dataDate)
+        ? new Date(window.cybereumState.dataDate).toISOString()
+        : new Date().toISOString();
+
+    return {
+        nodes: nodes || [],
+        links: links || [],
+        options: {
+            statusDate,
+            costRate: parseFloat(startNode.CostRate) || 1,
+            currency: startNode.Currency || 'USD',
+            project: (window.cybereumState && window.cybereumState.project) || null,
+            hoursPerDay: hpd,
+            workingDaysPerWeek: typeof dpw === 'number' ? dpw : 5,
+        },
+    };
+}
+
+async function _ensureEvmAnalysis(nodes, links) {
+    // De-duplicate concurrent calls; single round-trip populates both branches.
+    const fp = _evmFingerprint(nodes, links);
+    if (_evmInFlight && _evmInFlight.fingerprint === fp) {
+        return _evmInFlight.promise;
+    }
+
+    const controller = (typeof AbortController === 'function') ? new AbortController() : null;
+    const timer = controller ? setTimeout(
+        () => controller.abort(),
+        +evmBackendConfig.evmRequestTimeoutMs || 15000) : null;
+
+    const promise = (async () => {
+        try {
+            const body = _evmBuildRequestBody(nodes, links);
+            const resp = await fetch(evmBackendConfig.evmEndpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                signal: controller ? controller.signal : undefined,
+            });
+            if (timer) clearTimeout(timer);
+            if (!resp.ok) {
+                throw new Error('backend returned ' + resp.status);
+            }
+            return await resp.json();
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
+    })();
+
+    _evmInFlight = { fingerprint: fp, promise };
+    // Clear cache after settle so subsequent unrelated calls re-fetch
+    promise.finally(() => {
+        if (_evmInFlight && _evmInFlight.fingerprint === fp) _evmInFlight = null;
+    });
+    return promise;
+}
+
+function _applyBackendEvmToWindow(result) {
+    // Merge backend result into the SAME shape window.evmMetrics has
+    // always had, so every downstream consumer (charts, tables,
+    // Completionprediction.js .actual.CPIcum read, etc.) keeps working.
+    const evmMetrics = window.evmMetrics || {};
+    evmMetrics.forecasted = result.forecasted || evmMetrics.forecasted;
+    evmMetrics.actual = result.actual || evmMetrics.actual;
+    // Top-level (legacy) fields that downstream code also reads
+    if (result.forecasted) {
+        evmMetrics.distributionPlanned = result.forecasted.distributionPlanned || [];
+        evmMetrics.distributionPlannedCost = result.forecasted.distributionPlannedCost || [];
+        evmMetrics.allDates = result.forecasted.allDates || [];
+    }
+    evmMetrics.currency = result.currency || evmMetrics.currency || 'USD';
+    evmMetrics.source = 'backend';
+    evmMetrics.computation_ms = result.computation_ms;
+
+    window.cybereumState = window.cybereumState || {};
+    window.cybereumState.evmMetrics = evmMetrics;
+    window.evmMetrics = evmMetrics;
+    return evmMetrics;
+}
+
+async function getCumulativeDistributionAsync(nodes, links) {
+    const disabled = !evmBackendConfig.useBackendEVM
+        || typeof fetch !== 'function'
+        || !evmBackendConfig.evmEndpoint;
+    if (disabled) {
+        return getCumulativeDistribution(nodes, links);
+    }
+    try {
+        const result = await _ensureEvmAnalysis(nodes, links);
+        _applyBackendEvmToWindow(result);
+
+        const f = result.forecasted;
+        if (f && typeof displayForecastedEVMetrics === 'function') {
+            try {
+                displayForecastedEVMetrics(
+                    f.BCWP, f.ACWP, f.BCWS, f.SPI_model, f.SV, f.CV,
+                    f.CPIcum_model, f.EAC);
+            } catch (e) { console.warn('[EVM] displayForecastedEVMetrics:', e); }
+        }
+        if (f && typeof populateForecastedEVMTable === 'function') {
+            try {
+                populateForecastedEVMTable(
+                    f.distributionPlanned, f.distributionWithOverrun,
+                    f.evDistribution, f.allDates);
+            } catch (e) { console.warn('[EVM] populateForecastedEVMTable:', e); }
+        }
+        console.log('[EVM] Backend forecasted branch applied:', {
+            SPI: f?.SPI_model, CPI: f?.CPIcum_model, EAC: f?.EAC,
+            computation_ms: result.computation_ms,
+            cache_hit: result.cache_hit,
+        });
+    } catch (err) {
+        console.warn('[EVM] Backend failed (',
+                     err?.name || 'error', err?.message || err,
+                     ') -- falling back to JS getCumulativeDistribution');
+        return getCumulativeDistribution(nodes, links);
+    }
+}
+
+async function createActualEVMChartAsync(nodes, links) {
+    const disabled = !evmBackendConfig.useBackendEVM
+        || typeof fetch !== 'function'
+        || !evmBackendConfig.evmEndpoint;
+    if (disabled) {
+        return createActualEVMChart(nodes, links);
+    }
+    try {
+        const result = await _ensureEvmAnalysis(nodes, links);
+        _applyBackendEvmToWindow(result);
+
+        const a = result.actual;
+        if (a && typeof displayActualEVMetrics === 'function') {
+            try {
+                displayActualEVMetrics(
+                    a.BCWP, a.ACWP, a.BCWS, a.SPI_model, a.SV, a.CV,
+                    a.CPIcum_model, a.EAC);
+            } catch (e) { console.warn('[EVM] displayActualEVMetrics:', e); }
+        }
+        if (a && typeof populateActualEVMTable === 'function') {
+            try {
+                populateActualEVMTable(
+                    (window.evmMetrics && window.evmMetrics.distributionPlanned) || [],
+                    a.distributionActual, a.distributionEarned,
+                    a.distributionPredicted,
+                    (window.evmMetrics && window.evmMetrics.distributionPlannedCost) || [],
+                    a.distributionActualCost, a.distributionEarnedCost,
+                    a.distributionPredictedCost,
+                    a.allDates, a.transitionPointIndex,
+                    result.currency);
+            } catch (e) { console.warn('[EVM] populateActualEVMTable:', e); }
+        }
+        console.log('[EVM] Backend actual branch applied:', {
+            SPI: a?.SPI_model, CPI: a?.CPIcum_model, EAC: a?.EAC,
+            dwSPI: a?.durationWeightedProgress?.durationWeightedSPI,
+            slipDays: a?.slipDays,
+            frontierCount: (a?.frontierNodes || []).length,
+            computation_ms: result.computation_ms,
+            cache_hit: result.cache_hit,
+        });
+    } catch (err) {
+        console.warn('[EVM] Backend failed (',
+                     err?.name || 'error', err?.message || err,
+                     ') -- falling back to JS createActualEVMChart');
+        return createActualEVMChart(nodes, links);
+    }
+}
+
+// Expose async wrappers on window so the main app's tab-click handlers
+// can switch over gradually (preserve the sync globals for existing code).
+if (typeof window !== 'undefined') {
+    window.getCumulativeDistributionAsync = getCumulativeDistributionAsync;
+    window.createActualEVMChartAsync = createActualEVMChartAsync;
 }
 
 /********************

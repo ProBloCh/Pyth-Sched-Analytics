@@ -32,7 +32,14 @@ health check.  `completion/` (5 modules: `__init__`, `routes`,
 serving `/completion/monte-carlo` (remaining-work finish-date forecast
 wrapping `solver/stochastic.py`'s five-tier distribution) and
 `/completion/recovery-options` (ranked crash + lag-compression options
-composing with the MC P80).  Tests: 232 across 5 test files.
+composing with the MC P80).  `evm/` (6 modules: `__init__`, `routes`,
+`engine`, `metrics`, `forecast`, `distributions`, `helpers`) serves
+`/evm/analyze` -- a full Earned Value Management analysis (CPI, SPI,
+EAC, duration-weighted progress, schedule-delay prediction, and
+time-phased cumulative + period distributions) ported from the JS
+`Reference/EVM.js`; output shape mirrors `window.evmMetrics` so
+downstream consumers (notably `Completionprediction.js` reading
+`.actual.CPIcum`) work unchanged.  Tests: 297 across 6 test files.
 
 ## Four Principles
 

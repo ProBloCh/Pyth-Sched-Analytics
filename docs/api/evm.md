@@ -1,0 +1,249 @@
+# EVM Endpoint
+
+Earned Value Management analysis: CPI, SPI, EAC, duration-weighted
+progress, schedule-delay prediction, and time-phased cumulative +
+period distributions (planned / actual / earned / predicted).
+
+Served by the `evm/` Flask Blueprint (prefix `/evm`).  Extracted from
+`Reference/EVM.js` (~3,100 LOC) -- the deterministic computation core
+is now backend, while chart rendering, DOM updates and the `evmInit`
+event stay frontend.
+
+**Consumers:**
+- JS frontend EVM tab (via `getCumulativeDistributionAsync` /
+  `createActualEVMChartAsync` wrappers; original sync functions remain
+  as fallback)
+- `Reference/Completionprediction.js` line ~4871 reads
+  `window.evmMetrics.actual.CPIcum` as a side-effect of the EVM tab
+  being populated.  The `/evm/analyze` response preserves that key
+  exactly so the read path is unchanged.
+
+---
+
+## POST /evm/analyze
+
+Runs the full EVM computation and returns a dict that the JS wrapper
+can drop into `window.evmMetrics` unchanged (after snake_case ->
+camelCase is handled inside the engine response already).
+
+### Request
+
+```jsonc
+{
+  "nodes": [
+    {
+      "ID": "1",                        // Required.  Unique.  Milestone
+                                        //   conventionally has ID "0".
+      "Start":     "2025-01-01",        // Baseline planned start.
+      "Finish":    "2025-01-11",        // Baseline planned finish.
+      "Duration":  10,                  // Required; 0 for milestones.
+      "TimeUnits": "days",              // Optional.  "h"/"d"/"w"/"mo"/"y".
+                                        //   Default: "Hours".
+      "PercentComplete": 50,            // Optional.  0..100 (P6/MSP).
+      "ActualStart":     "2025-01-01",  // Optional.  Progress-case 2.
+      "ActualFinish":    "2025-01-08",  // Optional.  Progress-case 1.
+      "ActualCost":      1200,          // Optional.  Used verbatim when
+                                        //   positive; else imputed.
+      "CostRate":        100,           // Optional.  Per-hour rate.
+      "riskAdjustedStart": "2025-01-02",// Optional.  Forecasted branch.
+      "riskAdjustedEnd":   "2025-01-15",
+      "riskAdjustedDuration": 13,
+      "predictedStart":    "2025-01-02",// Optional.  Case-4 future EV.
+      "predictedEnd":      "2025-01-20",
+      "Milestone": 0
+    }
+  ],
+  "links": [
+    { "source": "0", "target": "1",
+      "type": "FS", "lag": 0, "lagUnits": "h" }
+  ],
+  "options": {
+    "statusDate":         "2025-01-06T00:00:00Z",  // Required for dated metrics.
+    "costRate":           100,                     // Project-default; per-node
+                                                   //   CostRate overrides.
+    "currency":           "USD",
+    "project": { "sector": "construction" },       // Drives sector overrun lookup.
+    "hoursPerDay":        8.0,
+    "workingDaysPerWeek": 5.0
+  }
+}
+```
+
+### Response (200)
+
+```jsonc
+{
+  "forecasted": {                 // Drop-in shape for evmMetrics.forecasted
+    "BCWS": 40.0, "BCWP": 40.0, "ACWP": 4000.0, "BAC": 120.0, "EAC": 140.0,
+    "SV": 0.0, "CV": -3960.0,
+    "SPI": 1.0, "SPI_model": 1.0,       // Raw preserves Infinity when PV=0 & EV>0
+    "CPIcum": 0.01, "CPIcum_model": 0.05,
+    "flags": { "pvZeroWithEV": false, "acZeroWithEV": false },
+    "percentComplete": 33.33,           // 0..100 scale
+    "statusDate":   "2025-01-06T00:00:00+00:00",
+    "currency":     "USD",
+    "timeUnits":    "Hours",
+    "distributionPlanned":           [{ "date": "2025-01-01", "hours": 0.0 }, ...],
+    "distributionPlannedCost":       [{ "date": "2025-01-01", "cost":  0.0 }, ...],
+    "distributionWithOverrun":       [{ "date": "...", "hours": ... }, ...],
+    "distributionWithOverrunCost":   [...],
+    "evDistribution":                [...],
+    "evDistributionCost":            [...],
+    "nonCumulativeDistributionPlanned":     [...],
+    "nonCumulativeDistributionWithOverrun": [...],
+    "nonCumulativeEvDistribution":          [...],
+    "allDates": ["2025-01-01", "2025-01-08", ...]
+  },
+  "actual": {                     // Drop-in shape for evmMetrics.actual
+    "BCWS": ..., "BCWP": ..., "ACWP": ..., "BAC": ..., "EAC": ...,
+    "SV": ..., "CV": ..., "SPI": ..., "SPI_model": ...,
+    "CPIcum": ..., "CPIcum_model": ...,      // <-- Read by Completionprediction.js
+    "flags":            { ... },
+    "percentComplete":  33.33,
+    "statusDate":       "2025-01-06T00:00:00+00:00",
+    "currency":         "USD",
+    "durationWeightedProgress": {
+      "plannedProgressPct":     33.3,
+      "actualProgressPct":      33.3,
+      "durationWeightedSPI":    1.0,
+      "durationWeightedSPI_model": 1.0,
+      "totalPlannedHours":      120.0,
+      "plannedCompletedHours":  40.0,
+      "actualCompletedHours":   40.0
+    },
+    "sectorScheduleOverrun":    0.25,        // From project.sector lookup
+    "scheduleMultiplier":       1.0,
+    "slipDays":                 0,
+    "performanceDelta":         1.0,
+    "actualDelayFactor":        1.0,
+    "forecastedDelayFactor":    1.25,
+    "frontierNodes":            ["1"],       // IDs of last-active activities
+    "distributionActual":       [...],
+    "distributionActualCost":   [...],
+    "distributionEarned":       [...],
+    "distributionEarnedCost":   [...],
+    "distributionPredicted":    [...],
+    "distributionPredictedCost":[...],
+    "nonCumulativeDistributionActual":  [...],
+    "nonCumulativeDistributionEarned":  [...],
+    "allDates":                 [...],
+    "transitionPointIndex":     27            // Index where future begins
+  },
+  "currency":       "USD",
+  "computation_ms": 12.3,
+  "cache_hit":      false
+}
+```
+
+### Response (400)
+
+```json
+{ "error": "No nodes provided" }
+```
+
+Validation: nodes must be a non-empty list, no duplicate IDs, no
+negative durations, links are objects, `options` is an object (or
+absent).  Values that are "weird but survivable" on the JS side
+(unknown link source/target, ActualCost of wrong type, etc.) are
+handled gracefully inside the engine rather than rejected -- matching
+the JS tolerance.
+
+### Response (500)
+
+Internal compute errors: `{"error": "Internal EVM service error"}`.
+
+---
+
+## Algorithm Notes (for reviewers)
+
+### Four-case EV time-phasing
+
+Matches `calculateTimePhasedEV` (EVM.js lines 215-299).  For each
+activity and each date:
+
+1. **Completed**: `ActualFinish <= day` -> full planned hours credited.
+2. **In-progress (actual start known)**:
+   - If `ActualFinish` also known -> linear interpolation over actual
+     duration.
+   - Else if `PercentComplete > 0` -> interpolate from `ActualStart`
+     to `statusDate`, factor `PercentComplete` in.
+3. **Has progress, no actual dates, `day <= statusDate`**: time-phase
+   on planned dates, cap by `PercentComplete`.
+4. **Future (`day > statusDate`)**: use `predictedStart` /
+   `predictedEnd`; full credit once past the predicted end.
+
+### EAC tiers
+
+Matches `calculateEAC` (EVM.js lines 1131-1161):
+
+| % complete | Formula |
+|---|---|
+| < 10% | `BAC * 1.15` (early pessimistic) |
+| > 90% | `AC + remaining` (trust actuals) |
+| CPI outside `[0.8, 1.2]` | `AC + remaining / (CPI * SPI)` (blended) |
+| else | `AC + remaining / CPI` (stable) |
+
+Result clamped to `[max(AC, 0.8 * BAC), BAC * (2.5 if pct > 50 else 3.0)]`.
+
+### Sector schedule overrun
+
+Static table from EVM.js lines 731-770, derived from Flyvbjerg et al.
+Oxford megaproject studies.  Lookup precedence:
+
+1. Exact (lowercased) match on `project.sector` / `.projectType` /
+   `.category` / `.industry`.
+2. Substring match (e.g. "Oil and Gas Development" -> "oil and gas").
+3. Explicit `project.scheduleOverrun > 0` fallback.
+4. Default: 0.25 (25%).
+
+### Infinity preservation on raw SPI / CPI
+
+`SPI` and `CPIcum` (raw fields) return `Infinity` when PV or AC is
+zero but EV is positive -- a data-quality signal matching EVM.js v5.
+The `*_model` suffixed fields are clamped to the EVM config bounds
+(`[0.05, 10]` for SPI, `[0.05, 20]` for CPI) and are what downstream
+computation should use.
+
+### Auto-complete start milestone
+
+If any node has `ActualStart` set, a node with `ID == "0"` and
+`Duration == 0` is treated as 100% complete (matches EVM.js FIX #9,
+lines 1279-1319).  The backend clones the input nodes before patching
+so the caller's list is never mutated.
+
+---
+
+## Limits
+
+| Limit | Value |
+|---|---|
+| Max payload | 10 MB |
+| Max nodes | 20,000 |
+| Max links | 100,000 |
+
+## Caching
+
+Lazy Redis / LRU bridge (shared with `solver/` and `completion/`).  Key:
+`evm:analyze:<sha256 of request body>`.  Cached responses return with
+`cache_hit: true`.
+
+## GET /evm/health
+
+```json
+{ "status": "healthy", "module": "evm", "endpoints": ["/evm/analyze"] }
+```
+
+## What stays in the JS frontend
+
+Out of scope for this endpoint (intentional):
+
+- Chart.js rendering (`createSingleEVMChart`, cumulative vs.
+  non-cumulative dual-chart logic).
+- DOM updates (tables, insight panels, `#forecastedEVMetrics` /
+  `#actualEVMetrics` HTML).
+- Tab UI (`initializeEVMUI`, `evmInit` custom event).
+- Currency / locale formatting.
+
+The JS wrapper drops the response into `window.evmMetrics` and
+`window.cybereumState.evmMetrics`, then calls the existing chart +
+DOM helpers unchanged.
