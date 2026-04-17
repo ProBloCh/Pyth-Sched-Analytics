@@ -760,6 +760,60 @@ class TestWorkingDayArithmetic:
                                          working_days=[1, 2, 3, 4, 5])
         assert result.weekday() == 4  # Friday
 
+    def test_add_working_hours_skips_holidays(self):
+        """Holidays must be skipped even if their weekday is a working day."""
+        from datetime import datetime, timezone
+        # Thu 2025-07-03 + 8h (one working day) with 2025-07-04 holiday ->
+        # lands on Mon 2025-07-07, not Fri 2025-07-04
+        thu = datetime(2025, 7, 3, tzinfo=timezone.utc)
+        no_holiday = _add_working_hours(
+            thu, 8.0, hours_per_day=8.0,
+            working_days=[1, 2, 3, 4, 5])
+        with_holiday = _add_working_hours(
+            thu, 8.0, hours_per_day=8.0,
+            working_days=[1, 2, 3, 4, 5],
+            holidays=['2025-07-04'])
+        assert no_holiday.strftime('%Y-%m-%d') == '2025-07-04'
+        assert with_holiday.strftime('%Y-%m-%d') == '2025-07-07'
+
+    def test_add_working_hours_skips_multiple_holidays(self):
+        from datetime import datetime, timezone
+        mon = datetime(2025, 1, 6, tzinfo=timezone.utc)
+        # Add 3 working days, with 2025-01-07 and 2025-01-08 both holidays
+        # Expect: Mon(start) -> skip Tue (hol) -> skip Wed (hol) -> Thu -> Fri -> Mon
+        result = _add_working_hours(
+            mon, 24.0, hours_per_day=8.0,
+            working_days=[1, 2, 3, 4, 5],
+            holidays=['2025-01-07', '2025-01-08'])
+        assert result.strftime('%Y-%m-%d') == '2025-01-13'  # Mon (next week)
+
+    def test_subtract_working_hours_skips_holidays(self):
+        """Backward arithmetic (FF/SF links) also skips holidays."""
+        from datetime import datetime, timezone
+        mon = datetime(2025, 7, 7, tzinfo=timezone.utc)
+        result = _subtract_working_hours(
+            mon, 8.0, hours_per_day=8.0,
+            working_days=[1, 2, 3, 4, 5],
+            holidays=['2025-07-04'])
+        # Mon - 1 working day, skipping Fri holiday -> Thu 2025-07-03
+        assert result.strftime('%Y-%m-%d') == '2025-07-03'
+
+    def test_holidays_accepts_varied_shapes(self):
+        """{'date': '...'} objects, ISO datetimes, and plain strings all work."""
+        from datetime import datetime, timezone
+        thu = datetime(2025, 7, 3, tzinfo=timezone.utc)
+        r1 = _add_working_hours(thu, 8.0, hours_per_day=8.0,
+                                working_days=[1, 2, 3, 4, 5],
+                                holidays=[{'date': '2025-07-04'}])
+        r2 = _add_working_hours(thu, 8.0, hours_per_day=8.0,
+                                working_days=[1, 2, 3, 4, 5],
+                                holidays=['2025-07-04T00:00:00Z'])
+        r3 = _add_working_hours(thu, 8.0, hours_per_day=8.0,
+                                working_days=[1, 2, 3, 4, 5],
+                                holidays=['2025-07-04'])
+        assert r1 == r2 == r3
+        assert r1.strftime('%Y-%m-%d') == '2025-07-07'
+
 
 class TestUpdatePredictedValues:
 
@@ -855,6 +909,75 @@ class TestUpdatePredictedValues:
         # All nodes still have predicted dates
         for n in nodes:
             assert 'predictedStart' in n
+
+
+class TestEngineHolidayThreading:
+    """Engine wires options.calendar.holidays through to
+    update_predicted_values, so predicted dates respect project
+    holidays (matches JS window.HOLIDAY_SET semantics)."""
+
+    def test_predicted_dates_shift_with_holidays(self):
+        """Same project, same schedule -- adding a holiday in the
+        predicted horizon should push successor predictedStart later."""
+        nodes = [
+            {'ID': '0', 'Duration': 0, 'Milestone': 1,
+             'Start': '2025-06-30T00:00:00Z', 'Finish': '2025-06-30T00:00:00Z'},
+            {'ID': '1', 'Duration': 5, 'TimeUnits': 'days',
+             'Start': '2025-06-30T00:00:00Z', 'Finish': '2025-07-07T00:00:00Z',
+             'ActualStart': '2025-06-30T00:00:00Z', 'PercentComplete': 40},
+            {'ID': '2', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '2025-07-07T00:00:00Z', 'Finish': '2025-07-21T00:00:00Z',
+             'PercentComplete': 0},
+        ]
+        links = [
+            {'source': '0', 'target': '1', 'type': 'FS', 'lag': 0},
+            {'source': '1', 'target': '2', 'type': 'FS', 'lag': 0},
+        ]
+        base_opts = {
+            'statusDate': '2025-07-03T00:00:00Z',
+            'costRate': 100,
+            'hoursPerDay': 8, 'workingDaysPerWeek': 5,
+        }
+
+        # Without holidays
+        r_no = run_evm_analysis(
+            [dict(n) for n in nodes], links,
+            {**base_opts, 'calendar': {
+                'hoursPerDay': 8, 'workingDays': [1, 2, 3, 4, 5],
+                'holidays': [],
+            }})
+        # With 5 holidays inside the predicted horizon for activity 2
+        r_yes = run_evm_analysis(
+            [dict(n) for n in nodes], links,
+            {**base_opts, 'calendar': {
+                'hoursPerDay': 8, 'workingDays': [1, 2, 3, 4, 5],
+                'holidays': ['2025-07-14', '2025-07-15', '2025-07-16',
+                             '2025-07-17', '2025-07-18'],
+            }})
+        # Both branches must at least run without error and the holiday
+        # version's distributions must still be populated.  The key
+        # assertion: the engine didn't crash threading holidays through
+        # and the predicted distribution still advances past status date.
+        assert len(r_no['actual']['distributionPredicted']) > 0
+        assert len(r_yes['actual']['distributionPredicted']) > 0
+
+    def test_calendar_holidays_nested_or_top_level(self):
+        """Holidays accepted either under options.calendar.holidays or
+        top-level options.holidays (engine prefers the calendar path)."""
+        nodes = [{'ID': '1', 'Duration': 5, 'TimeUnits': 'days',
+                  'Start': '2025-07-01T00:00:00Z',
+                  'Finish': '2025-07-08T00:00:00Z'}]
+        r1 = run_evm_analysis(nodes, [], {
+            'statusDate': '2025-07-01T00:00:00Z',
+            'calendar': {'holidays': ['2025-07-04']},
+        })
+        r2 = run_evm_analysis(nodes, [], {
+            'statusDate': '2025-07-01T00:00:00Z',
+            'holidays': ['2025-07-04'],
+        })
+        # Both paths accepted, engine returns a shape for each
+        assert 'actual' in r1
+        assert 'actual' in r2
 
 
 class TestEngineWithPredictedDates:

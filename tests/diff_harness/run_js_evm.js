@@ -133,11 +133,37 @@ const currency = opts.currency || 'USD';
 // Sync the calendar from fixture's cybereumState.teamCalendar
 sandbox.window.cybereumState.dataDate = statusDate;
 sandbox.window.cybereumState.project = opts.project || sandbox.window.cybereumState.project;
-sandbox.window.cybereumState.teamCalendar = opts.calendar || {
+const calendar = opts.calendar || {
     hoursPerDay: opts.hoursPerDay || 8,
     workingDays: [1, 2, 3, 4, 5],
     holidays: [],
 };
+sandbox.window.cybereumState.teamCalendar = calendar;
+
+// EVM.js _evmGetWorkingDaySet and _evmGetHolidaySet read these globals
+// directly (not from cybereumState) -- populate them so the working-day
+// and holiday-skipping arithmetic in addDurationToDate matches what the
+// fixture specifies.  Without this, the JS defaults (Mon-Fri, empty
+// holiday set) would apply and the diff would miss holiday-induced shifts.
+sandbox.window.DEFAULT_WORKING_DAYS = Array.isArray(calendar.workingDays)
+    ? calendar.workingDays.slice() : [1, 2, 3, 4, 5];
+sandbox.window.WORKING_DAY_SET = new Set(sandbox.window.DEFAULT_WORKING_DAYS);
+
+function _dateKey(d) {
+    const dt = (d instanceof Date) ? d : new Date(d);
+    if (isNaN(dt.getTime())) return null;
+    const y = dt.getUTCFullYear();
+    const m = String(dt.getUTCMonth() + 1).padStart(2, '0');
+    const day = String(dt.getUTCDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+}
+const holidayKeys = new Set();
+for (const h of (calendar.holidays || [])) {
+    const key = (typeof h === 'string' && h.length === 10) ? h
+              : _dateKey(h && h.date ? h.date : h);
+    if (key) holidayKeys.add(key);
+}
+sandbox.window.HOLIDAY_SET = holidayKeys;
 
 // Update CONFIG (used by convertToHours)
 if (sandbox.CONFIG) {

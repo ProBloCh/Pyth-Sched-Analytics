@@ -189,6 +189,12 @@ def build_actual_branch(nodes, links, options):
                             options.get('working_days_per_week', 5.0)))
     project = options.get('project') or {}
     working_days = options.get('workingDays') or options.get('working_days')
+    # Calendar may carry working_days and holidays; prefer nested values
+    # when the top-level fields are absent so either shape works.
+    cal = options.get('calendar') or {}
+    if not working_days:
+        working_days = cal.get('workingDays') or cal.get('working_days')
+    holidays = cal.get('holidays') or options.get('holidays')
 
     bcws_hours = compute_bcws_hours(nodes, status_date, hpd, dpw)
     bcwp_hours = compute_bcwp_hours(nodes, hpd, dpw)
@@ -237,6 +243,7 @@ def build_actual_branch(nodes, links, options):
         performance_delta=schedule_delay['performanceDelta'],
         hours_per_day=hpd, working_days_per_week=dpw,
         working_days=working_days,
+        holidays=holidays,
         precomputed_frontier=frontier)
 
     distributions = build_actual_distributions(

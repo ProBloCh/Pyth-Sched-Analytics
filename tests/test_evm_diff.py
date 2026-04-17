@@ -40,10 +40,18 @@ pytestmark = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 def _run_js(fixture_path):
-    """Invoke the Node harness; returns parsed JSON."""
+    """Invoke the Node harness; returns parsed JSON.
+
+    Runs with TZ=UTC so JS Date's local-time arithmetic (setDate,
+    getDate, getFullYear used by _evmDateKey) produces the same keys
+    the UTC ISO fixtures use.  Without this, holidays specified as
+    'YYYY-MM-DD' wouldn't match on non-UTC hosts.
+    """
+    env = dict(os.environ)
+    env['TZ'] = 'UTC'
     proc = subprocess.run(
         [NODE_BIN, str(JS_HARNESS), str(fixture_path)],
-        capture_output=True, timeout=60, text=True)
+        capture_output=True, timeout=60, text=True, env=env)
     if proc.returncode != 0:
         raise RuntimeError(
             f'Node harness exited {proc.returncode}\n'
@@ -210,6 +218,10 @@ def test_predicted_dates_within_one_day(fixture_path):
     cost_rate = float(opts.get('costRate', 1.0))
     status_date = opts.get('statusDate')
     project = opts.get('project') or {}
+    cal = opts.get('calendar') or {}
+    working_days = (opts.get('workingDays') or opts.get('working_days')
+                    or cal.get('workingDays') or cal.get('working_days'))
+    holidays = cal.get('holidays') or opts.get('holidays')
 
     bcws = compute_bcws_hours(nodes_actual, status_date, hpd, dpw)
     bcwp = compute_bcwp_hours(nodes_actual, hpd, dpw)
@@ -239,6 +251,8 @@ def test_predicted_dates_within_one_day(fixture_path):
         slip_days=sd_res['slipDays'],
         performance_delta=sd_res['performanceDelta'],
         hours_per_day=hpd, working_days_per_week=dpw,
+        working_days=working_days,
+        holidays=holidays,
         precomputed_frontier=frontier)
 
     for n in nodes_actual:

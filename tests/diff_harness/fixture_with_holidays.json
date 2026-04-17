@@ -1,0 +1,39 @@
+{
+    "nodes": [
+        {"ID": "0", "Duration": 0, "Milestone": 1,
+         "Start": "2025-06-30T00:00:00Z", "Finish": "2025-06-30T00:00:00Z"},
+        {"ID": "1", "Duration": 5, "TimeUnits": "days", "Name": "Survey Phase",
+         "Start": "2025-06-30T00:00:00Z", "Finish": "2025-07-07T00:00:00Z",
+         "ActualStart": "2025-06-30T00:00:00Z", "PercentComplete": 40,
+         "CostRate": 90, "ActualCost": 2400},
+        {"ID": "2", "Duration": 10, "TimeUnits": "days", "Name": "Install Equipment",
+         "Start": "2025-07-07T00:00:00Z", "Finish": "2025-07-21T00:00:00Z",
+         "PercentComplete": 0, "CostRate": 120},
+        {"ID": "3", "Duration": 8, "TimeUnits": "days", "Name": "Commission Test",
+         "Start": "2025-07-21T00:00:00Z", "Finish": "2025-07-31T00:00:00Z",
+         "PercentComplete": 0, "CostRate": 130}
+    ],
+    "links": [
+        {"source": "0", "target": "1", "type": "FS", "lag": 0},
+        {"source": "1", "target": "2", "type": "FS", "lag": 0},
+        {"source": "2", "target": "3", "type": "FS", "lag": 0}
+    ],
+    "options": {
+        "statusDate": "2025-07-03T00:00:00Z",
+        "costRate": 100,
+        "currency": "USD",
+        "project": {"sector": "construction"},
+        "hoursPerDay": 8,
+        "workingDaysPerWeek": 5,
+        "calendar": {
+            "hoursPerDay": 8,
+            "workingDays": [1, 2, 3, 4, 5],
+            "holidays": [
+                "2025-07-04",
+                "2025-07-14",
+                "2025-07-24",
+                "2025-08-04"
+            ]
+        }
+    }
+}

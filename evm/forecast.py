@@ -271,20 +271,69 @@ def compute_schedule_delay(status_date, planned_end_date, forecasted_end_date,
 # ---------------------------------------------------------------------------
 
 
+def _normalise_holiday_set(holidays):
+    """Accept iterable of 'YYYY-MM-DD' strings, ISO datetimes, or {'date': ...}
+    dicts; return set of 'YYYY-MM-DD' strings.  Mirrors the JS
+    _evmDateKey format so holiday lookups match.
+    """
+    if not holidays:
+        return set()
+    out = set()
+    for h in holidays:
+        if h is None:
+            continue
+        if isinstance(h, dict):
+            h = h.get('date') or h.get('Date')
+            if h is None:
+                continue
+        dt = safe_date(h)
+        if dt is not None:
+            out.add(dt.strftime('%Y-%m-%d'))
+    return out
+
+
+def _normalise_working_days(working_days):
+    """Accept JS getDay() or ISO weekday convention [1..5] = Mon-Fri;
+    returns a set of Python weekday() values (Mon=0..Sun=6).
+
+    Both conventions agree on 1-5 meaning Mon-Fri.  For Sun, JS uses 0
+    and ISO uses 7; ``(d - 1) % 7`` correctly maps both to Python 6.
+    """
+    if not working_days:
+        return {0, 1, 2, 3, 4}
+    out = set()
+    for d in working_days:
+        try:
+            out.add((int(d) - 1) % 7)
+        except (TypeError, ValueError):
+            continue
+    return out or {0, 1, 2, 3, 4}
+
+
 def _add_working_hours(start_dt, hours, calendar=None,
-                       hours_per_day=8.0, working_days=None):
+                       hours_per_day=8.0, working_days=None,
+                       holidays=None):
     """Working-day-aware date advance.
 
     Mirrors EVM.js addDurationToDate (lines 951-984): adds
     ``ceil(hours / hours_per_day)`` working days, skipping weekends and
-    holidays defined by ``calendar``.
+    holidays.
+
+    Args:
+        start_dt      : datetime
+        hours         : working hours to add (ceil'd to whole days)
+        calendar      : reserved for future WorkingCalendar integration
+        hours_per_day : divisor for converting hours -> days
+        working_days  : JS getDay() or ISO weekday list (default Mon-Fri)
+        holidays      : iterable of 'YYYY-MM-DD' / ISO / {'date': ...}
+                        entries that are NOT working days even if their
+                        weekday is.
 
     Returns a new datetime; never mutates ``start_dt``.
     """
     if start_dt is None:
         return None
     if not math.isfinite(hours) or hours <= 0:
-        # JS short-circuits on non-positive hours
         return start_dt
 
     from datetime import timedelta
@@ -292,33 +341,28 @@ def _add_working_hours(start_dt, hours, calendar=None,
     if days_to_add <= 0:
         return start_dt
 
-    # Working day set: ISO weekdays (Mon=1..Sun=7) -> Python weekday() (0..6)
-    if working_days is None:
-        working_days = {0, 1, 2, 3, 4}  # Mon-Fri
-    else:
-        working_days = {(d - 1) % 7 for d in working_days}
-
-    # Holidays as a set of date objects
-    holidays = set()
-    if calendar is not None and getattr(calendar, 'is_working', None) is not None:
-        # Use the precomputed calendar's holiday set indirectly via is_working
-        holidays = None  # signal: use is_working
+    wd_set = _normalise_working_days(working_days)
+    holiday_set = _normalise_holiday_set(holidays)
 
     cur = start_dt
     work_days_added = 0
-    while work_days_added < days_to_add:
+    # Safety bound -- worst case is years of weekend+holiday chains;
+    # 10x the requested span is plenty.
+    max_iter = max(days_to_add * 10, 365 * 3)
+    iters = 0
+    while work_days_added < days_to_add and iters < max_iter:
         cur = cur + timedelta(days=1)
-        dow = cur.weekday()
-        if dow not in working_days:
+        iters += 1
+        if cur.weekday() not in wd_set:
             continue
-        if holidays is not None and cur.date().isoformat() in holidays:
+        if holiday_set and cur.strftime('%Y-%m-%d') in holiday_set:
             continue
         work_days_added += 1
     return cur
 
 
 def _subtract_working_hours(end_dt, hours, hours_per_day=8.0,
-                            working_days=None):
+                            working_days=None, holidays=None):
     """Reverse of _add_working_hours (for FF/SF backward passes)."""
     if end_dt is None:
         return None
@@ -328,16 +372,20 @@ def _subtract_working_hours(end_dt, hours, hours_per_day=8.0,
     days_to_sub = int(math.ceil(hours / max(hours_per_day, 1e-9)))
     if days_to_sub <= 0:
         return end_dt
-    if working_days is None:
-        working_days = {0, 1, 2, 3, 4}
-    else:
-        working_days = {(d - 1) % 7 for d in working_days}
+    wd_set = _normalise_working_days(working_days)
+    holiday_set = _normalise_holiday_set(holidays)
     cur = end_dt
     sub = 0
-    while sub < days_to_sub:
+    max_iter = max(days_to_sub * 10, 365 * 3)
+    iters = 0
+    while sub < days_to_sub and iters < max_iter:
         cur = cur - timedelta(days=1)
-        if cur.weekday() in working_days:
-            sub += 1
+        iters += 1
+        if cur.weekday() not in wd_set:
+            continue
+        if holiday_set and cur.strftime('%Y-%m-%d') in holiday_set:
+            continue
+        sub += 1
     return cur
 
 
@@ -408,7 +456,8 @@ def _link_lag_hours(link, hours_per_day, working_days_per_week):
 
 
 def _initial_predict(node, status_dt, schedule_multiplier, slip_days,
-                     safe_perf_delta, hours_per_day, working_days):
+                     safe_perf_delta, hours_per_day, working_days,
+                     holidays=None):
     """Step 1: initial per-node prediction (matches EVM.js 2655-2726)."""
     base_start = safe_date(node.get('riskAdjustedStart') or node.get('Start'))
     base_end = safe_date(node.get('riskAdjustedEnd') or node.get('Finish'))
@@ -428,7 +477,8 @@ def _initial_predict(node, status_dt, schedule_multiplier, slip_days,
     node['predictedStart'] = base_start or planned_start or status_dt
     node['predictedEnd'] = _add_working_hours(
         node['predictedStart'], node['predictedDuration'],
-        hours_per_day=hours_per_day, working_days=working_days)
+        hours_per_day=hours_per_day, working_days=working_days,
+        holidays=holidays)
 
     pct = normalize_percent_complete(node.get('PercentComplete'))
 
@@ -465,7 +515,8 @@ def _initial_predict(node, status_dt, schedule_multiplier, slip_days,
         node['predictedStart'] = actual_start
         node['predictedEnd'] = _add_working_hours(
             node['predictedStart'], node['predictedDuration'],
-            hours_per_day=hours_per_day, working_days=working_days)
+            hours_per_day=hours_per_day, working_days=working_days,
+            holidays=holidays)
         return
 
     # CASE 4: Not started -- shift by slip_days, scale duration
@@ -478,12 +529,13 @@ def _initial_predict(node, status_dt, schedule_multiplier, slip_days,
     node['predictedStart'] = shifted_start
     node['predictedEnd'] = _add_working_hours(
         shifted_start, node['predictedDuration'],
-        hours_per_day=hours_per_day, working_days=working_days)
+        hours_per_day=hours_per_day, working_days=working_days,
+        holidays=holidays)
 
 
 def _apply_distance_decay(nodes, frontier_ids, node_by_id, succ_map,
                           performance_delta, hours_per_day, working_days,
-                          decay_factor=0.85):
+                          decay_factor=0.85, holidays=None):
     """Step 2: BFS distance decay (EVM.js 486-568)."""
     if not frontier_ids:
         return
@@ -531,16 +583,18 @@ def _apply_distance_decay(nodes, frontier_ids, node_by_id, succ_map,
         if node.get('predictedStart'):
             node['predictedEnd'] = _add_working_hours(
                 node['predictedStart'], node['predictedDuration'],
-                hours_per_day=hours_per_day, working_days=working_days)
+                hours_per_day=hours_per_day, working_days=working_days,
+                holidays=holidays)
 
 
 def _propagate_topologically(nodes, links, node_by_id,
                              hours_per_day, working_days_per_week,
-                             working_days):
+                             working_days, holidays=None):
     """Step 3: walk in topological order, satisfy predecessor constraints.
 
     Mirror EVM.js propagatePredictionsTopologically (lines 312-389).
-    Supports FS / SS / FF / SF with lag.
+    Supports FS / SS / FF / SF with lag.  Working-day arithmetic
+    honours the optional ``holidays`` set.
     """
     succ_map = _build_succ_map(links)
     pred_map = _build_pred_map(links)
@@ -566,33 +620,40 @@ def _propagate_topologically(nodes, links, node_by_id,
             if link_type == 'FS':
                 req_start = _add_working_hours(
                     pred.get('predictedEnd'), lag_hours,
-                    hours_per_day=hours_per_day, working_days=working_days)
+                    hours_per_day=hours_per_day, working_days=working_days,
+                    holidays=holidays)
             elif link_type == 'SS':
                 req_start = _add_working_hours(
                     pred.get('predictedStart'), lag_hours,
-                    hours_per_day=hours_per_day, working_days=working_days)
+                    hours_per_day=hours_per_day, working_days=working_days,
+                    holidays=holidays)
             elif link_type == 'FF':
                 req_end = _add_working_hours(
                     pred.get('predictedEnd'), lag_hours,
-                    hours_per_day=hours_per_day, working_days=working_days)
+                    hours_per_day=hours_per_day, working_days=working_days,
+                    holidays=holidays)
                 if req_end is not None and node.get('predictedDuration', 0) > 0:
                     req_start = _subtract_working_hours(
                         req_end, node['predictedDuration'],
                         hours_per_day=hours_per_day,
-                        working_days=working_days)
+                        working_days=working_days,
+                        holidays=holidays)
             elif link_type == 'SF':
                 req_end2 = _add_working_hours(
                     pred.get('predictedStart'), lag_hours,
-                    hours_per_day=hours_per_day, working_days=working_days)
+                    hours_per_day=hours_per_day, working_days=working_days,
+                    holidays=holidays)
                 if req_end2 is not None and node.get('predictedDuration', 0) > 0:
                     req_start = _subtract_working_hours(
                         req_end2, node['predictedDuration'],
                         hours_per_day=hours_per_day,
-                        working_days=working_days)
+                        working_days=working_days,
+                        holidays=holidays)
             else:  # default to FS
                 req_start = _add_working_hours(
                     pred.get('predictedEnd'), lag_hours,
-                    hours_per_day=hours_per_day, working_days=working_days)
+                    hours_per_day=hours_per_day, working_days=working_days,
+                    holidays=holidays)
 
             if req_start is not None and (max_required_start is None
                                           or req_start > max_required_start):
@@ -603,7 +664,8 @@ def _propagate_topologically(nodes, links, node_by_id,
             node['predictedStart'] = max_required_start
             node['predictedEnd'] = _add_working_hours(
                 max_required_start, node.get('predictedDuration', 0),
-                hours_per_day=hours_per_day, working_days=working_days)
+                hours_per_day=hours_per_day, working_days=working_days,
+                holidays=holidays)
 
 
 def update_predicted_values(nodes, links, status_date, schedule_multiplier,
@@ -611,6 +673,7 @@ def update_predicted_values(nodes, links, status_date, schedule_multiplier,
                             hours_per_day=8.0,
                             working_days_per_week=5.0,
                             working_days=None,
+                            holidays=None,
                             precomputed_frontier=None,
                             decay_factor=0.85):
     """Mutates ``nodes`` in place adding / updating ``predictedStart``,
@@ -618,6 +681,11 @@ def update_predicted_values(nodes, links, status_date, schedule_multiplier,
 
     Caller MUST pass already-cloned nodes (the engine does this in
     ``_auto_complete_start_milestone`` so the caller's input is safe).
+
+    All three propagation stages (initial assignment, distance decay,
+    topological constraint) honour the optional ``holidays`` set,
+    matching EVM.js addDurationToDate / subtractDurationFromDate
+    behaviour that reads window.HOLIDAY_SET.
 
     Mirrors EVM.js updatePredictedValues_Improved.
     """
@@ -634,8 +702,11 @@ def update_predicted_values(nodes, links, status_date, schedule_multiplier,
         Bounds.MIN_PERF_DELTA, Bounds.MAX_PERF_DELTA)
 
     if working_days is None:
-        # Default Mon-Fri (ISO 1..5 -> internal 1..5; converted in helpers)
         working_days = [1, 2, 3, 4, 5]
+
+    # Pre-normalise the holiday set once so every call site uses the same
+    # 'YYYY-MM-DD' canonical form (saves per-call conversion overhead).
+    holiday_set = _normalise_holiday_set(holidays)
 
     node_by_id = {str(n.get('ID', n.get('id', ''))): n for n in nodes}
 
@@ -643,7 +714,7 @@ def update_predicted_values(nodes, links, status_date, schedule_multiplier,
     for n in nodes:
         _initial_predict(
             n, status_dt, schedule_multiplier, slip_days, safe_perf_delta,
-            hours_per_day, working_days)
+            hours_per_day, working_days, holidays=holiday_set)
 
     # STEP 2: distance decay from frontier
     succ_map = _build_succ_map(links)
@@ -655,13 +726,14 @@ def update_predicted_values(nodes, links, status_date, schedule_multiplier,
         _apply_distance_decay(
             nodes, frontier_ids, node_by_id, succ_map,
             safe_perf_delta, hours_per_day, working_days,
-            decay_factor=decay_factor)
+            decay_factor=decay_factor, holidays=holiday_set)
 
     # STEP 3: topological propagation under FS/SS/FF/SF + lag
     if links:
         _propagate_topologically(
             nodes, links, node_by_id,
-            hours_per_day, working_days_per_week, working_days)
+            hours_per_day, working_days_per_week, working_days,
+            holidays=holiday_set)
 
 
 # Re-export for the engine
