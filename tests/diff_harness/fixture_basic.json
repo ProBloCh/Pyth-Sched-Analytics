@@ -1,0 +1,30 @@
+{
+    "nodes": [
+        {"ID": "0", "Duration": 0, "Milestone": 1,
+         "Start": "2025-01-01T00:00:00Z", "Finish": "2025-01-01T00:00:00Z"},
+        {"ID": "1", "Duration": 10, "TimeUnits": "days",
+         "Start": "2025-01-01T00:00:00Z", "Finish": "2025-01-15T00:00:00Z",
+         "ActualStart": "2025-01-01T00:00:00Z", "PercentComplete": 50,
+         "CostRate": 100},
+        {"ID": "2", "Duration": 10, "TimeUnits": "days",
+         "Start": "2025-01-15T00:00:00Z", "Finish": "2025-01-29T00:00:00Z",
+         "PercentComplete": 0, "CostRate": 100}
+    ],
+    "links": [
+        {"source": "0", "target": "1", "type": "FS", "lag": 0},
+        {"source": "1", "target": "2", "type": "FS", "lag": 0}
+    ],
+    "options": {
+        "statusDate": "2025-01-08T00:00:00Z",
+        "costRate": 100,
+        "currency": "USD",
+        "project": {"sector": "construction"},
+        "hoursPerDay": 8,
+        "workingDaysPerWeek": 5,
+        "calendar": {
+            "hoursPerDay": 8,
+            "workingDays": [1, 2, 3, 4, 5],
+            "holidays": []
+        }
+    }
+}

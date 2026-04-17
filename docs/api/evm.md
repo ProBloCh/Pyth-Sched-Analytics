@@ -211,6 +211,112 @@ If any node has `ActualStart` set, a node with `ID == "0"` and
 lines 1279-1319).  The backend clones the input nodes before patching
 so the caller's list is never mutated.
 
+### Predicted-date propagation
+
+After computing schedule delay, the engine populates
+`predictedStart` / `predictedEnd` / `predictedDuration` on each
+activity by:
+
+1. **Initial assignment** -- per-node 4-case logic (completed /
+   100%-no-dates / in-progress / not-started).  Not-started nodes get
+   shifted by `slipDays` and scaled by `performanceDelta`.
+2. **Distance decay** -- BFS from frontier nodes (last-active
+   activities); per-node performance delta is decayed by
+   `0.85^distance`, so far-future activities don't carry the full
+   slip multiplier.
+3. **Topological propagation** -- walks the DAG and pushes each
+   successor's `predictedStart` forward to satisfy FS/SS/FF/SF +
+   lag constraints.
+
+These dates feed the case-4 branch of `time_phased_ev`, which draws
+the **predicted** portion of the actual-branch curve beyond the status
+date.  Without this propagation, the predicted curve would be flat at
+zero past `statusDate`.
+
+### `riskAdjustedDatesProvided` flag
+
+Top-level field on the response.  `true` when at least one node
+carries `riskAdjustedStart`, `riskAdjustedEnd`, or
+`riskAdjustedDuration`; otherwise `false`.  When `false`, the
+forecasted branch is identical to the planned branch (BCWS / BCWP /
+ACWP fall back to `Start` / `Finish` silently).  Consumers that show
+"forecast vs plan" curves should hide the forecast trace when this
+flag is `false`.
+
+---
+
+## JS Bugs Fixed (2026-04)
+
+The Python port originally aimed for byte-for-byte parity with
+`Reference/EVM.js`.  Diff testing revealed three real bugs in the JS
+that produced different numbers in environments where they manifested.
+Fixed in **both** implementations together:
+
+### 1. Forecasted ACWP double-multiplied by `CostRate`
+
+`getCumulativeDistribution` line 1723 originally:
+
+```js
+const ACWP = calculateForecastedACWP(workingNodes, statusDate) * CostRate;
+```
+
+`calculateForecastedACWP` already multiplies the per-node
+`riskDuration` by `node.CostRate || 1`, so the second multiplication
+inflated ACWP by the project `CostRate` factor whenever any node
+carried an explicit `CostRate`.  Result: forecasted CPI looked
+artificially low (project appeared over budget by a factor of the
+cost rate).
+
+Fix: drop the spurious second multiplication.  The actual branch
+(line 1859) was already correct, so this only needed to change in the
+forecasted branch.  Python engine never had the bug and now mirrors
+the corrected JS pattern.
+
+### 2. `calculateACWP` used `new Date()` instead of the status date
+
+The cost-multiplier "expected progress" check (line 1108):
+
+```js
+const today = new Date();   // <-- wall clock!
+const elapsedDays = differenceInCalendarDays(today, nodeStart);
+```
+
+Made the analysis **non-idempotent** -- running the same fixture two
+days apart produced different ACWP because the wall-clock advanced.
+The correct anchor for "what should be complete by now" is the
+project's status date.
+
+Fix: `calculateACWP` accepts an explicit `statusDate` parameter,
+falling back to `window.cybereumState.dataDate` and finally to
+`new Date()` for legacy callers.  The sync call site in
+`createActualEVMChart` now passes `statusDate` explicitly.  Python
+engine already used the status date; this brings JS to parity.
+
+### 3. Distance decay silently skipped when `succMap` was missing
+
+`updatePredictedValues_Improved` checked
+`window.cybereumState?.succMap` and **skipped the distance-decay
+step entirely** when it wasn't externally precomputed.  The
+topological-propagation step had a Kahn's-algorithm fallback for
+`topoOrder`, but decay had no equivalent.  Result: in environments
+where the caller hadn't pre-populated `cybereumState.succMap` (unit
+tests, isolated harnesses, possibly some load orderings of the main
+app), all not-started activities used the full `plannedH * perfDelta`
+instead of the distance-decayed `riskH * decayedDelta`.
+
+Fix: build `succMap` inline from `links` when it isn't precomputed.
+Distance decay now always runs.  Python engine already builds its
+own succ_map; this brings JS to parity.
+
+### Diff-test harness
+
+`tests/test_evm_diff.py` (with helper `tests/diff_harness/run_js_evm.js`)
+runs the JS reference implementation under Node.js on each fixture in
+`tests/diff_harness/fixture_*.json` and asserts every scalar metric
+matches the Python engine within `1e-6` relative tolerance, frontier
+node sets are identical, and predicted dates agree within 24 h.
+Skips automatically when Node.js is unavailable.
+
 ---
 
 ## Limits

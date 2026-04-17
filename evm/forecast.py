@@ -243,8 +243,429 @@ def compute_schedule_delay(status_date, planned_end_date, forecasted_end_date,
     }
 
 
+# ---------------------------------------------------------------------------
+# Predicted-date propagation (FIX #20, #19, #18 chain)
+# ---------------------------------------------------------------------------
+#
+# Port of updatePredictedValues_Improved (EVM.js 2630-2748) plus its
+# helpers applyDistanceDecay (EVM.js 486-568) and
+# propagatePredictionsTopologically (EVM.js 312-389).
+#
+# Why this matters: time_phased_ev case-4 (future EV) reads
+# node.predictedStart / node.predictedEnd to draw the "predicted" curve
+# beyond status_date.  Without this populated, future EV is 0 and the
+# actual-branch chart falls off a cliff at the status date.
+#
+# Algorithm (per JS comments):
+#   STEP 1: Initial assignment per node based on actuals + risk-adjusted
+#           dates + scheduleMultiplier (4 cases: completed / 100%-no-dates /
+#           in-progress / not-started).
+#   STEP 2: Distance decay -- for each frontier node, BFS through
+#           successors and decay performance_delta by 0.85^distance so
+#           far-future activities don't get the full slip multiplier.
+#   STEP 3: Topological propagation -- walk the DAG and push each
+#           successor's predictedStart forward to satisfy the latest
+#           predecessor constraint (FS / SS / FF / SF + lag).
+#
+# Mutates the cloned nodes in place (caller passes already-cloned list).
+# ---------------------------------------------------------------------------
+
+
+def _add_working_hours(start_dt, hours, calendar=None,
+                       hours_per_day=8.0, working_days=None):
+    """Working-day-aware date advance.
+
+    Mirrors EVM.js addDurationToDate (lines 951-984): adds
+    ``ceil(hours / hours_per_day)`` working days, skipping weekends and
+    holidays defined by ``calendar``.
+
+    Returns a new datetime; never mutates ``start_dt``.
+    """
+    if start_dt is None:
+        return None
+    if not math.isfinite(hours) or hours <= 0:
+        # JS short-circuits on non-positive hours
+        return start_dt
+
+    from datetime import timedelta
+    days_to_add = int(math.ceil(hours / max(hours_per_day, 1e-9)))
+    if days_to_add <= 0:
+        return start_dt
+
+    # Working day set: ISO weekdays (Mon=1..Sun=7) -> Python weekday() (0..6)
+    if working_days is None:
+        working_days = {0, 1, 2, 3, 4}  # Mon-Fri
+    else:
+        working_days = {(d - 1) % 7 for d in working_days}
+
+    # Holidays as a set of date objects
+    holidays = set()
+    if calendar is not None and getattr(calendar, 'is_working', None) is not None:
+        # Use the precomputed calendar's holiday set indirectly via is_working
+        holidays = None  # signal: use is_working
+
+    cur = start_dt
+    work_days_added = 0
+    while work_days_added < days_to_add:
+        cur = cur + timedelta(days=1)
+        dow = cur.weekday()
+        if dow not in working_days:
+            continue
+        if holidays is not None and cur.date().isoformat() in holidays:
+            continue
+        work_days_added += 1
+    return cur
+
+
+def _subtract_working_hours(end_dt, hours, hours_per_day=8.0,
+                            working_days=None):
+    """Reverse of _add_working_hours (for FF/SF backward passes)."""
+    if end_dt is None:
+        return None
+    if not math.isfinite(hours) or hours <= 0:
+        return end_dt
+    from datetime import timedelta
+    days_to_sub = int(math.ceil(hours / max(hours_per_day, 1e-9)))
+    if days_to_sub <= 0:
+        return end_dt
+    if working_days is None:
+        working_days = {0, 1, 2, 3, 4}
+    else:
+        working_days = {(d - 1) % 7 for d in working_days}
+    cur = end_dt
+    sub = 0
+    while sub < days_to_sub:
+        cur = cur - timedelta(days=1)
+        if cur.weekday() in working_days:
+            sub += 1
+    return cur
+
+
+def _build_succ_map(links):
+    succ = {}
+    for link in links or []:
+        src = str(link.get('source', ''))
+        tgt = str(link.get('target', ''))
+        if not src or not tgt:
+            continue
+        succ.setdefault(src, []).append({
+            'target': tgt,
+            'type': str(link.get('type', 'FS')).upper(),
+            'lag': float(link.get('lag', 0) or 0),
+            'lagUnits': link.get('lagUnits') or link.get('TimeUnits') or 'h',
+        })
+    return succ
+
+
+def _build_pred_map(links):
+    pred = {}
+    for link in links or []:
+        src = str(link.get('source', ''))
+        tgt = str(link.get('target', ''))
+        if not src or not tgt:
+            continue
+        pred.setdefault(tgt, []).append({
+            'source': src,
+            'type': str(link.get('type', 'FS')).upper(),
+            'lag': float(link.get('lag', 0) or 0),
+            'lagUnits': link.get('lagUnits') or link.get('TimeUnits') or 'h',
+        })
+    return pred
+
+
+def _topological_order(nodes, succ_map, node_by_id):
+    """Kahn's algorithm; matches JS computeTopologicalOrder fallback."""
+    in_deg = {str(n.get('ID', n.get('id', ''))): 0 for n in nodes or []}
+    for src, edges in succ_map.items():
+        for e in edges:
+            tgt = e['target']
+            if tgt in in_deg:
+                in_deg[tgt] += 1
+    queue = [nid for nid, d in in_deg.items() if d == 0]
+    order = []
+    while queue:
+        nid = queue.pop(0)
+        order.append(nid)
+        for e in succ_map.get(nid, []):
+            tgt = e['target']
+            if tgt in in_deg:
+                in_deg[tgt] -= 1
+                if in_deg[tgt] == 0:
+                    queue.append(tgt)
+    # Append cycle stragglers
+    for nid in in_deg:
+        if nid not in order:
+            order.append(nid)
+    return order
+
+
+def _link_lag_hours(link, hours_per_day, working_days_per_week):
+    """Mirror PathScripts.getLinkLagHours: lag value with lagUnits aware."""
+    return convert_to_hours(
+        link.get('lag', 0),
+        link.get('lagUnits', 'h'),
+        hours_per_day, working_days_per_week)
+
+
+def _initial_predict(node, status_dt, schedule_multiplier, slip_days,
+                     safe_perf_delta, hours_per_day, working_days):
+    """Step 1: initial per-node prediction (matches EVM.js 2655-2726)."""
+    base_start = safe_date(node.get('riskAdjustedStart') or node.get('Start'))
+    base_end = safe_date(node.get('riskAdjustedEnd') or node.get('Finish'))
+    planned_h = convert_to_hours(
+        node.get('Duration', 0), node.get('TimeUnits', 'Hours'),
+        hours_per_day, len(working_days) if working_days else 5)
+    risk_h = convert_to_hours(
+        node.get('riskAdjustedDuration') if node.get('riskAdjustedDuration') is not None
+        else node.get('Duration', 0),
+        node.get('TimeUnits', 'Hours'),
+        hours_per_day, len(working_days) if working_days else 5)
+    planned_start = safe_date(node.get('Start'))
+    planned_end = safe_date(node.get('Finish'))
+
+    # Initialize from forecasted dates
+    node['predictedDuration'] = risk_h or planned_h or 0
+    node['predictedStart'] = base_start or planned_start or status_dt
+    node['predictedEnd'] = _add_working_hours(
+        node['predictedStart'], node['predictedDuration'],
+        hours_per_day=hours_per_day, working_days=working_days)
+
+    pct = normalize_percent_complete(node.get('PercentComplete'))
+
+    # CASE 1: Has actual span (completed)
+    actual_start = safe_date(node.get('ActualStart'))
+    actual_finish = safe_date(node.get('ActualFinish'))
+    actual_duration = node.get('ActualDuration')
+    has_actual_span = (actual_start is not None and actual_finish is not None
+                       and actual_duration is not None)
+    if has_actual_span:
+        node['predictedStart'] = actual_start
+        node['predictedEnd'] = actual_finish
+        node['predictedDuration'] = convert_to_hours(
+            actual_duration, node.get('TimeUnits', 'Hours'),
+            hours_per_day, len(working_days) if working_days else 5)
+        return
+
+    # CASE 2: 100% complete but missing dates -> impute clamped to status_date
+    if pct >= 1.0 and (not actual_start or not actual_finish):
+        imputed_start = base_start or planned_start or status_dt
+        imputed_finish = base_end or planned_end or status_dt
+        if imputed_finish > status_dt:
+            imputed_finish = status_dt
+        node['predictedStart'] = imputed_start
+        node['predictedEnd'] = imputed_finish
+        node['predictedDuration'] = risk_h or planned_h or 0
+        return
+
+    # CASE 3: In-progress (ActualStart, 0 < pct < 1)
+    if actual_start and 0.0 < pct < 1.0:
+        done_h = planned_h * pct
+        rem_h = max(0.0, planned_h - done_h) * safe_perf_delta
+        node['predictedDuration'] = done_h + rem_h
+        node['predictedStart'] = actual_start
+        node['predictedEnd'] = _add_working_hours(
+            node['predictedStart'], node['predictedDuration'],
+            hours_per_day=hours_per_day, working_days=working_days)
+        return
+
+    # CASE 4: Not started -- shift by slip_days, scale duration
+    from datetime import timedelta
+    bs = base_start if base_start else status_dt
+    shifted_start = bs if bs > status_dt else status_dt
+    if slip_days != 0:
+        shifted_start = shifted_start + timedelta(days=slip_days)
+    node['predictedDuration'] = planned_h * safe_perf_delta
+    node['predictedStart'] = shifted_start
+    node['predictedEnd'] = _add_working_hours(
+        shifted_start, node['predictedDuration'],
+        hours_per_day=hours_per_day, working_days=working_days)
+
+
+def _apply_distance_decay(nodes, frontier_ids, node_by_id, succ_map,
+                          performance_delta, hours_per_day, working_days,
+                          decay_factor=0.85):
+    """Step 2: BFS distance decay (EVM.js 486-568)."""
+    if not frontier_ids:
+        return
+
+    distance = {}
+    queue = []
+    for fid in frontier_ids:
+        sid = str(fid)
+        distance[sid] = 0
+        queue.append(sid)
+
+    while queue:
+        nid = queue.pop(0)
+        d = distance[nid]
+        for edge in succ_map.get(nid, []):
+            sid = edge['target']
+            if sid not in distance:
+                distance[sid] = d + 1
+                queue.append(sid)
+
+    for nid, dist in distance.items():
+        node = node_by_id.get(nid)
+        if node is None:
+            continue
+        # Skip completed / in-progress
+        if node.get('ActualStart') or node.get('ActualFinish'):
+            continue
+        if normalize_percent_complete(node.get('PercentComplete')) > 0:
+            continue
+
+        decayed_weight = decay_factor ** dist
+        decayed_delta = decayed_weight * performance_delta + (1 - decayed_weight) * 1.0
+
+        planned_h = convert_to_hours(
+            node.get('Duration', 0), node.get('TimeUnits', 'Hours'),
+            hours_per_day, len(working_days) if working_days else 5)
+        risk_h = convert_to_hours(
+            node.get('riskAdjustedDuration') if node.get('riskAdjustedDuration') is not None
+            else node.get('Duration', 0),
+            node.get('TimeUnits', 'Hours'),
+            hours_per_day, len(working_days) if working_days else 5)
+        base_h = risk_h or planned_h
+        node['predictedDuration'] = base_h * decayed_delta
+
+        if node.get('predictedStart'):
+            node['predictedEnd'] = _add_working_hours(
+                node['predictedStart'], node['predictedDuration'],
+                hours_per_day=hours_per_day, working_days=working_days)
+
+
+def _propagate_topologically(nodes, links, node_by_id,
+                             hours_per_day, working_days_per_week,
+                             working_days):
+    """Step 3: walk in topological order, satisfy predecessor constraints.
+
+    Mirror EVM.js propagatePredictionsTopologically (lines 312-389).
+    Supports FS / SS / FF / SF with lag.
+    """
+    succ_map = _build_succ_map(links)
+    pred_map = _build_pred_map(links)
+    topo = _topological_order(nodes, succ_map, node_by_id)
+
+    for nid in topo:
+        node = node_by_id.get(nid)
+        if node is None:
+            continue
+        if node.get('ActualStart'):
+            continue  # cannot adjust started activities
+
+        max_required_start = None
+        for plink in pred_map.get(nid, []):
+            pred = node_by_id.get(plink['source'])
+            if pred is None:
+                continue
+            lag_hours = _link_lag_hours(
+                plink, hours_per_day, working_days_per_week)
+            link_type = plink['type']
+            req_start = None
+
+            if link_type == 'FS':
+                req_start = _add_working_hours(
+                    pred.get('predictedEnd'), lag_hours,
+                    hours_per_day=hours_per_day, working_days=working_days)
+            elif link_type == 'SS':
+                req_start = _add_working_hours(
+                    pred.get('predictedStart'), lag_hours,
+                    hours_per_day=hours_per_day, working_days=working_days)
+            elif link_type == 'FF':
+                req_end = _add_working_hours(
+                    pred.get('predictedEnd'), lag_hours,
+                    hours_per_day=hours_per_day, working_days=working_days)
+                if req_end is not None and node.get('predictedDuration', 0) > 0:
+                    req_start = _subtract_working_hours(
+                        req_end, node['predictedDuration'],
+                        hours_per_day=hours_per_day,
+                        working_days=working_days)
+            elif link_type == 'SF':
+                req_end2 = _add_working_hours(
+                    pred.get('predictedStart'), lag_hours,
+                    hours_per_day=hours_per_day, working_days=working_days)
+                if req_end2 is not None and node.get('predictedDuration', 0) > 0:
+                    req_start = _subtract_working_hours(
+                        req_end2, node['predictedDuration'],
+                        hours_per_day=hours_per_day,
+                        working_days=working_days)
+            else:  # default to FS
+                req_start = _add_working_hours(
+                    pred.get('predictedEnd'), lag_hours,
+                    hours_per_day=hours_per_day, working_days=working_days)
+
+            if req_start is not None and (max_required_start is None
+                                          or req_start > max_required_start):
+                max_required_start = req_start
+
+        if (max_required_start is not None and node.get('predictedStart')
+                and max_required_start > node['predictedStart']):
+            node['predictedStart'] = max_required_start
+            node['predictedEnd'] = _add_working_hours(
+                max_required_start, node.get('predictedDuration', 0),
+                hours_per_day=hours_per_day, working_days=working_days)
+
+
+def update_predicted_values(nodes, links, status_date, schedule_multiplier,
+                            slip_days, performance_delta,
+                            hours_per_day=8.0,
+                            working_days_per_week=5.0,
+                            working_days=None,
+                            precomputed_frontier=None,
+                            decay_factor=0.85):
+    """Mutates ``nodes`` in place adding / updating ``predictedStart``,
+    ``predictedEnd``, ``predictedDuration``.
+
+    Caller MUST pass already-cloned nodes (the engine does this in
+    ``_auto_complete_start_milestone`` so the caller's input is safe).
+
+    Mirrors EVM.js updatePredictedValues_Improved.
+    """
+    if not nodes:
+        return
+
+    status_dt = safe_date(status_date)
+    if status_dt is None:
+        from datetime import datetime, timezone
+        status_dt = datetime.now(tz=timezone.utc)
+
+    safe_perf_delta = clamp(
+        performance_delta if performance_delta else 1.0,
+        Bounds.MIN_PERF_DELTA, Bounds.MAX_PERF_DELTA)
+
+    if working_days is None:
+        # Default Mon-Fri (ISO 1..5 -> internal 1..5; converted in helpers)
+        working_days = [1, 2, 3, 4, 5]
+
+    node_by_id = {str(n.get('ID', n.get('id', ''))): n for n in nodes}
+
+    # STEP 1: initial per-node assignment
+    for n in nodes:
+        _initial_predict(
+            n, status_dt, schedule_multiplier, slip_days, safe_perf_delta,
+            hours_per_day, working_days)
+
+    # STEP 2: distance decay from frontier
+    succ_map = _build_succ_map(links)
+    if precomputed_frontier is not None and len(precomputed_frontier) > 0:
+        frontier_ids = [str(f) for f in precomputed_frontier]
+    else:
+        frontier_ids = find_frontier_nodes(nodes, links)
+    if frontier_ids:
+        _apply_distance_decay(
+            nodes, frontier_ids, node_by_id, succ_map,
+            safe_perf_delta, hours_per_day, working_days,
+            decay_factor=decay_factor)
+
+    # STEP 3: topological propagation under FS/SS/FF/SF + lag
+    if links:
+        _propagate_topologically(
+            nodes, links, node_by_id,
+            hours_per_day, working_days_per_week, working_days)
+
+
 # Re-export for the engine
 __all__ = [
     'time_phased_ev', 'find_frontier_nodes', 'compute_schedule_delay',
-    'get_sector_schedule_overrun',
+    'get_sector_schedule_overrun', 'update_predicted_values',
 ]

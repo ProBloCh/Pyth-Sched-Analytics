@@ -1073,12 +1073,42 @@ function calculateBCWP_Hours(nodes) {
     return sum;
 }
 
-// Calculate ACWP with simplified logic
-function calculateACWP(nodes, CostRate = 1) {
+// Calculate ACWP with simplified logic.
+//
+// BUG FIX (2026-04): historic versions returned ACWP in cost units
+// (dollars) and were fed into calculateEVMetrics(BCWP_hours,
+// ACWP_dollars, BCWS_hours), making CPI = hours/dollars -- off by a
+// factor of CostRate.  We now expose two siblings:
+//   calculateACWP        -- legacy behaviour (cost units; for cost-side
+//                           display, kept as-is for callers that depend
+//                           on it, including any external consumers).
+//   calculateACWP_Hours  -- hours (no cost rate applied); the value
+//                           that should be passed to calculateEVMetrics
+//                           so CPI = EV/AC is in consistent units.
+//
+// The async backend wrapper now feeds calculateACWP_Hours into
+// calculateEVMetrics; the sync entry points (getCumulativeDistribution,
+// createActualEVMChart) likewise switched to calculateACWP_Hours for
+// the metric call but keep calculateACWP for cost-distribution arrays.
+function calculateACWP(nodes, CostRate = 1, applyCostRate = true,
+                       statusDate = null) {
     if (!Array.isArray(nodes)) return 0;
 
     let totalACWP = 0;
-    const today = new Date();
+    // BUG FIX (2026-04): originally `new Date()` -- the current wall
+    // clock -- which made the analysis non-idempotent (running the
+    // same fixture two days apart produced different ACWP).  The
+    // correct anchor for "expected progress" is the project's status
+    // date / data date.  Caller now passes statusDate explicitly;
+    // existing callers fall back to window.cybereumState.dataDate so
+    // the bug fix doesn't require changing every call site.
+    let today = safeDate(statusDate);
+    if (!today) {
+        today = (typeof window !== 'undefined'
+                 && window.cybereumState && window.cybereumState.dataDate)
+                ? safeDate(window.cybereumState.dataDate) : null;
+    }
+    if (!today) today = new Date();
 
     nodes.forEach(node => {
         try {
@@ -1089,7 +1119,13 @@ function calculateACWP(nodes, CostRate = 1) {
 
             const actualCost = parseFloat(node.ActualCost);
             if (actualCost && isFinite(actualCost) && actualCost > 0) {
-                totalACWP += actualCost;
+                if (applyCostRate) {
+                    totalACWP += actualCost;
+                } else {
+                    // Convert dollars back to hours via node CostRate
+                    const rate = parseFloat(node.CostRate) || CostRate || 1;
+                    totalACWP += actualCost / Math.max(rate, 1e-9);
+                }
             } else {
                 const nodeStart = safeDate(node.ActualStart || node.Start);
                 if (!nodeStart) return;
@@ -1117,7 +1153,8 @@ function calculateACWP(nodes, CostRate = 1) {
                         }
                     }
 
-                    totalACWP += plannedHours * pct * plannedCostRate * costMultiplier;
+                    const base = plannedHours * pct * costMultiplier;
+                    totalACWP += base * (applyCostRate ? plannedCostRate : 1.0);
                 }
             }
         } catch (error) {
@@ -1126,6 +1163,12 @@ function calculateACWP(nodes, CostRate = 1) {
     });
 
     return totalACWP;
+}
+
+// Sibling: ACWP in HOURS (no cost rate applied).  Use this for the
+// calculateEVMetrics call so CPI = EV/AC is dimensionally consistent.
+function calculateACWP_Hours(nodes, CostRate = 1) {
+    return calculateACWP(nodes, CostRate, /*applyCostRate=*/false);
 }
 
 // Calculate Budget at Completion (BAC) - in HOURS
@@ -1240,8 +1283,11 @@ function calculateForecastedBCWP(nodes, statusDate) {
     return bcwp;
 }
 
-// Forecasted ACWP using risk-adjusted durations
-function calculateForecastedACWP(nodes, statusDate) {
+// Forecasted ACWP using risk-adjusted durations.
+// `applyCostRate` (default true): legacy behaviour, returns dollars.
+//                  Set false to return hours for the unit-consistent
+//                  CPI calculation (see calculateACWP_Hours).
+function calculateForecastedACWP(nodes, statusDate, applyCostRate = true) {
     if (!Array.isArray(nodes) || !statusDate) return 0;
 
     const statusTime = safeDate(statusDate)?.getTime();
@@ -1259,20 +1305,27 @@ function calculateForecastedACWP(nodes, statusDate) {
             node.TimeUnits || "Hours"
         );
         const costRate = parseFloat(node.CostRate) || 1;
+        const rateFactor = applyCostRate ? costRate : 1;
 
         if (!riskStart || !riskEnd || !riskDuration) return;
 
         if (statusTime >= riskEnd) {
-            acwp += riskDuration * costRate;
+            acwp += riskDuration * rateFactor;
         } else if (statusTime > riskStart && statusTime < riskEnd) {
             const totalDuration = riskEnd - riskStart;
             const elapsed = statusTime - riskStart;
             const progress = elapsed / totalDuration;
-            acwp += riskDuration * costRate * progress;
+            acwp += riskDuration * rateFactor * progress;
         }
     });
 
     return acwp;
+}
+
+// Sibling: forecasted ACWP in HOURS.  Use this for the
+// calculateEVMetrics call so CPI = EV/AC is dimensionally consistent.
+function calculateForecastedACWP_Hours(nodes, statusDate) {
+    return calculateForecastedACWP(nodes, statusDate, /*applyCostRate=*/false);
 }
 
 /********************
@@ -1681,7 +1734,12 @@ function getCumulativeDistribution(nodes, links) {
         const BAC = totalPlanned * CostRate;
         const BCWS = calculateBCWS_Hours(workingNodes, statusDate) * CostRate;
         const BCWP = calculateForecastedBCWP(workingNodes, statusDate) * CostRate;
-        const ACWP = calculateForecastedACWP(workingNodes, statusDate) * CostRate;
+        // BUG FIX (2026-04): originally `calculateForecastedACWP() * CostRate`,
+        // which double-multiplied by the project rate when nodes carried an
+        // explicit `node.CostRate` (the function already applied the per-node
+        // rate internally).  Mirrors createActualEVMChart's pattern (line
+        // 1840 below): function output is already in dollars.
+        const ACWP = calculateForecastedACWP(workingNodes, statusDate);
 
         const { SV, CV, SPI, SPI_model, CPIcum, CPIcum_model, flags: evmFlags } = calculateEVMetrics(BCWP, ACWP, BCWS);
         const percentComplete = BAC > 0 ? (BCWP / BAC) * 100 : 0;
@@ -1798,7 +1856,9 @@ function createActualEVMChart(nodes, links) {
         // Calculate actual EVM metrics
         const BCWS_h = calculateBCWS_Hours(workingNodes, statusDate);
         const BCWP_h = calculateBCWP_Hours(workingNodes);
-        const ACWP_c = calculateACWP(workingNodes, CostRate);
+        // Pass statusDate so the cost-multiplier "expected progress"
+        // check anchors on the data date, not wall-clock now() (FIX 2026-04).
+        const ACWP_c = calculateACWP(workingNodes, CostRate, true, statusDate);
 
         const BCWP = BCWP_h * CostRate;
         const BCWS = BCWS_h * CostRate;
@@ -2632,8 +2692,23 @@ function updatePredictedValues_Improved(nodes, statusDate, scheduleMultiplier, s
     const daysPerWeek = _evmDaysPerWeek(); // FIX: was hardcoded 5
     const sd = safeDate(statusDate) || window.cybereumState?.dataDate || new Date();
 
-    // Get pre-computed data structures from PathScripts
-    const succMap = window.cybereumState?.succMap || window.cybereumState?.cpm?.succMap; // FIX: cpm fallback
+    // Get pre-computed data structures from PathScripts.
+    // BUG FIX (2026-04): when neither precomputed map is present we now
+    // build the succMap inline from links, so distance decay always
+    // fires.  Originally the function silently skipped Step 2 when
+    // succMap was absent, making the decay dependent on the caller
+    // having pre-populated cybereumState -- and producing different
+    // predicted durations in environments where it wasn't (the diff
+    // harness, isolated unit tests, etc.).
+    let succMap = window.cybereumState?.succMap || window.cybereumState?.cpm?.succMap;
+    if (!succMap && Array.isArray(links)) {
+        succMap = new Map();
+        for (const link of links) {
+            const src = String(link.source);
+            if (!succMap.has(src)) succMap.set(src, []);
+            succMap.get(src).push(link);
+        }
+    }
     const predMap = window.cybereumState?.predMap || window.cybereumState?.cpm?.predMap; // FIX: cpm fallback
 
     // Ensure nodeMap exists

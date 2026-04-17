@@ -276,12 +276,30 @@ def compute_bac_hours(nodes, hours_per_day: float = 8.0,
 
 def compute_acwp(nodes, cost_rate: float = 1.0, status_date=None,
                  hours_per_day: float = 8.0,
-                 working_days_per_week: float = 5.0) -> float:
+                 working_days_per_week: float = 5.0,
+                 apply_cost_rate: bool = True) -> float:
     """Port of calculateACWP (EVM.js 1065-1117).
 
-    If ActualCost is set and positive, use it directly.  Otherwise
-    impute from planned hours * pct * cost_rate, with a cost multiplier
-    (1.0 .. 2.0) when the activity is behind expected linear progress.
+    If ActualCost is set and positive, use it directly (assumed to be in
+    cost units; will be passed through as hours when ``apply_cost_rate``
+    is False by dividing by ``cost_rate``).  Otherwise impute from
+    planned hours * pct, with a cost multiplier (1.0 .. 2.0) when the
+    activity is behind expected linear progress.
+
+    BUG FIX (vs original JS): the JS file mixes units -- it returns ACWP
+    in cost dollars but feeds it into ``calculateEVMetrics(BCWP_hours,
+    ACWP_dollars, BCWS_hours)`` which makes CPI = hours / dollars,
+    off by a factor of CostRate.
+
+    The ``apply_cost_rate`` flag controls which branch:
+      True  (default): legacy behaviour, returns dollars (cost).
+                       Used for cost-distribution arrays.
+      False:           returns hours (no cost rate applied).  Used for
+                       the metrics call so CPI = EV/AC is in consistent
+                       units.
+
+    The JS now has a sibling ``calculateACWP_Hours`` mirroring the
+    False branch and feeds it into ``calculateEVMetrics``.
     """
     from datetime import datetime, timezone
     today = safe_date(status_date) or datetime.now(tz=timezone.utc)
@@ -302,7 +320,18 @@ def compute_acwp(nodes, cost_rate: float = 1.0, status_date=None,
             except (TypeError, ValueError):
                 ac_val = 0.0
             if ac_val > 0 and math.isfinite(ac_val):
-                total += ac_val
+                if apply_cost_rate:
+                    total += ac_val
+                else:
+                    # Convert dollars back to hours using node CostRate (best
+                    # effort).  Falls back to project default cost_rate.
+                    try:
+                        node_rate = float(node.get('CostRate'))
+                        if not math.isfinite(node_rate) or node_rate <= 0:
+                            node_rate = cost_rate
+                    except (TypeError, ValueError):
+                        node_rate = cost_rate
+                    total += ac_val / max(node_rate, 1e-9)
                 continue
 
             node_start = safe_date(node.get('ActualStart') or node.get('Start'))
@@ -332,11 +361,24 @@ def compute_acwp(nodes, cost_rate: float = 1.0, status_date=None,
                     if pct < expected_progress and expected_progress > 0:
                         cost_multiplier = clamp(
                             expected_progress / pct, 1.0, 2.0)
-            total += planned_hrs * pct * node_cost_rate * cost_multiplier
+            base = planned_hrs * pct * cost_multiplier
+            total += base * (node_cost_rate if apply_cost_rate else 1.0)
         except Exception:
-            # Match JS: log and continue (we don't throw on a single bad node)
             continue
     return total
+
+
+def compute_acwp_hours(nodes, status_date=None, hours_per_day: float = 8.0,
+                       working_days_per_week: float = 5.0,
+                       cost_rate: float = 1.0) -> float:
+    """ACWP in hours, used for the unit-consistent CPI calculation.
+
+    Convenience wrapper for ``compute_acwp(..., apply_cost_rate=False)``.
+    Mirrors JS ``calculateACWP_Hours``.
+    """
+    return compute_acwp(nodes, cost_rate, status_date,
+                        hours_per_day, working_days_per_week,
+                        apply_cost_rate=False)
 
 
 # ---------------------------------------------------------------------------
@@ -377,8 +419,15 @@ def compute_forecasted_bcwp(nodes, status_date, hours_per_day: float = 8.0,
 
 def compute_forecasted_acwp(nodes, status_date, cost_rate: float = 1.0,
                             hours_per_day: float = 8.0,
-                            working_days_per_week: float = 5.0) -> float:
-    """Port of calculateForecastedACWP (EVM.js 1232-1264)."""
+                            working_days_per_week: float = 5.0,
+                            apply_cost_rate: bool = True) -> float:
+    """Port of calculateForecastedACWP (EVM.js 1232-1264).
+
+    BUG FIX (matches compute_acwp): ``apply_cost_rate=False`` returns
+    hours instead of dollars so the CPI calculation has consistent
+    units.  Engine uses False for the metrics call and True for the
+    cost-distribution display.
+    """
     sd = safe_date(status_date)
     if sd is None:
         return 0.0
@@ -404,8 +453,20 @@ def compute_forecasted_acwp(nodes, status_date, cost_rate: float = 1.0,
             continue
         s = rstart.timestamp()
         f = rend.timestamp()
+        rate_factor = node_rate if apply_cost_rate else 1.0
         if sd_time >= f:
-            acwp += risk_hrs * node_rate
+            acwp += risk_hrs * rate_factor
         elif sd_time > s and (f - s) > 0:
-            acwp += risk_hrs * node_rate * ((sd_time - s) / (f - s))
+            acwp += risk_hrs * rate_factor * ((sd_time - s) / (f - s))
     return acwp
+
+
+def compute_forecasted_acwp_hours(nodes, status_date,
+                                  hours_per_day: float = 8.0,
+                                  working_days_per_week: float = 5.0) -> float:
+    """Forecasted ACWP in hours.  Mirrors JS calculateForecastedACWP_Hours."""
+    return compute_forecasted_acwp(nodes, status_date,
+                                   cost_rate=1.0,
+                                   hours_per_day=hours_per_day,
+                                   working_days_per_week=working_days_per_week,
+                                   apply_cost_rate=False)

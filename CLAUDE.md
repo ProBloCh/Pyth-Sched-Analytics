@@ -39,7 +39,12 @@ EAC, duration-weighted progress, schedule-delay prediction, and
 time-phased cumulative + period distributions) ported from the JS
 `Reference/EVM.js`; output shape mirrors `window.evmMetrics` so
 downstream consumers (notably `Completionprediction.js` reading
-`.actual.CPIcum`) work unchanged.  Tests: 297 across 6 test files.
+`.actual.CPIcum`) work unchanged.  Tests: 333 across 7 test files,
+including a JS-vs-Python diff harness
+(`tests/test_evm_diff.py` + `tests/diff_harness/run_js_evm.js`) that
+runs the JS reference implementation under Node.js on shared fixtures
+and asserts every scalar metric agrees within `1e-6` relative
+tolerance and predicted dates within 24 h.
 
 ## Four Principles
 

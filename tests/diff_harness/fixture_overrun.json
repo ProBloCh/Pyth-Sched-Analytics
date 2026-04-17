@@ -1,0 +1,37 @@
+{
+    "nodes": [
+        {"ID": "0", "Duration": 0, "Milestone": 1,
+         "Start": "2025-02-01T00:00:00Z", "Finish": "2025-02-01T00:00:00Z"},
+        {"ID": "1", "Duration": 20, "TimeUnits": "days", "Name": "Engineering",
+         "Start": "2025-02-01T00:00:00Z", "Finish": "2025-03-01T00:00:00Z",
+         "ActualStart": "2025-02-01T00:00:00Z", "PercentComplete": 30,
+         "CostRate": 150, "ActualCost": 12000},
+        {"ID": "2", "Duration": 30, "TimeUnits": "days", "Name": "Procurement",
+         "Start": "2025-03-01T00:00:00Z", "Finish": "2025-04-15T00:00:00Z",
+         "PercentComplete": 0, "CostRate": 80,
+         "riskAdjustedStart": "2025-03-05T00:00:00Z",
+         "riskAdjustedEnd": "2025-04-25T00:00:00Z",
+         "riskAdjustedDuration": 35},
+        {"ID": "3", "Duration": 15, "TimeUnits": "days", "Name": "Construction",
+         "Start": "2025-04-15T00:00:00Z", "Finish": "2025-05-06T00:00:00Z",
+         "PercentComplete": 0, "CostRate": 120}
+    ],
+    "links": [
+        {"source": "0", "target": "1", "type": "FS", "lag": 0},
+        {"source": "1", "target": "2", "type": "FS", "lag": 0},
+        {"source": "2", "target": "3", "type": "FS", "lag": 0}
+    ],
+    "options": {
+        "statusDate": "2025-02-20T00:00:00Z",
+        "costRate": 100,
+        "currency": "USD",
+        "project": {"sector": "infrastructure"},
+        "hoursPerDay": 8,
+        "workingDaysPerWeek": 5,
+        "calendar": {
+            "hoursPerDay": 8,
+            "workingDays": [1, 2, 3, 4, 5],
+            "holidays": []
+        }
+    }
+}
