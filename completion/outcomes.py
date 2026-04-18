@@ -154,6 +154,15 @@ def validate_outcome(record):
         for k in _REQUIRED_PREDICTED:
             if k not in pred:
                 errs.append(f'predicted.{k} is required')
+        # Validate ISO parseability for the timestamps we'll later need
+        # in calibration_report.  Without this, malformed strings slip
+        # through validation and silently reduce calibration signal.
+        for k in ('p80_finish', 'p50_finish', 'p95_finish', 'baseline_finish'):
+            v = pred.get(k)
+            if v is not None and (not isinstance(v, str) or
+                                  _parse_iso(v) is None):
+                errs.append(f'predicted.{k} is not a parseable ISO-8601 '
+                            f'timestamp: {v!r}')
 
     actual = record.get('actual') or {}
     if not isinstance(actual, dict):
@@ -162,6 +171,11 @@ def validate_outcome(record):
         for k in _REQUIRED_ACTUAL:
             if k not in actual:
                 errs.append(f'actual.{k} is required')
+        a_finish = actual.get('finish')
+        if a_finish is not None and (not isinstance(a_finish, str) or
+                                     _parse_iso(a_finish) is None):
+            errs.append(f'actual.finish is not a parseable ISO-8601 '
+                        f'timestamp: {a_finish!r}')
 
     rc = record.get('reference_class')
     if rc is not None and not isinstance(rc, str):
@@ -325,13 +339,23 @@ def calibration_report(reference_class=None):
 
 
 def _parse_iso(s):
+    """Parse an ISO-8601 string, always returning a timezone-aware UTC
+    datetime (or None on failure).  Naive inputs -- e.g. '2025-01-01' or
+    '2025-01-01T00:00:00' without a tz suffix -- are assumed UTC, matching
+    the rest of the codebase's "naive => UTC" convention.  Without this
+    normalisation, subtraction against tz-aware datetimes later in
+    calibration_report raised TypeError and the record was silently
+    skipped."""
     if s is None:
         return None
     try:
         clean = str(s).replace('Z', '+00:00')
-        return datetime.fromisoformat(clean)
+        dt = datetime.fromisoformat(clean)
     except (TypeError, ValueError):
         return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 __all__ = [

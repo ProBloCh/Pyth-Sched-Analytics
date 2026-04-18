@@ -55,7 +55,14 @@ def _parse_holiday(value):
         # Accept bare YYYY-MM-DD too
         if 'T' not in s and len(s) == 10:
             s = s + 'T00:00:00+00:00'
-        dt = datetime.fromisoformat(s).astimezone(timezone.utc)
+        dt = datetime.fromisoformat(s)
+        # astimezone(timezone.utc) raises on naive datetimes and would
+        # silently drop the holiday; treat naive input as UTC to match
+        # the repo-wide "naive => UTC" convention (see evm.helpers.safe_date).
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
         midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0)
         return midnight.timestamp() * 1000.0
     except Exception:

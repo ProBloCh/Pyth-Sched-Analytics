@@ -2318,14 +2318,19 @@ function _evmFingerprint(nodes, links) {
 
 function _evmBuildRequestBody(nodes, links) {
     const teamCal = (window.cybereumState && window.cybereumState.teamCalendar) || null;
-    const hpd = (teamCal && teamCal.hoursPerDay) || evmConfig.WORKING_HOURS_PER_DAY
-        || CONFIG?.WORKING_HOURS_PER_DAY || 8;
+    // `window.CONFIG?.X` is safe here; plain `CONFIG?.X` would still
+    // throw ReferenceError if CONFIG is an undeclared identifier
+    // (optional chaining only handles null/undefined *values*, not
+    // undeclared names).  evmConfig is always declared in this file.
+    const cfg = (typeof window !== 'undefined' && window.CONFIG) || null;
+    const hpd = (teamCal && teamCal.hoursPerDay)
+        || (cfg && cfg.WORKING_HOURS_PER_DAY) || 8;
     const workingDaysList = (teamCal && Array.isArray(teamCal.workingDays) && teamCal.workingDays.length)
         ? teamCal.workingDays.slice()
         : null;
     const dpw = workingDaysList
         ? workingDaysList.length
-        : (evmConfig.WORKING_DAYS_PER_WEEK || CONFIG?.WORKING_DAYS_PER_WEEK || 5);
+        : ((cfg && cfg.WORKING_DAYS_PER_WEEK) || 5);
     const holidaysList = (teamCal && Array.isArray(teamCal.holidays))
         ? teamCal.holidays.slice() : [];
     const startNode = (nodes || []).find(n => String(n.ID) === '0') || (nodes || [])[0] || {};

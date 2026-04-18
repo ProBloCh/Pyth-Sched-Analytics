@@ -256,15 +256,18 @@ def _validate_recovery_config(data):
     cfg = data.get('config')
     if not (cfg and isinstance(cfg, dict)):
         return None
+    # (key, lo, hi, integer_only).  Integer-only fields are used as
+    # slice / count indices downstream and must not accept 10.5 -- that
+    # previously turned a client error into a 500 at `candidates[:cfg.x]`.
     checks = [
-        ('max_risk_buffer_days',         0.0,  365.0),
-        ('max_recovery_options',         1,    200),
-        ('max_lag_options',              0,    200),
-        ('min_crashable_hours',          0.0,  10_000.0),
-        ('min_lag_days_for_compression', 0.0,  365.0),
-        ('lag_compression_factor',       0.0,  1.0),
+        ('max_risk_buffer_days',         0.0,  365.0,    False),
+        ('max_recovery_options',         1,    200,      True),
+        ('max_lag_options',              0,    200,      True),
+        ('min_crashable_hours',          0.0,  10_000.0, False),
+        ('min_lag_days_for_compression', 0.0,  365.0,    False),
+        ('lag_compression_factor',       0.0,  1.0,      False),
     ]
-    for key, lo, hi in checks:
+    for key, lo, hi, int_only in checks:
         if key not in cfg:
             continue
         try:
@@ -273,6 +276,8 @@ def _validate_recovery_config(data):
             return f'config.{key} must be a number'
         if math.isnan(fv) or math.isinf(fv) or fv < lo or fv > hi:
             return f'config.{key} must be in [{lo}, {hi}]'
+        if int_only and not float(fv).is_integer():
+            return f'config.{key} must be an integer'
     return None
 
 

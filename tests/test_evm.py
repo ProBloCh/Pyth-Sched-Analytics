@@ -1159,6 +1159,99 @@ class TestDurationToWorkHoursCalendar:
         assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
 
 
+class TestOutcomeValidationHardening:
+    """Locks Copilot fixes for completion/outcomes:
+    - validate_outcome now parses timestamps and returns errors for
+      unparseable ISO strings (previously slipped through and got
+      silently skipped in calibration_report).
+    - _parse_iso returns tz-aware UTC for naive inputs so later
+      subtraction against tz-aware datetimes doesn't raise TypeError.
+    """
+
+    def test_malformed_p80_finish_rejected(self):
+        from completion.outcomes import validate_outcome
+        errs = validate_outcome({
+            'project_id': 'X',
+            'predicted': {'p80_finish': 'not-a-date'},
+            'actual': {'finish': '2026-01-01T00:00:00Z'},
+        })
+        assert any('p80_finish' in e and 'ISO' in e for e in errs), errs
+
+    def test_malformed_actual_finish_rejected(self):
+        from completion.outcomes import validate_outcome
+        errs = validate_outcome({
+            'project_id': 'X',
+            'predicted': {'p80_finish': '2026-01-01T00:00:00Z'},
+            'actual': {'finish': '2026-13-40'},
+        })
+        assert any('actual.finish' in e and 'ISO' in e for e in errs), errs
+
+    def test_valid_outcome_no_errors(self):
+        from completion.outcomes import validate_outcome
+        errs = validate_outcome({
+            'project_id': 'X',
+            'predicted': {'p80_finish': '2026-12-31T00:00:00Z',
+                          'baseline_finish': '2026-06-01T00:00:00Z'},
+            'actual': {'finish': '2027-01-15T00:00:00Z'},
+        })
+        assert errs == []
+
+    def test_parse_iso_naive_becomes_utc(self):
+        from completion.outcomes import _parse_iso
+        dt = _parse_iso('2025-01-01T00:00:00')  # naive
+        assert dt is not None
+        assert dt.tzinfo is not None
+
+    def test_parse_iso_bare_date_becomes_utc(self):
+        from completion.outcomes import _parse_iso
+        dt = _parse_iso('2025-01-01')
+        assert dt is not None
+        assert dt.tzinfo is not None
+
+
+class TestRecoveryConfigIntegerFields:
+    """Locks Copilot fix: max_recovery_options / max_lag_options reject
+    non-integer floats at validation time rather than 500'ing on a
+    slice index later."""
+
+    def test_float_max_recovery_options_rejected(self, client):
+        resp = client.post('/completion/recovery-options', json={
+            'nodes': [{'ID': 'A', 'Duration': 5, 'TimeUnits': 'days'}],
+            'links': [],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {'max_recovery_options': 10.5},
+        })
+        assert resp.status_code == 400
+        assert 'integer' in resp.get_json()['error']
+
+    def test_integer_accepted(self, client):
+        resp = client.post('/completion/recovery-options', json={
+            'nodes': [{'ID': 'A', 'Duration': 5, 'TimeUnits': 'days'}],
+            'links': [],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {'max_recovery_options': 10, 'max_lag_options': 5},
+        })
+        assert resp.status_code == 200
+
+
+class TestCalendarNaiveHoliday:
+    """Locks Copilot fix: _parse_holiday accepts naive datetimes (treats
+    them as UTC) rather than silently dropping them via the astimezone
+    ValueError path."""
+
+    def test_naive_iso_holiday_accepted(self):
+        from completion.calendar import _parse_holiday
+        # Naive ISO (no tz) -- previously dropped silently.
+        ms = _parse_holiday('2025-07-04T00:00:00')
+        assert ms is not None
+        assert isinstance(ms, float)
+
+    def test_bare_date_holiday_accepted(self):
+        from completion.calendar import _parse_holiday
+        ms = _parse_holiday('2025-07-04')
+        assert ms is not None
+
+
 class TestRecoveryISOValidation:
     """Locks Copilot fix: recovery endpoint validator rejects malformed
     ISO strings in planned_finish / expected_finish / p80_finish rather

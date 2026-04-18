@@ -17,9 +17,10 @@ Explicitly NOT extracted (stays frontend):
   - DOM updates (tables, insight panels, tab UI)
   - Event dispatching (`evmInit`)
 
-The JS wrapper (see Reference/EVM.js async layer) maps the snake_case
-response back to the camelCase `window.evmMetrics` shape consumers
-expect so nothing downstream changes (notably
+The backend returns camelCase keys directly -- same shape as the
+existing `window.evmMetrics` object -- so the JS wrapper
+(Reference/EVM.js async layer) can drop the response in without
+any key conversion.  Nothing downstream changes (notably
 Completionprediction.js:4871 which reads `.actual.CPIcum`).
 
 Grounding: PMI EVM Practice Standard; sector overrun table derived
