@@ -23,8 +23,9 @@ event stay frontend.
 ## POST /evm/analyze
 
 Runs the full EVM computation and returns a dict that the JS wrapper
-can drop into `window.evmMetrics` unchanged (after snake_case ->
-camelCase is handled inside the engine response already).
+can drop into `window.evmMetrics` unchanged.  The response keys are
+already camelCase (matching the existing `window.evmMetrics` shape)
+so no key conversion is required on the JS side.
 
 ### Request
 
@@ -76,7 +77,9 @@ camelCase is handled inside the engine response already).
   "forecasted": {                 // Drop-in shape for evmMetrics.forecasted
     "BCWS": 40.0, "BCWP": 40.0, "ACWP": 4000.0, "BAC": 120.0, "EAC": 140.0,
     "SV": 0.0, "CV": -3960.0,
-    "SPI": 1.0, "SPI_model": 1.0,       // Raw preserves Infinity when PV=0 & EV>0
+    "SPI": 1.0, "SPI_model": 1.0,       // Raw is null when PV=0 & EV>0 (JSON
+                                        //   can't represent Infinity).  Treat
+                                        //   null as "non-finite, use *_model".
     "CPIcum": 0.01, "CPIcum_model": 0.05,
     "flags": { "pvZeroWithEV": false, "acZeroWithEV": false },
     "percentComplete": 33.33,           // 0..100 scale

@@ -197,7 +197,7 @@ def test_predicted_dates_within_one_day(fixture_path):
     # Easiest: rerun update_predicted_values directly.
     with open(fixture_path) as f:
         fixture = json.load(f)
-    from evm.engine import _auto_complete_start_milestone, _has_risk_adjusted_dates
+    from evm.engine import _auto_complete_start_milestone
     from evm.metrics import compute_evm_metrics
     from evm.forecast import (
         compute_schedule_delay, find_frontier_nodes,

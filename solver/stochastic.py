@@ -357,10 +357,19 @@ def _compute_caps(risk, durations, fat_thresh,
         # 6:10 ratio used in the historic cap design.
         std_ceiling = pareto_ceiling * (6.0 / 10.0)
 
+    # Clamp lerp bases so caps stay monotone (non-decreasing) in blend
+    # when a thin-tailed sector sets max_multiplier_cap below the
+    # default bases.  Without clamping, pareto_ceiling=3 gave
+    # caps = 4.0 at blend=0 -> 3.0 at blend=1 (decreasing), and the
+    # standard tier went 2.0 -> 1.8.  With clamping, a cap below the
+    # default base flattens the lerp to a constant = ceiling.
+    pareto_base = min(4.0, pareto_ceiling)
+    std_base    = min(2.0, std_ceiling)
+
     caps = np.where(
         is_pareto,
-        4.0 + (pareto_ceiling - 4.0) * blend,
-        2.0 + (std_ceiling - 2.0) * blend,
+        pareto_base + (pareto_ceiling - pareto_base) * blend,
+        std_base    + (std_ceiling    - std_base)    * blend,
     )
     return caps
 

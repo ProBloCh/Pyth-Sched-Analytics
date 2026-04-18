@@ -597,16 +597,21 @@ def run_recovery_options(nodes, links, status_date,
     if status_ms is None:
         raise ValueError("status_date must be a valid ISO-8601 date string")
 
+    # Extract calendar values from project_context first so link-lag
+    # normalisation below and CPM/float calculations all use the same
+    # hours_per_day / working_days_per_week.
+    cal_cfg = ((project_context or {}).get('calendar') or {}) if isinstance(
+        project_context, dict) else {}
+    hours_per_day = float(cal_cfg.get('hours_per_day',
+                                      config.hours_per_day))
+    working_days_per_week = float(cal_cfg.get('working_days_per_week', 5.0))
+
     # Normalise link lag units BEFORE build_dag, so the CPM slack /
     # critical-path calculation uses the same lag interpretation as
     # the lag-compression candidate filter downstream.  solver/dag.py
     # treats ``lag`` abstractly (no unit awareness), so we convert
-    # here while lagUnits is still available.  hours_per_day default
-    # is 8 because project_context is parsed slightly later; the
-    # small difference vs a non-default calendar is acceptable at
-    # the CPM-slack stage (the recovery filter itself re-reads the
-    # calendar when packaging options).
-    links = _normalise_link_lags(links)
+    # here while lagUnits is still available.
+    links = _normalise_link_lags(links, hours_per_day, working_days_per_week)
 
     # Calendar reuse: same construction as the MC endpoint
     dag_state, id_to_idx = build_dag(nodes, links)
@@ -617,10 +622,6 @@ def run_recovery_options(nodes, links, status_date,
     calendar = _maybe_build_calendar(
         nodes, dag_state, id_to_idx, status_ms, activity_metadata,
         project_context)
-    cal_cfg = ((project_context or {}).get('calendar') or {}) if isinstance(
-        project_context, dict) else {}
-    hours_per_day = float(cal_cfg.get('hours_per_day',
-                                      config.hours_per_day))
 
     # Deterministic CPM (already run inside build_dag) gives TF.
     # Critical-path set: nodes with TF ~= 0.

@@ -1159,6 +1159,101 @@ class TestTier4AliasBackcompat:
         assert resp.status_code == 200
 
 
+class TestLowMaxMultiplierCap:
+    """Locks the Copilot fix: caps must be monotone (non-decreasing) in
+    blend = risk * dur_frac, even for thin-tailed sectors that set
+    max_multiplier_cap below the default lerp bases (4.0 pareto,
+    2.0 std).  Regression: previously, cap=3.0 yielded pareto cap =
+    4.0 at low blend dropping to 3.0 at high blend.
+    """
+
+    def test_caps_are_non_decreasing_for_low_cap(self):
+        import numpy as np
+        from solver.stochastic import _compute_caps
+
+        # risk ordering low -> high, durations uniform
+        risk = np.array([0.1, 0.3, 0.5, 0.7, 0.9])
+        durations = np.array([10.0, 10.0, 10.0, 10.0, 10.0])
+        fat_thresh = np.full(5, 0.40)
+
+        caps = _compute_caps(risk, durations, fat_thresh,
+                             max_multiplier_cap=3.0)
+        # Every cap <= configured cap, and caps never decrease with risk.
+        assert np.all(caps <= 3.0 + 1e-9)
+        assert np.all(np.diff(caps) >= -1e-9)
+
+    def test_standard_tier_not_below_cap(self):
+        import numpy as np
+        from solver.stochastic import _compute_caps
+
+        # All standard-tier (risk below fat_thresh)
+        risk = np.full(5, 0.10)
+        durations = np.array([1.0, 2.5, 5.0, 7.5, 10.0])
+        fat_thresh = np.full(5, 0.40)
+
+        caps = _compute_caps(risk, durations, fat_thresh,
+                             max_multiplier_cap=3.0)
+        # Std ceiling = 0.6 * 3 = 1.8.  Monotone in dur_frac, below cap.
+        assert np.all(caps <= 1.8 + 1e-9)
+        assert np.all(np.diff(caps) >= -1e-9)
+
+    def test_default_cap_behaviour_unchanged(self):
+        import numpy as np
+        from solver.stochastic import _compute_caps
+
+        # Default path (no cap): std tier lerps 2->6, pareto lerps 4->10.
+        risk = np.array([0.1, 0.9])
+        durations = np.array([10.0, 10.0])
+        fat_thresh = np.full(2, 0.40)
+
+        caps_no_cap = _compute_caps(risk, durations, fat_thresh,
+                                    max_multiplier_cap=None)
+        caps_cap_10 = _compute_caps(risk, durations, fat_thresh,
+                                    max_multiplier_cap=10.0)
+        # max_multiplier_cap=10 must match the no-cap default exactly.
+        assert np.allclose(caps_no_cap, caps_cap_10)
+
+
+class TestRecoveryCustomCalendarLag:
+    """Locks the Copilot fix: link-lag normalisation reads
+    hours_per_day / working_days_per_week from project_context before
+    CPM runs, not the default 8/5.  Regression: previously, a non-
+    default calendar could yield different critical-path detection vs
+    the downstream lag-candidate path.
+    """
+
+    def test_lag_in_days_respects_non_default_hours_per_day(self, client):
+        # 1-day lag converted at hours_per_day=10 should equal a
+        # 10-hour lag on the same calendar.
+        nodes = [
+            {'ID': 'A', 'Duration': 10, 'TimeUnits': 'days'},
+            {'ID': 'B', 'Duration': 10, 'TimeUnits': 'days'},
+        ]
+        opts = {
+            'status_date': '2025-01-01T00:00:00Z',
+            'project_context': {'calendar': {
+                'hours_per_day': 10,
+                'working_days_per_week': 5,
+                'working_days': [1, 2, 3, 4, 5],
+            }},
+        }
+        r_days = client.post('/completion/recovery-options', json={
+            **opts, 'nodes': nodes,
+            'links': [{'source': 'A', 'target': 'B',
+                       'type': 'FS', 'lag': 1, 'lagUnits': 'd'}],
+        }).get_json()
+        r_hours = client.post('/completion/recovery-options', json={
+            **opts, 'nodes': nodes,
+            'links': [{'source': 'A', 'target': 'B',
+                       'type': 'FS', 'lag': 10, 'lagUnits': 'h'}],
+        }).get_json()
+        assert (len(r_days['lag_candidates'])
+                == len(r_hours['lag_candidates']))
+        if r_days['lag_candidates']:
+            assert (r_days['lag_candidates'][0]['lag_hrs']
+                    == r_hours['lag_candidates'][0]['lag_hrs'])
+
+
 class TestJudgementWarningEnhanced:
     """reference_class_judgement warning surfaces the actual source notes."""
 
