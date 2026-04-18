@@ -348,11 +348,12 @@ def calibration_report(reference_class=None):
 def _parse_iso(s):
     """Parse an ISO-8601 string, always returning a timezone-aware UTC
     datetime (or None on failure).  Naive inputs -- e.g. '2025-01-01' or
-    '2025-01-01T00:00:00' without a tz suffix -- are assumed UTC, matching
-    the rest of the codebase's "naive => UTC" convention.  Without this
-    normalisation, subtraction against tz-aware datetimes later in
-    calibration_report raised TypeError and the record was silently
-    skipped."""
+    '2025-01-01T00:00:00' without a tz suffix -- are assumed UTC.  Inputs
+    with a non-UTC offset (e.g. '2025-01-01T00:00:00+05:00') are
+    converted to UTC so day-delta computations in calibration_report
+    don't skew on customers who submit local-time timestamps.  Matches
+    the repo-wide "naive => UTC, aware => convert to UTC" convention
+    (evm.helpers.safe_date)."""
     if s is None:
         return None
     try:
@@ -362,6 +363,8 @@ def _parse_iso(s):
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
     return dt
 
 

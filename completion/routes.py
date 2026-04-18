@@ -436,6 +436,13 @@ def register_outcome_route():
     """
     if request.method == 'OPTIONS':
         return jsonify({'status': 'ok'})
+    # Same payload-size guard the heavy-compute endpoints use, so the
+    # outcome registry isn't an unbounded ingestion path.  Outcome
+    # records are small (kilobytes); a 10 MB ceiling rejects clearly-
+    # abusive payloads without rejecting any legitimate use.
+    if (request.content_length is not None
+            and request.content_length > MAX_PAYLOAD_BYTES):
+        return jsonify({'error': 'Payload too large (limit: 10 MB)'}), 413
     data = request.get_json(force=True, silent=True)
     if not data:
         return jsonify({'error': 'Invalid or missing JSON body'}), 400

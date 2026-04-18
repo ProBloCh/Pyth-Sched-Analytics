@@ -1172,6 +1172,55 @@ class TestDurationToWorkHoursCalendar:
         assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
 
 
+class TestUTCNormalisation:
+    """Locks Copilot fix: safe_date and outcomes._parse_iso both
+    normalise tz-aware non-UTC inputs to UTC, matching the
+    repo-wide 'naive => UTC, aware => convert to UTC' convention.
+    """
+
+    def test_safe_date_aware_non_utc_converts_to_utc(self):
+        from datetime import datetime, timezone, timedelta
+        from evm.helpers import safe_date
+        # +05:00 input -> output should be in UTC
+        dt = datetime(2025, 1, 1, 12, 0, tzinfo=timezone(timedelta(hours=5)))
+        out = safe_date(dt)
+        assert out.tzinfo == timezone.utc
+        # 12:00 +05:00 == 07:00 UTC
+        assert out.hour == 7
+
+    def test_safe_date_iso_with_offset_converts_to_utc(self):
+        from datetime import timezone
+        from evm.helpers import safe_date
+        out = safe_date('2025-01-01T12:00:00+05:00')
+        assert out.tzinfo == timezone.utc
+        assert out.hour == 7
+
+    def test_outcomes_parse_iso_aware_converts_to_utc(self):
+        from datetime import timezone
+        from completion.outcomes import _parse_iso
+        out = _parse_iso('2025-01-01T12:00:00+05:00')
+        assert out.tzinfo == timezone.utc
+        assert out.hour == 7
+
+
+class TestRegisterOutcomePayloadCap:
+    """Locks Copilot fix: register_outcome enforces the same 10MB
+    payload cap the heavy-compute endpoints use, so the outcome
+    registry isn't an unbounded ingestion path."""
+
+    def test_oversized_content_length_rejected(self, client):
+        # 11 MB of payload (over the 10 MB cap).  The flask test
+        # client recomputes Content-Length from the body, so a
+        # synthetic header alone gets ignored -- send actual bytes.
+        big = 'x' * (11 * 1024 * 1024)
+        resp = client.post(
+            '/completion/register-outcome',
+            data=big,
+            headers={'Content-Type': 'application/json'})
+        assert resp.status_code == 413
+        assert 'too large' in resp.get_json()['error'].lower()
+
+
 class TestAutoCompleteStartMilestoneJsParity:
     """Locks Copilot fix: _auto_complete_start_milestone now mirrors
     the JS reference autoCompleteStartMilestone (EVM.js 1355-1392):

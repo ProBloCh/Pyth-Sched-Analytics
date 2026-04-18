@@ -54,7 +54,13 @@ def safe_date(value) -> Optional[datetime]:
     if value is None or value == '':
         return None
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        # Normalise to UTC: naive -> assume UTC; tz-aware -> convert to UTC
+        # so day-boundary logic (date keys, holiday matching) doesn't shift
+        # for inputs in non-UTC offsets.  Matches JS Date semantics, which
+        # internally stores epoch ms (no zone) and compares in UTC.
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
     if isinstance(value, (int, float)):
         if not math.isfinite(value):
             return None
@@ -72,6 +78,8 @@ def safe_date(value) -> Optional[datetime]:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
         return dt
     except (TypeError, ValueError):
         return None
