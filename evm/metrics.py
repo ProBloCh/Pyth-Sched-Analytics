@@ -17,12 +17,35 @@ downstream use.
 
 from __future__ import annotations
 
+import logging
 import math
 
 from .helpers import (
     Bounds, clamp, safe_date, convert_to_hours,
     normalize_percent_complete, difference_in_calendar_days,
 )
+
+logger = logging.getLogger(__name__)
+
+# Rate-limited warning flag for compute_acwp dirty-data paths.
+# Process-level: once per process, logs the first unexpected shape so
+# field diagnostics are possible without flooding logs on a 10K-node
+# project with many malformed rows.
+_ACWP_WARNED = {'emitted': False}
+
+
+def _acwp_warn_once(node, exc):
+    if _ACWP_WARNED['emitted']:
+        return
+    try:
+        nid = str(node.get('ID', node.get('id', '<unknown>')))
+    except Exception:
+        nid = '<unreadable>'
+    logger.warning(
+        'compute_acwp: skipping node id=%s due to unexpected data shape '
+        '(%s: %s); further warnings suppressed for this process.',
+        nid, type(exc).__name__, exc)
+    _ACWP_WARNED['emitted'] = True
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +386,13 @@ def compute_acwp(nodes, cost_rate: float = 1.0, status_date=None,
                             expected_progress / pct, 1.0, 2.0)
             base = planned_hrs * pct * cost_multiplier
             total += base * (node_cost_rate if apply_cost_rate else 1.0)
-        except Exception:
+        except Exception as exc:
+            # Match the JS reference: log once per unexpected shape
+            # (e.g. corrupt date string, non-numeric Duration) so field
+            # diagnostics are possible; then skip the node.  Rate-
+            # limited via module-level flag so a 10K-node project with
+            # dirty data doesn't flood the logs.
+            _acwp_warn_once(node, exc)
             continue
     return total
 

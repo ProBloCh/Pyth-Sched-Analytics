@@ -107,9 +107,10 @@ def _validate_common(data):
             return None, f'Duplicate activity ID: {nid}'
         seen_ids.add(sid)
 
-        # Allow (0, '0', '', None) as milestone-zero -- matches
-        # evm/routes._validate_common and the MC/recovery engines
-        # that treat blank duration as zero rather than rejecting.
+        # Allow (0, '0', '', None) as milestone-zero -- matches the
+        # EVM blueprint's _validate() in evm/routes.py and the MC /
+        # recovery engines, which treat blank duration as zero rather
+        # than rejecting.
         dur = node.get('Duration', node.get('duration', 0))
         if dur not in (0, '0', '', None):
             try:
@@ -288,12 +289,19 @@ def _validate_recovery(data):
     _, err = _validate_common(data)
     if err:
         return err
+    # Parse the optional finish fields here rather than accepting any
+    # non-empty string -- the engine silently coerces unparseable dates
+    # to None (which makes risk_buffer_days collapse to 0 and hides the
+    # caller's mistake), so treat a malformed ISO as a 400.
+    from .monte_carlo import _parse_iso_to_ms
     for key in ('planned_finish', 'expected_finish', 'p80_finish'):
         v = data.get(key)
         if v is None:
             continue
         if not isinstance(v, str) or not v:
             return f'{key} must be an ISO-8601 date string or null'
+        if _parse_iso_to_ms(v) is None:
+            return f'{key} is not a parseable ISO-8601 date: {v!r}'
     return _validate_recovery_config(data)
 
 

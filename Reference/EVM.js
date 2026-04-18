@@ -2266,18 +2266,52 @@ function _evmRecordTelemetry(kind, detail) {
 }
 
 function _evmFingerprint(nodes, links) {
-    // Cheap fingerprint that changes when the project data changes but
-    // not when the user just switches tabs.  Includes a monotonic
-    // version flag that callers can bump to force-refresh.
+    // Fingerprint that changes when the project data changes but not
+    // when the user just switches tabs.  Two projects with the same
+    // node/link counts, statusDate, and sector would previously collide
+    // here -- so we also fold in a cheap FNV-1a-style content hash of
+    // node IDs + key schedule fields and link endpoints + types, plus a
+    // monotonic version flag callers can bump to force-refresh.
     const statusDate = (window.cybereumState && window.cybereumState.dataDate)
         ? String(window.cybereumState.dataDate) : 'now';
     const sector = (window.cybereumState && window.cybereumState.project
                     && window.cybereumState.project.sector) || '';
+    const projectId = (window.cybereumState && window.cybereumState.project
+                       && (window.cybereumState.project.id
+                           || window.cybereumState.project.projectId)) || '';
+
+    // Cheap 32-bit FNV-1a over the minimal content string.  Fast (no
+    // crypto allocations), stable across tab switches, and collision
+    // rate is low enough for a request-dedup cache.
+    let h = 0x811c9dc5;
+    function mix(s) {
+        const str = String(s);
+        for (let i = 0; i < str.length; i++) {
+            h ^= str.charCodeAt(i);
+            h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+        }
+        h ^= 0x7c; // field separator (| char) so field-boundary collisions are rare
+        h >>>= 0;
+    }
+    const ns = nodes || [];
+    for (const n of ns) {
+        mix(n.ID);
+        mix(n.Start); mix(n.Finish);
+        mix(n.ActualStart); mix(n.ActualFinish);
+        mix(n.Duration); mix(n.PercentComplete);
+    }
+    const ls = links || [];
+    for (const l of ls) {
+        mix(l.source); mix(l.target); mix(l.type); mix(l.lag);
+    }
+
     return JSON.stringify({
-        n: (nodes || []).length,
-        l: (links || []).length,
+        n: ns.length,
+        l: ls.length,
         sd: statusDate,
         sc: sector,
+        p: projectId,
+        h: h.toString(16),
         v: window.evmInvalidationKey || 0,
     });
 }
