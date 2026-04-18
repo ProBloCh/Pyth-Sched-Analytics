@@ -1172,6 +1172,35 @@ class TestDurationToWorkHoursCalendar:
         assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
 
 
+class TestStatusDateRequired:
+    """Locks Copilot fix: /evm/analyze rejects requests without a
+    parseable options.statusDate so downstream ACWP doesn't fall back
+    to wall-clock now() and silently produce non-deterministic results.
+    """
+
+    def test_missing_status_date_400(self, client):
+        resp = client.post('/evm/analyze', json={
+            'nodes': [{'ID': '1', 'Duration': 5, 'TimeUnits': 'days'}],
+            'options': {'costRate': 100},  # statusDate missing
+        })
+        assert resp.status_code == 400
+        assert 'statusDate' in resp.get_json()['error']
+
+    def test_missing_options_400(self, client):
+        resp = client.post('/evm/analyze', json={
+            'nodes': [{'ID': '1', 'Duration': 5, 'TimeUnits': 'days'}],
+        })
+        assert resp.status_code == 400
+
+    def test_unparsable_status_date_400(self, client):
+        resp = client.post('/evm/analyze', json={
+            'nodes': [{'ID': '1', 'Duration': 5, 'TimeUnits': 'days'}],
+            'options': {'statusDate': 'not-a-date'},
+        })
+        assert resp.status_code == 400
+        assert 'parseable' in resp.get_json()['error']
+
+
 class TestNonObjectJSONRejected:
     """Locks Copilot fix: a JSON array (or any non-dict root) returns
     400 with a clear error rather than 500'ing on AttributeError."""

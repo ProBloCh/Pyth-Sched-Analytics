@@ -558,20 +558,21 @@ def _package_lag_options(lag_candidates, config, hours_per_day):
 # Expected-finish helper (deterministic forward pass, calendar-aware)
 # ---------------------------------------------------------------------------
 
-def _compute_expected_finish_ms(nodes, links, status_date, activity_metadata,
-                                project_context):
+def _compute_expected_finish_ms(nodes, dag_state, id_to_idx, status_ms,
+                                activity_metadata, calendar):
     """
-    Run the same deterministic forward pass as the MC (risk off) and
-    return the project finish in epoch ms.  Used when the caller does
-    not supply ``expected_finish``.
+    Deterministic forward pass + project-finish reduction.  Used when
+    the caller doesn't supply ``expected_finish``.
+
+    Takes already-built ``dag_state`` / ``calendar`` to avoid the
+    duplicate ``build_dag`` + ``_maybe_build_calendar`` work the
+    earlier MC-based implementation paid for on every recovery
+    request.  Delegates to monte_carlo.deterministic_expected_finish_ms.
     """
-    from .monte_carlo import run_completion_mc
-    r = run_completion_mc(
-        nodes, links, status_date,
-        activity_metadata=activity_metadata,
-        project_context=project_context,
-        config={'iterations': 1, 'enable_risk': False})
-    return _parse_iso_to_ms(r.get('expected_finish'))
+    from .monte_carlo import deterministic_expected_finish_ms
+    return deterministic_expected_finish_ms(
+        nodes, dag_state, id_to_idx, status_ms,
+        activity_metadata, calendar)
 
 
 # ---------------------------------------------------------------------------
@@ -643,7 +644,8 @@ def run_recovery_options(nodes, links, status_date,
 
     if expected_ms is None:
         expected_ms = _compute_expected_finish_ms(
-            nodes, links, status_date, activity_metadata, project_context)
+            nodes, dag_state, id_to_idx, status_ms,
+            activity_metadata, calendar)
 
     target_days, target_hours, overrun_days, risk_buffer_days = _compute_target(
         planned_ms, expected_ms, p80_ms,

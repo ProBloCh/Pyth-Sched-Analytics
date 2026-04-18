@@ -115,6 +115,21 @@ def _validate(data):
     if options is not None and not isinstance(options, dict):
         return 'options must be an object'
 
+    # statusDate is required for deterministic results.  Without it,
+    # downstream ACWP / predicted-date code can fall back to wall-clock
+    # now() and silently produce non-deterministic output -- exactly
+    # the bug the explicit-statusDate refactor was supposed to fix.
+    opts = options or {}
+    sd_raw = opts.get('statusDate', opts.get('status_date'))
+    if sd_raw is None or sd_raw == '':
+        return ('options.statusDate is required (ISO-8601 string); '
+                'omitting it would silently produce non-deterministic results')
+    if not isinstance(sd_raw, str):
+        return 'options.statusDate must be an ISO-8601 string'
+    from .helpers import safe_date
+    if safe_date(sd_raw) is None:
+        return f'options.statusDate is not parseable ISO-8601: {sd_raw!r}'
+
     return None
 
 

@@ -745,6 +745,31 @@ def _deterministic_finish_ms(dag_state, remaining, earliest_start_ms,
     return start, finish
 
 
+def deterministic_expected_finish_ms(nodes, dag_state, id_to_idx, status_ms,
+                                     activity_metadata, calendar):
+    """Single deterministic forward pass + project-finish reduction.
+
+    Reuses pre-built ``dag_state`` and (optional) ``calendar`` so callers
+    that already paid for `build_dag` / `_maybe_build_calendar` don't
+    rebuild them.  Used by ``completion/recovery.py`` when the caller
+    omits ``expected_finish`` -- previously this re-ran the full MC
+    pipeline (iterations=1, enable_risk=False), which was wasteful.
+
+    Returns the project finish in epoch ms, or status_ms if no
+    activity is in scope.
+    """
+    (remaining, earliest_start_ms, _risk, _atypes,
+     in_scope, _af) = _build_scope(
+        nodes, dag_state, id_to_idx, status_ms, activity_metadata, calendar)
+
+    if not np.any(in_scope):
+        return float(status_ms)
+
+    _det_start, det_finish = _deterministic_finish_ms(
+        dag_state, remaining, earliest_start_ms, status_ms, calendar)
+    return float(np.max(det_finish[in_scope]))
+
+
 # ---------------------------------------------------------------------------
 # Calendar construction
 # ---------------------------------------------------------------------------
