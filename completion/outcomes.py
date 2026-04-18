@@ -196,9 +196,11 @@ def register_outcome(record, ttl=None):
     except Exception as exc:
         # Redis unavailable mid-flight: degrade to in-proc so the
         # request still succeeds; client gets a warning in the response.
+        # When Redis is primary, fallback is None -- reach for _inproc
+        # directly so the recovery path is unconditional.
         logger.warning('Outcome storage failed (%s); using in-proc fallback',
                        exc)
-        fallback.set(key, payload, ttl=ttl)
+        _inproc.set(key, payload, ttl=ttl)
     return rec
 
 
@@ -211,6 +213,11 @@ def list_outcomes(reference_class=None, limit=_MAX_REPORT_OUTCOMES):
     pattern = f'outcomes:{rc_key}:*' if reference_class else 'outcomes:*'
 
     keys = []
+    # Track whether we've been forced into the in-proc fallback by a
+    # Redis error so the per-key GET loop below reads from the right
+    # store.  Without this, a `scan_iter` failure would re-scan _inproc
+    # keys but then try to `redis_cli.get` them, finding nothing.
+    reading_from_redis = redis_cli is not None
     try:
         if redis_cli is not None:
             # SCAN is preferred over KEYS for production Redis but we
@@ -225,17 +232,20 @@ def list_outcomes(reference_class=None, limit=_MAX_REPORT_OUTCOMES):
         else:
             keys = fallback.keys(pattern)[:limit]
     except Exception as exc:
+        # When Redis is primary, fallback is None -- reach for _inproc
+        # directly so the recovery path is unconditional.
         logger.warning('Failed to list outcomes: %s', exc)
-        keys = fallback.keys(pattern)[:limit]
+        keys = _inproc.keys(pattern)[:limit]
+        reading_from_redis = False
 
     for k in keys:
         try:
-            if redis_cli is not None:
+            if reading_from_redis:
                 raw = redis_cli.get(k)
                 if isinstance(raw, bytes):
                     raw = raw.decode('utf-8')
             else:
-                raw = fallback.get(k)
+                raw = (fallback or _inproc).get(k)
             if raw:
                 yield json.loads(raw)
         except Exception:

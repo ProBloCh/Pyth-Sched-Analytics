@@ -1074,6 +1074,63 @@ class TestOutcomesEndpoint:
         assert dc['mean_ratio'] > 1.0
 
 
+class TestOutcomeRedisFallback:
+    """Locks the Copilot fix for completion/outcomes.py register_outcome
+    and list_outcomes: when Redis is the primary store but raises mid-
+    flight, the exception path must degrade to the in-process store
+    rather than calling methods on a None fallback (secondary
+    exception that previously broke the request)."""
+
+    def test_register_outcome_survives_redis_failure(self, monkeypatch):
+        import completion.outcomes as oc
+
+        class _BoomRedis:
+            def set(self, *a, **kw):
+                raise RuntimeError('simulated redis connection lost')
+            def get(self, *a, **kw):
+                raise RuntimeError('simulated redis connection lost')
+            def scan_iter(self, *a, **kw):
+                raise RuntimeError('simulated redis connection lost')
+
+        monkeypatch.setattr(oc, '_store', lambda: (_BoomRedis(), None))
+        # Should not raise -- previously blew up with AttributeError
+        # on fallback=None.
+        rec = oc.register_outcome({
+            'project_id': 'RECOVER-1',
+            'reference_class': 'oil_gas_offshore',
+            'predicted': {'p80_finish': '2026-12-31T00:00:00Z'},
+            'actual': {'finish': '2027-01-01T00:00:00Z'},
+        })
+        assert rec['project_id'] == 'RECOVER-1'
+        # The record landed in the in-process store (primary was Redis).
+        key = 'outcomes:oil_gas_offshore:RECOVER-1'
+        assert oc._inproc.get(key) is not None
+
+    def test_list_outcomes_survives_redis_failure(self, monkeypatch):
+        import completion.outcomes as oc
+
+        # Seed the in-process store with an outcome so list_outcomes
+        # has something to return via the fallback path.
+        oc._inproc.set(
+            'outcomes:oil_gas_offshore:RECOVER-LIST-1',
+            '{"project_id": "RECOVER-LIST-1", "reference_class": "oil_gas_offshore",'
+            ' "predicted": {"p80_finish": "2026-12-31T00:00:00Z"},'
+            ' "actual": {"finish": "2027-01-01T00:00:00Z"}}',
+            ttl=3600)
+
+        class _BoomRedis:
+            def scan_iter(self, *a, **kw):
+                raise RuntimeError('simulated redis connection lost')
+            def get(self, *a, **kw):
+                raise RuntimeError('simulated redis connection lost')
+
+        monkeypatch.setattr(oc, '_store', lambda: (_BoomRedis(), None))
+        # Should return the _inproc record rather than raising.
+        records = list(oc.list_outcomes('oil_gas_offshore'))
+        ids = [r.get('project_id') for r in records]
+        assert 'RECOVER-LIST-1' in ids
+
+
 class TestMaxDistributionPoints:
     """config.maxDistributionPoints subsamples the date grid for very
     large projects without breaking downstream consumers."""

@@ -1,12 +1,18 @@
 """
-Verifies the backend-vs-fallback telemetry helper on the JS side.
+Verifies the backend-vs-fallback telemetry helpers on the JS side.
 
-The helper (Completionprediction.js `_recordTelemetry` +
-EVM.js `_evmRecordTelemetry`) increments counters on
-`window.cybereumState.completionPredictionTelemetry` so the main app
-can detect a degrading backend (e.g. 30% 5xx rate → banner).  This
-test drives the helper via the _internals debug export in a Node
-sandbox and asserts the counter semantics match the contract.
+Two helpers share a single window.cybereumState.completionPredictionTelemetry
+object so the main app can detect a degrading backend (e.g. 30% 5xx
+rate -> banner):
+
+  - Completionprediction.js `_recordTelemetry` (reached via the
+    `_internals` debug export of the IIFE)
+  - EVM.js `_evmRecordTelemetry` (top-level function, lands on the
+    sandbox global when the script is loaded)
+
+The Node harness loads both scripts, invokes each helper, and emits
+the aggregate telemetry object on stdout.  This test asserts both
+per-service counters and the cross-module aggregate totals.
 
 Auto-skips when Node.js is not installed.
 """
@@ -44,24 +50,30 @@ def _run_js():
 
 def test_telemetry_counter_semantics():
     """The helper script runs:
-      - 2× MC call, 1× MC success
-      - 1× recovery call, 1× recovery fallback (non_ok_status 500)
-      - 1× reference_classes fallback (backend_disabled)
+      - 2x MC call, 1x MC success
+      - 1x recovery call, 1x recovery fallback (non_ok_status 500)
+      - 1x reference_classes fallback (backend_disabled)
+      - 1x evm call, 1x evm success, 1x evm fallback (timeout)
+    Totals: 4 calls, 2 successes, 3 fallbacks.
     """
     t = _run_js()
-    assert t['backend_calls'] == 3
-    assert t['backend_successes'] == 1
-    assert t['fallback_count'] == 2
+    assert t['backend_calls'] == 4
+    assert t['backend_successes'] == 2
+    assert t['fallback_count'] == 3
 
-    # Last error wins: the last fallback call was reference_classes disabled.
-    assert t['last_error']['service'] == 'reference_classes'
-    assert t['last_error']['reason'] == 'backend_disabled'
+    # Last error wins: evm fallback was the last invocation.
+    assert t['last_error']['service'] == 'evm'
+    assert t['last_error']['reason'] == 'timeout'
+    assert t['last_error']['message'] == 'aborted after 15s'
 
     by = t['by_service']
     assert by['monte_carlo'] == {'calls': 2, 'successes': 1, 'fallbacks': 0}
     assert by['recovery'] == {'calls': 1, 'successes': 0, 'fallbacks': 1}
     assert by['reference_classes'] == {'calls': 0, 'successes': 0,
                                        'fallbacks': 1}
+    # EVM helper (top-level function in EVM.js) writes to the same
+    # shared object -- proves cross-module aggregation works.
+    assert by['evm'] == {'calls': 1, 'successes': 1, 'fallbacks': 1}
 
 
 def test_telemetry_never_throws_on_missing_window():

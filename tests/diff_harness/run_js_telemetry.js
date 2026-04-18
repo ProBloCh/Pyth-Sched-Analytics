@@ -2,11 +2,12 @@
 /*
  * tests/diff_harness/run_js_telemetry.js
  *
- * Loads Completionprediction.js in the same stubbed sandbox used by
- * run_js_recovery.js and exercises the _recordTelemetry helper via
- * the _internals debug export.  Emits the resulting
- * window.cybereumState.completionPredictionTelemetry object on stdout
- * so the Python test can assert counter semantics.
+ * Loads Completionprediction.js AND EVM.js in a stubbed sandbox and
+ * exercises both telemetry helpers (_recordTelemetry from
+ * Completionprediction.js, _evmRecordTelemetry from EVM.js) on the
+ * shared window.cybereumState.completionPredictionTelemetry object.
+ * Emits the result on stdout so the Python test can assert counter
+ * semantics and cross-module sharing.
  *
  * Usage: node run_js_telemetry.js > out.json
  */
@@ -67,8 +68,14 @@ function loadScript(filename) {
 }
 loadScript('PathScripts.js');
 loadScript('Completionprediction.js');
+loadScript('EVM.js');
 
-// Drive the telemetry helper through all three code paths.
+// Drive both telemetry helpers.  _evmRecordTelemetry is a top-level
+// function in EVM.js so it lands on the sandbox global; _recordTelemetry
+// lives inside Completionprediction.js's IIFE and is reached via the
+// _internals debug export.  Both write to the same shared
+// window.cybereumState.completionPredictionTelemetry object, so the
+// aggregate counters reflect usage from either side.
 vm.runInContext(`
     const rec = window.CompletionPrediction._internals._recordTelemetry;
     rec('monte_carlo', 'call');
@@ -77,6 +84,12 @@ vm.runInContext(`
     rec('recovery', 'call');
     rec('recovery', 'fallback', { reason: 'non_ok_status', status: 500 });
     rec('reference_classes', 'fallback', { reason: 'backend_disabled' });
+
+    // EVM side: _evmRecordTelemetry writes under the 'evm' service key.
+    _evmRecordTelemetry('call');
+    _evmRecordTelemetry('success');
+    _evmRecordTelemetry('fallback', { reason: 'timeout',
+                                      message: 'aborted after 15s' });
 `, sandbox);
 
 process.stdout.write(JSON.stringify(
