@@ -2298,11 +2298,20 @@ function _evmFingerprint(nodes, links) {
         mix(n.ID);
         mix(n.Start); mix(n.Finish);
         mix(n.ActualStart); mix(n.ActualFinish);
-        mix(n.Duration); mix(n.PercentComplete);
+        mix(n.Duration); mix(n.TimeUnits);
+        mix(n.PercentComplete);
+        mix(n.CostRate); mix(n.ActualCost);
+        // Risk-adjusted dates feed BCWP (forecasted earned value) and
+        // distribution windows -- changing them changes the response.
+        mix(n.riskAdjustedStart); mix(n.riskAdjustedEnd);
+        mix(n.riskAdjustedDuration);
+        // Predicted dates feed the actual-branch case-4 EV path.
+        mix(n.predictedStart); mix(n.predictedEnd);
     }
     const ls = links || [];
     for (const l of ls) {
-        mix(l.source); mix(l.target); mix(l.type); mix(l.lag);
+        mix(l.source); mix(l.target); mix(l.type);
+        mix(l.lag); mix(l.lagUnits);
     }
 
     return JSON.stringify({

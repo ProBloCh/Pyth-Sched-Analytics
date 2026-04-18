@@ -1172,6 +1172,31 @@ class TestDurationToWorkHoursCalendar:
         assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
 
 
+class TestNonObjectJSONRejected:
+    """Locks Copilot fix: a JSON array (or any non-dict root) returns
+    400 with a clear error rather than 500'ing on AttributeError."""
+
+    def test_evm_array_root_400(self, client):
+        resp = client.post('/evm/analyze', json=[{'ID': '1'}])
+        assert resp.status_code == 400
+        assert 'object' in resp.get_json()['error']
+
+    def test_completion_mc_array_root_400(self, client):
+        resp = client.post('/completion/monte-carlo',
+                           json=[{'ID': '1'}])
+        assert resp.status_code == 400
+
+    def test_completion_recovery_array_root_400(self, client):
+        resp = client.post('/completion/recovery-options',
+                           json=[{'ID': '1'}])
+        assert resp.status_code == 400
+
+    def test_register_outcome_array_root_400(self, client):
+        resp = client.post('/completion/register-outcome',
+                           json=['not', 'an', 'object'])
+        assert resp.status_code == 400
+
+
 class TestUTCNormalisation:
     """Locks Copilot fix: safe_date and outcomes._parse_iso both
     normalise tz-aware non-UTC inputs to UTC, matching the

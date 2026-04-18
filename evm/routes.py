@@ -125,6 +125,11 @@ def _parse_request():
     data = request.get_json(force=True, silent=True)
     if not data:
         return None, (jsonify({'error': 'Invalid or missing JSON body'}), 400)
+    if not isinstance(data, dict):
+        # _validate calls data.get(...); a bare list/string body would
+        # raise AttributeError and turn a client error into a 500.
+        return None, (jsonify({
+            'error': 'JSON root must be an object'}), 400)
 
     err = _validate(data)
     if err:
