@@ -150,13 +150,23 @@ def _duration_to_ms(dur, time_units):
     return d * _MS_PER_HOUR
 
 
-def _duration_to_work_hours(dur, time_units, hours_per_day):
+_WEEKS_PER_MONTH = 4.345  # matches evm.helpers._WEEKS_PER_MONTH + JS PathScripts
+
+
+def _duration_to_work_hours(dur, time_units, hours_per_day,
+                            working_days_per_week=5.0):
     """Convert (Duration, TimeUnits) to working hours.
 
     Used on the calendar path -- durations in 'days' map to working days
     (e.g., 8 hours under a standard 5x8 calendar).  Matches the frontend
-    convertToHours() convention (PathScripts.js): weeks = hpd * 5,
-    months = hpd * 21.
+    convertToHours() convention (PathScripts.js / evm.helpers) that
+    weeks = working_days_per_week working days, months = 4.345 weeks
+    (so a 5-day week is ~21.725 days, not the previous hardcoded 21).
+
+    ``working_days_per_week`` defaults to 5 for backwards compatibility
+    with callers that didn't previously specify a calendar; callers on
+    the calendar path should pass ``len(calendar.working_days)`` so the
+    conversion matches the CPM / float path.
     """
     try:
         d = float(dur)
@@ -164,15 +174,16 @@ def _duration_to_work_hours(dur, time_units, hours_per_day):
         return 0.0
     if not np.isfinite(d) or d < 0:
         return 0.0
+    dpw = float(working_days_per_week) if working_days_per_week else 5.0
     unit = str(time_units or 'h').strip().lower()
     if unit in ('h', 'hr', 'hrs', 'hour', 'hours'):
         return d
     if unit in ('d', 'day', 'days'):
         return d * hours_per_day
     if unit in ('w', 'wk', 'week', 'weeks'):
-        return d * hours_per_day * 5.0
+        return d * hours_per_day * dpw
     if unit in ('m', 'mo', 'month', 'months'):
-        return d * hours_per_day * 21.0
+        return d * hours_per_day * dpw * _WEEKS_PER_MONTH
     return d  # unknown -> treat as hours
 
 
@@ -266,8 +277,9 @@ def _build_scope(nodes, dag_state, id_to_idx, status_ms, activity_metadata,
         if calendar is None:
             total = _duration_to_ms(dur_val, dur_units)
         else:
-            total = _duration_to_work_hours(dur_val, dur_units,
-                                            calendar.hours_per_day)
+            total = _duration_to_work_hours(
+                dur_val, dur_units, calendar.hours_per_day,
+                working_days_per_week=len(calendar.working_days))
 
         pct_raw = node.get('PercentComplete', node.get('percentComplete', 0))
         try:
@@ -745,6 +757,15 @@ def _maybe_build_calendar(nodes, dag_state, id_to_idx, status_ms,
     hours_per_day = float(cal_cfg.get('hours_per_day', 8.0))
     working_days = cal_cfg.get('working_days', [1, 2, 3, 4, 5])
     holidays = cal_cfg.get('holidays', [])
+    # Count just the ISO weekdays in the provided list so weeks/months
+    # scale with the caller's calendar rather than the hardcoded 5-day week.
+    try:
+        dpw_hint = sum(1 for d in (working_days or [])
+                       if isinstance(d, (int, float)) and 1 <= int(d) <= 7)
+        if dpw_hint <= 0:
+            dpw_hint = 5
+    except Exception:
+        dpw_hint = 5
 
     # Estimate horizon from total remaining working hours (deterministic).
     total_work_hrs = 0.0
@@ -756,7 +777,9 @@ def _maybe_build_calendar(nodes, dag_state, id_to_idx, status_ms,
             continue
         dur_val = node.get('Duration', node.get('duration', 0))
         dur_units = node.get('TimeUnits', node.get('timeUnits'))
-        total = _duration_to_work_hours(dur_val, dur_units, hours_per_day)
+        total = _duration_to_work_hours(
+            dur_val, dur_units, hours_per_day,
+            working_days_per_week=dpw_hint)
         pct_raw = node.get('PercentComplete', node.get('percentComplete', 0))
         try:
             pct = float(pct_raw)

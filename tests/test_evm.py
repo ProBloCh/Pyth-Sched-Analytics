@@ -1125,6 +1125,41 @@ class TestNormaliseIdempotent:
 
 
 # =====================================================================
+# _duration_to_work_hours honours working_days_per_week + 4.345 months
+# =====================================================================
+
+class TestDurationToWorkHoursCalendar:
+    """Locks Copilot fix: _duration_to_work_hours uses the caller's
+    working_days_per_week and 4.345 weeks/month (matching JS
+    PathScripts / evm.helpers), not the old hardcoded 5.0 / 21.0.
+    """
+
+    def test_weeks_scale_with_working_days_per_week(self):
+        from completion.monte_carlo import _duration_to_work_hours
+        # 1 week at hpd=8, dpw=5 -> 40 hrs
+        assert _duration_to_work_hours(1, 'w', 8.0, 5.0) == 40.0
+        # 1 week at hpd=10, dpw=4 (4x10) -> 40 hrs
+        assert _duration_to_work_hours(1, 'w', 10.0, 4.0) == 40.0
+        # 1 week at hpd=8, dpw=6 -> 48 hrs
+        assert _duration_to_work_hours(1, 'w', 8.0, 6.0) == 48.0
+
+    def test_months_use_4_345_weeks(self):
+        import pytest
+        from completion.monte_carlo import _duration_to_work_hours
+        # 1 month at hpd=8, dpw=5 -> 8 * 5 * 4.345 = 173.8 hrs
+        assert _duration_to_work_hours(1, 'mo', 8.0, 5.0) == \
+            pytest.approx(8.0 * 5.0 * 4.345)
+        # Old behaviour was exactly 8 * 21 = 168; the new value is
+        # ~173.8, matching JS PathScripts / evm.helpers.
+        assert _duration_to_work_hours(1, 'mo', 8.0, 5.0) != 168.0
+
+    def test_default_dpw_stays_five(self):
+        """Back-compat: default invocation gives 5-day-week scaling."""
+        from completion.monte_carlo import _duration_to_work_hours
+        assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
+
+
+# =====================================================================
 # _compute_float_hours honours working_days_per_week
 # =====================================================================
 

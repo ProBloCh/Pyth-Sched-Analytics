@@ -274,7 +274,8 @@ def _compute_target(planned_ms, expected_ms, p80_ms, max_risk_buffer_days,
 
 def _build_crash_candidates(nodes, dag_state, id_to_idx, activity_metadata,
                             calendar, hours_per_day, critical_set,
-                            float_hrs, config):
+                            float_hrs, config,
+                            working_days_per_week=5.0):
     """
     Produce a list of dicts (raw, unsorted before return):
         {id, name, kind, remaining_hrs, max_crash_hrs, leverage,
@@ -282,6 +283,7 @@ def _build_crash_candidates(nodes, dag_state, id_to_idx, activity_metadata,
     """
     candidates = []
     hpd = float(hours_per_day)
+    dpw = float(working_days_per_week) if working_days_per_week else 5.0
 
     for node in nodes:
         nid = str(node.get('ID', node.get('id', '')))
@@ -300,7 +302,8 @@ def _build_crash_candidates(nodes, dag_state, id_to_idx, activity_metadata,
         dur_val = node.get('Duration', node.get('duration', 0))
         dur_units = node.get('TimeUnits', node.get('timeUnits'))
         if calendar is not None:
-            total_hrs = _duration_to_work_hours(dur_val, dur_units, hpd)
+            total_hrs = _duration_to_work_hours(
+                dur_val, dur_units, hpd, working_days_per_week=dpw)
         else:
             # Wall-clock path: convert ms-of-duration back to hours using
             # 24h/day.  This preserves the JS "1 day = 8 hours" intent
@@ -662,7 +665,8 @@ def run_recovery_options(nodes, links, status_date,
 
     crash_candidates = _build_crash_candidates(
         nodes, dag_state, id_to_idx, activity_metadata,
-        calendar, hours_per_day, critical_set, float_hrs, config)
+        calendar, hours_per_day, critical_set, float_hrs, config,
+        working_days_per_week)
 
     lag_candidates = _build_lag_candidates(
         links, id_to_idx, node_by_id, critical_set,
