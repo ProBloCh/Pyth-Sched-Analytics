@@ -141,12 +141,20 @@ def _duration_to_ms(dur, time_units):
     unit = str(time_units or 'h').strip().lower()
     if unit in ('h', 'hr', 'hrs', 'hour', 'hours'):
         return d * _MS_PER_HOUR
+    if unit in ('s', 'sec', 'secs', 'second', 'seconds'):
+        return d * 1000.0
+    # 'm' is minutes per the canonical JS convertToHours (PathScripts.js
+    # line 158); months are 'mo'/'mon'/'month(s)' only.
+    if unit in ('m', 'min', 'mins', 'minute', 'minutes'):
+        return d * _MS_PER_HOUR / 60.0
     if unit in ('d', 'day', 'days'):
         return d * _MS_PER_DAY
-    if unit in ('w', 'wk', 'week', 'weeks'):
+    if unit in ('w', 'wk', 'wks', 'week', 'weeks'):
         return d * _MS_PER_DAY * 7.0
-    if unit in ('m', 'mo', 'month', 'months'):
+    if unit in ('mo', 'mon', 'mons', 'month', 'months'):
         return d * _MS_PER_DAY * 30.0
+    if unit in ('y', 'yr', 'yrs', 'year', 'years'):
+        return d * _MS_PER_DAY * 365.0
     return d * _MS_PER_HOUR
 
 
@@ -178,12 +186,20 @@ def _duration_to_work_hours(dur, time_units, hours_per_day,
     unit = str(time_units or 'h').strip().lower()
     if unit in ('h', 'hr', 'hrs', 'hour', 'hours'):
         return d
+    if unit in ('s', 'sec', 'secs', 'second', 'seconds'):
+        return d / 3600.0
+    # 'm' is minutes per the canonical JS convertToHours (PathScripts.js
+    # line 158); months are 'mo'/'mon'/'month(s)' only.
+    if unit in ('m', 'min', 'mins', 'minute', 'minutes'):
+        return d / 60.0
     if unit in ('d', 'day', 'days'):
         return d * hours_per_day
-    if unit in ('w', 'wk', 'week', 'weeks'):
+    if unit in ('w', 'wk', 'wks', 'week', 'weeks'):
         return d * hours_per_day * dpw
-    if unit in ('m', 'mo', 'month', 'months'):
+    if unit in ('mo', 'mon', 'mons', 'month', 'months'):
         return d * hours_per_day * dpw * _WEEKS_PER_MONTH
+    if unit in ('y', 'yr', 'yrs', 'year', 'years'):
+        return d * hours_per_day * dpw * 52.14
     return d  # unknown -> treat as hours
 
 

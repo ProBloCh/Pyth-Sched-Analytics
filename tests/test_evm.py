@@ -1159,6 +1159,34 @@ class TestDurationToWorkHoursCalendar:
         assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
 
 
+class TestMinutesUnitParity:
+    """Locks Copilot fix: 'm' means minutes (matching the canonical JS
+    convertToHours in PathScripts.js line 158), not months.  The
+    previous mapping inflated minute-based inputs by ~4.345 weeks and
+    broke JS<->Python parity for schedules that used 'm' for minutes.
+    """
+
+    def test_duration_to_work_hours_m_is_minutes(self):
+        from completion.monte_carlo import _duration_to_work_hours
+        # 60 'm' at hpd=8 -> 1 hour; previously would have been
+        # 60 * 8 * 5 * 4.345 = ~10428 hours.
+        assert _duration_to_work_hours(60, 'm', 8.0) == 1.0
+
+    def test_duration_to_work_hours_month_aliases_still_work(self):
+        from completion.monte_carlo import _duration_to_work_hours
+        # 'mo' / 'month' / 'months' still = months.
+        assert _duration_to_work_hours(1, 'mo', 8.0, 5.0) != 1.0 / 60.0
+        assert _duration_to_work_hours(1, 'month', 8.0, 5.0) != 1.0 / 60.0
+        assert _duration_to_work_hours(1, 'months', 8.0, 5.0) != 1.0 / 60.0
+
+    def test_duration_to_ms_m_is_minutes(self):
+        from completion.monte_carlo import _duration_to_ms
+        # 60 'm' -> 3.6e6 ms (1 hour of wall-clock), not 30 days.
+        assert _duration_to_ms(60, 'm') == 3_600_000.0
+        # 1 'month' -> still 30 days.
+        assert _duration_to_ms(1, 'month') == 30.0 * 86_400_000.0
+
+
 class TestEstimateHorizonScalesWithCap:
     """Locks Copilot fix: estimate_horizon_days derives safety_factor
     from the configured max_multiplier_cap so 50x Olympics/IT caps

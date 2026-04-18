@@ -201,46 +201,26 @@ def _compute_float_hours(dag_state, nodes, id_to_idx, calendar, hours_per_day,
     """
     n = dag_state.n
     wpw = float(working_days_per_week) if working_days_per_week else 5.0
-    # Reuse the shared weeks/month constant so float math stays
-    # aligned with evm.helpers.convert_to_hours and
-    # completion.monte_carlo._duration_to_work_hours.
-    from .monte_carlo import _WEEKS_PER_MONTH
-    month_days = wpw * _WEEKS_PER_MONTH
-    # Determine per-activity time-unit scale to hours
+    # Determine per-activity time-unit scale to hours.  Calendar path
+    # delegates to the canonical evm.helpers.convert_to_hours with the
+    # caller's calendar; wall-clock path uses the same dispatch with
+    # 24h/day so 'd'/'w' map to wall-clock hours (JS "1 day = 24h" on
+    # the no-calendar path).  'm' is minutes in both paths (not months)
+    # -- matches the canonical JS convertToHours (PathScripts.js).
     per_unit_hrs = np.ones(n, dtype=np.float64)
     for node in nodes:
         nid = str(node.get('ID', node.get('id', '')))
         if nid not in id_to_idx:
             continue
         j = id_to_idx[nid]
-        units = str(node.get('TimeUnits', node.get('timeUnits', 'h')) or 'h').lower()
+        units = node.get('TimeUnits', node.get('timeUnits', 'h')) or 'h'
         if calendar is not None:
-            # Solver duration was passed through as nominal units; convert
-            # those units to working hours to match remaining-work units.
-            if units in ('h', 'hr', 'hrs', 'hour', 'hours'):
-                per_unit_hrs[j] = 1.0
-            elif units in ('d', 'day', 'days'):
-                per_unit_hrs[j] = float(hours_per_day)
-            elif units in ('w', 'wk', 'week', 'weeks'):
-                per_unit_hrs[j] = float(hours_per_day) * wpw
-            elif units in ('m', 'mo', 'month', 'months'):
-                per_unit_hrs[j] = float(hours_per_day) * month_days
-            else:
-                per_unit_hrs[j] = 1.0
+            per_unit_hrs[j] = convert_to_hours(
+                1.0, units, float(hours_per_day), wpw)
         else:
-            # Wall-clock path: hours = ms / 3.6e6; slack stays in the same
-            # (abstract) unit.  Convert to hours using the same mapping,
-            # assuming 'days' == 24h wall-clock.
-            if units in ('h', 'hr', 'hrs', 'hour', 'hours'):
-                per_unit_hrs[j] = 1.0
-            elif units in ('d', 'day', 'days'):
-                per_unit_hrs[j] = 24.0
-            elif units in ('w', 'wk', 'week', 'weeks'):
-                per_unit_hrs[j] = 24.0 * 7.0
-            elif units in ('m', 'mo', 'month', 'months'):
-                per_unit_hrs[j] = 24.0 * 30.0
-            else:
-                per_unit_hrs[j] = 1.0
+            # Wall-clock: 1 day = 24h, 1 week = 168h, 1 month = 30 days.
+            per_unit_hrs[j] = convert_to_hours(
+                1.0, units, hours_per_day=24.0, working_days_per_week=7.0)
 
     return np.asarray(dag_state.TF, dtype=np.float64) * per_unit_hrs
 
