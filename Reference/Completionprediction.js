@@ -1831,6 +1831,25 @@
             ?? project?.projectType
             ?? null;
 
+        // Per-request extension of the registry.  Customers with their
+        // own historical calibration can set
+        // window.cybereumState.customReferenceClasses = {name: {...}, ...}
+        // and reference one by name on the project.  Validated server
+        // side so a malformed entry returns 400 with a specific field.
+        const customClasses = opts.customReferenceClasses
+            ?? (typeof window !== 'undefined'
+                && window.cybereumState?.customReferenceClasses)
+            ?? null;
+
+        // {base, overrides} for one-off tweaks of a built-in class
+        // without registering a full custom class.  Useful when a
+        // single project deviates from the sector default for a
+        // known reason (e.g. unusually long permitting cycle).
+        const referenceClassOverrides = opts.referenceClassOverrides
+            ?? (typeof window !== 'undefined'
+                && window.cybereumState?.referenceClassOverrides)
+            ?? null;
+
         const body = {
             nodes: sentNodes,
             links: sentLinks,
@@ -1859,6 +1878,8 @@
                     max_mult_high: opts.maxMultHigh ?? CONFIG.mcMaxMultHigh,
                 },
                 reference_class: referenceClass,
+                custom_reference_classes: customClasses,
+                reference_class_overrides: referenceClassOverrides,
             },
         };
         return body;
@@ -1921,6 +1942,39 @@
         }
         const d = safeDate(value);
         return d ? d.toISOString() : null;
+    }
+
+    // -------------------------------------------------------------------------
+    // Reference-class discovery: fetch the list of available sectors from the
+    // backend so a sector dropdown can populate dynamically (rather than
+    // hardcoding the 19 built-ins in the frontend).  Cached on window after
+    // the first call; memoised per page load.  Returns null on backend
+    // failure so the caller can fall back to a static list.
+    // -------------------------------------------------------------------------
+    let _referenceClassesCache = null;
+    async function fetchReferenceClasses() {
+        if (_referenceClassesCache) return _referenceClassesCache;
+        const disabled = !CONFIG.useBackendCompletion
+            || typeof fetch !== 'function'
+            || !CONFIG.completionEndpoint;
+        if (disabled) return null;
+        // Derive the discovery URL from the configured MC endpoint base
+        // so callers don't need a second config knob.
+        const base = CONFIG.completionEndpoint.replace(/\/monte-carlo\/?$/, '');
+        const url = base + '/reference-classes';
+        try {
+            const resp = await fetch(url, { method: 'GET' });
+            if (!resp.ok) return null;
+            const data = await resp.json();
+            _referenceClassesCache = data;
+            return data;
+        } catch (err) {
+            console.warn('[CompletionPrediction] reference-class discovery failed:', err);
+            return null;
+        }
+    }
+    if (typeof window !== 'undefined') {
+        window.fetchReferenceClasses = fetchReferenceClasses;
     }
 
     // =========================================================================

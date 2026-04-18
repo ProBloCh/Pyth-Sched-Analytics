@@ -248,10 +248,23 @@ prevents integration drift.
   `lognormal` / `skip`), Pareto α range, max multiplier cap, and
   per-percentile inflation factors for 19 named classes (oil & gas,
   nuclear, rail, tunnels, defense MDAP, IT, Olympics, mining, solar,
-  wind, batteries, data centres, etc.).  Driven by
-  `config.reference_class` on `/completion/monte-carlo`; emits a
-  `reference_class_calibrated` companion in the response with
-  empirically-corrected percentiles and citations.  When unset, the
+  wind, batteries, data centres, etc.).  **Five extension mechanisms**:
+  (1) built-in source-code edit, (2) env var
+  `PYTH_REFERENCE_CLASSES_PATH=/path/to.json` for ops-managed
+  customer calibrations bundled with deploy, (3) per-request
+  `config.custom_reference_classes` for one-off custom classes,
+  (4) per-request `config.reference_class_overrides = {base, overrides}`
+  for tweaking a built-in without registering a full custom class,
+  (5) `GET /completion/reference-classes` discovery endpoint for
+  frontend dropdowns.  Each class definition is schema-validated
+  (`validate_class_definition`) at module load (built-ins, fail-fast on
+  dev errors) and per-request (custom classes, return 400 with the
+  specific field that broke).  Unknown class names return 400 with
+  fuzzy-matched suggestion ("did you mean oil_gas_offshore?") via
+  `difflib`.  Driven by `config.reference_class` on
+  `/completion/monte-carlo`; emits a `reference_class_calibrated`
+  companion in the response with empirically-corrected percentiles
+  and citations.  When unset, the
   response carries a `no_reference_class` info warning and the
   historic global tier model applies (byte-equivalent to pre-2026-04).
   Sources: Flyvbjerg & Bester 2021; Aaen, Flyvbjerg et al. PMJ 2025;

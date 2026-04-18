@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 
 import numpy as np
 from flask import Blueprint, request, jsonify
@@ -189,16 +190,59 @@ def _validate_mc_config(data):
             and cap_vals['max_mult_base'] > cap_vals['max_mult_high']):
         return 'config.caps.max_mult_base must be <= max_mult_high'
 
+    # Custom classes can extend / shadow the built-in registry for one
+    # request.  Validate first so reference_class lookup below resolves
+    # against the merged registry.
+    custom = cfg.get('custom_reference_classes')
+    if custom is not None:
+        from solver.reference_classes import validate_custom_classes
+        errs = validate_custom_classes(custom)
+        if errs:
+            return 'config.custom_reference_classes: ' + '; '.join(errs[:5])
+
+    overrides = cfg.get('reference_class_overrides')
+    if overrides is not None:
+        if not isinstance(overrides, dict):
+            return 'config.reference_class_overrides must be an object'
+        if 'base' not in overrides or not isinstance(overrides['base'], str):
+            return ('config.reference_class_overrides.base is required '
+                    'and must be a string')
+        if 'overrides' in overrides and not isinstance(overrides['overrides'], dict):
+            return 'config.reference_class_overrides.overrides must be an object'
+        # Try resolving the base eagerly so the user gets a clear error
+        # at request time (not deep inside the MC).
+        from solver.reference_classes import (
+            get_reference_class, suggest_reference_class, effective_registry,
+        )
+        merged = effective_registry(custom_classes=custom)
+        base_class = get_reference_class(overrides['base'], registry=merged)
+        if base_class is None:
+            suggestions = suggest_reference_class(
+                overrides['base'], registry=merged)
+            hint = (f' did you mean: {", ".join(suggestions)}?'
+                    if suggestions else '')
+            return (f'config.reference_class_overrides.base '
+                    f'"{overrides["base"]}" not recognised.{hint}')
+
     rc = cfg.get('reference_class')
     if rc is not None:
         if not isinstance(rc, str) or not rc:
             return 'config.reference_class must be a non-empty string'
-        from solver.reference_classes import get_reference_class
-        if get_reference_class(rc) is None:
-            from solver.reference_classes import REFERENCE_CLASS_TIERS
-            available = ', '.join(sorted(REFERENCE_CLASS_TIERS.keys()))
-            return (f'config.reference_class "{rc}" not recognised; '
-                    f'supported: {available}')
+        from solver.reference_classes import (
+            get_reference_class, suggest_reference_class, effective_registry,
+        )
+        merged = effective_registry(custom_classes=custom)
+        if get_reference_class(rc, registry=merged) is None:
+            suggestions = suggest_reference_class(rc, registry=merged)
+            if suggestions:
+                hint = f' did you mean: {", ".join(suggestions)}?'
+            else:
+                # Only spell out the full list when no useful suggestion
+                # exists -- keeps error messages from being walls of text.
+                hint = (' supported classes: '
+                        + ', '.join(sorted(merged.keys())))
+            return (f'config.reference_class "{rc}" not recognised.'
+                    + hint)
     return None
 
 
@@ -362,6 +406,30 @@ def recovery_options():
         return jsonify({'error': 'Internal completion-service error'}), 500
 
 
+@completion_bp.route('/reference-classes', methods=['GET', 'OPTIONS'])
+def reference_classes():
+    """Discovery endpoint: list all built-in + env-loaded reference
+    classes with their metadata + citations.
+
+    Useful for the frontend to populate a "project sector" dropdown
+    without hardcoding the list, and for ops to verify which classes
+    a given environment has loaded (env-var extension visibility).
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'})
+    from solver.reference_classes import (
+        list_reference_classes, REFERENCE_CLASS_TIERS,
+        EXTERNAL_CLASS_TIERS, ALIASES, effective_registry,
+    )
+    return jsonify({
+        'classes':       list_reference_classes(effective_registry()),
+        'aliases':       ALIASES,
+        'builtin_count': len(REFERENCE_CLASS_TIERS),
+        'external_count': len(EXTERNAL_CLASS_TIERS),
+        'external_path': os.environ.get('PYTH_REFERENCE_CLASSES_PATH', ''),
+    })
+
+
 @completion_bp.route('/health', methods=['GET'])
 def health():
     return jsonify({
@@ -370,5 +438,6 @@ def health():
         'endpoints': [
             '/completion/monte-carlo',
             '/completion/recovery-options',
+            '/completion/reference-classes',
         ],
     })

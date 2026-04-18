@@ -719,6 +719,302 @@ class TestReferenceClassCalibration:
         assert 'small_scope_mc' in codes
 
 
+class TestReferenceClassExtensibility:
+    """Custom classes, overrides, fuzzy matching, discovery, defensive
+    fallback when classes are partially malformed."""
+
+    _NODES = [{'ID': f'A{i}', 'Duration': 10, 'TimeUnits': 'days',
+               'riskScore': 0.4 if i % 2 else 0.7}
+              for i in range(40)]
+
+    def test_discovery_endpoint(self, client):
+        resp = client.get('/completion/reference-classes')
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['builtin_count'] >= 19
+        names = [c['name'] for c in data['classes']]
+        for required in ('oil_gas_offshore', 'it_software', 'olympics',
+                         'data_centre_hyperscale'):
+            assert required in names
+        # Aliases visible for client-side mapping
+        assert 'oil_and_gas' in data['aliases']
+        assert data['aliases']['oil_and_gas'] == 'oil_gas_offshore'
+
+    def test_discovery_options_preflight(self, client):
+        resp = client.options('/completion/reference-classes')
+        assert resp.status_code == 200
+
+    def test_fuzzy_suggestion_in_error(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': 'A', 'Duration': 10, 'TimeUnits': 'days'}],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {'reference_class': 'oilgaz'},
+        })
+        assert resp.status_code == 400
+        msg = resp.get_json()['error']
+        assert 'oilgaz' in msg
+        assert 'did you mean' in msg.lower()
+        assert 'oil_gas_offshore' in msg
+
+    def test_fuzzy_no_match_lists_supported(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': 'A', 'Duration': 10, 'TimeUnits': 'days'}],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {'reference_class': 'zzzzzz_unrecognisable'},
+        })
+        assert resp.status_code == 400
+        assert 'supported classes' in resp.get_json()['error'].lower()
+
+    def test_custom_class_used_in_mc(self):
+        """A per-request custom class is honoured by the sampler and
+        surfaces in reference_class_calibrated.citations."""
+        custom = {
+            'customer_acme_petrochem': {
+                'fat_tail_from': 0.50,
+                'pareto_offset': 0.20,
+                'pareto_alpha_range': [1.7, 2.3],
+                'tier_4_distribution': 'birnbaum_saunders',
+                'percentile_factors': {'P50': 1.15, 'P80': 1.40,
+                                       'P95': 1.85, 'P99': 2.80},
+                'max_multiplier_cap': 12.0,
+                'mean_overrun': 0.40,
+                'is_fat_tailed': True,
+                'has_finite_mean': True,
+                'citations': ['ACME internal portfolio analysis 2026'],
+            },
+        }
+        r = run_completion_mc(
+            self._NODES, [], '2025-01-01T00:00:00Z',
+            config={'iterations': 200, 'seed': 42,
+                    'reference_class': 'customer_acme_petrochem',
+                    'custom_reference_classes': custom})
+        cal = r['reference_class_calibrated']
+        assert cal is not None
+        assert 'ACME' in cal['citations'][0]
+        assert cal['percentile_factors']['P80'] == 1.40
+
+    def test_custom_class_can_shadow_builtin(self):
+        """Per-request custom classes override built-ins of the same name."""
+        custom = {
+            'rail': {  # shadow the built-in rail
+                'fat_tail_from': 0.50,
+                'pareto_offset': 0.25,
+                'pareto_alpha_range': [1.5, 2.0],
+                'tier_4_distribution': 'birnbaum_saunders',
+                'percentile_factors': {'P50': 1.50, 'P80': 2.00,
+                                       'P95': 3.00, 'P99': 5.00},
+                'max_multiplier_cap': 15.0,
+                'mean_overrun': 0.80,
+                'is_fat_tailed': True,
+                'has_finite_mean': True,
+                'citations': ['Internal customer rail data 2026'],
+            },
+        }
+        r = run_completion_mc(
+            self._NODES, [], '2025-01-01T00:00:00Z',
+            config={'iterations': 200, 'seed': 42,
+                    'reference_class': 'rail',
+                    'custom_reference_classes': custom})
+        # Shadowed factors used (not the built-in 1.45/1.95)
+        assert r['reference_class_calibrated']['percentile_factors']['P80'] == 2.00
+
+    def test_overrides_applied_to_builtin(self, client):
+        """{base, overrides} merges into the registry without registering
+        a full custom class."""
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': self._NODES, 'links': [],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {
+                'reference_class_overrides': {
+                    'base': 'rail',
+                    'overrides': {'percentile_factors': {'P95': 2.5,
+                                                          'P99': 4.0}},
+                },
+            },
+        })
+        assert resp.status_code == 200
+        cal = resp.get_json()['reference_class_calibrated']
+        assert cal is not None
+        # P95 / P99 overridden; P50 / P80 inherited from rail
+        assert cal['percentile_factors']['P95'] == 2.5
+        assert cal['percentile_factors']['P99'] == 4.0
+        assert cal['percentile_factors']['P50'] == 1.15  # from rail
+        assert cal['percentile_factors']['P80'] == 1.45  # from rail
+
+    def test_overrides_unknown_base_rejected(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': self._NODES, 'links': [],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {
+                'reference_class_overrides': {
+                    'base': 'no_such_class',
+                    'overrides': {},
+                },
+            },
+        })
+        assert resp.status_code == 400
+        assert 'no_such_class' in resp.get_json()['error']
+
+    def test_overrides_alongside_custom_class(self, client):
+        """Caller can register a custom class AND override-with-base it."""
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': self._NODES, 'links': [],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {
+                'custom_reference_classes': {
+                    'acme_base': {
+                        'fat_tail_from': 0.50,
+                        'pareto_offset': 0.25,
+                        'pareto_alpha_range': [1.8, 2.4],
+                        'tier_4_distribution': 'birnbaum_saunders',
+                        'percentile_factors': {'P50': 1.10, 'P80': 1.40,
+                                               'P95': 1.80, 'P99': 2.50},
+                        'max_multiplier_cap': 10.0,
+                        'mean_overrun': 0.30,
+                        'is_fat_tailed': True,
+                        'has_finite_mean': True,
+                        'citations': ['ACME base 2026'],
+                    },
+                },
+                'reference_class_overrides': {
+                    'base': 'acme_base',
+                    'overrides': {'percentile_factors': {'P95': 2.20}},
+                },
+            },
+        })
+        assert resp.status_code == 200
+        cal = resp.get_json()['reference_class_calibrated']
+        assert cal['percentile_factors']['P95'] == 2.20
+        assert cal['percentile_factors']['P50'] == 1.10  # inherited
+
+    def test_malformed_custom_class_rejected(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': 'A', 'Duration': 10, 'TimeUnits': 'days'}],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {
+                'custom_reference_classes': {
+                    'broken': {
+                        'fat_tail_from': 1.5,  # out of [0,1]
+                        'pareto_alpha_range': [0.1, 0.05],  # lo > hi, both too low
+                    },
+                },
+            },
+        })
+        assert resp.status_code == 400
+        msg = resp.get_json()['error']
+        assert 'broken' in msg
+        assert 'fat_tail_from' in msg
+
+    def test_partial_percentile_factors_warning(self, client):
+        """A custom class missing P95/P99 still works; warning issued."""
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': self._NODES, 'links': [],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {
+                'custom_reference_classes': {
+                    'partial': {
+                        'fat_tail_from': 0.55,
+                        'pareto_offset': 0.25,
+                        'pareto_alpha_range': [2.0, 2.5],
+                        'tier_4_distribution': 'birnbaum_saunders',
+                        'percentile_factors': {'P50': 1.10, 'P80': 1.40},
+                        # no P95 / P99
+                        'max_multiplier_cap': 10.0,
+                    },
+                },
+                'reference_class': 'partial',
+            },
+        })
+        assert resp.status_code == 200
+        data = resp.get_json()
+        codes = {w['code'] for w in data['calibration_warnings']}
+        assert 'partial_percentile_factors' in codes
+        # Defensive: P95 falls back to factor 1.0 (cal P95 == model P95)
+        cal = data['reference_class_calibrated']
+        assert cal['p95_finish'] is not None  # didn't crash
+        assert cal['p99_finish'] is None  # missing factor -> null
+
+    def test_invalid_tier_4_value_rejected(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': 'A', 'Duration': 10, 'TimeUnits': 'days'}],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {
+                'custom_reference_classes': {
+                    'bad_tier_4': {
+                        'fat_tail_from': 0.55, 'pareto_offset': 0.25,
+                        'pareto_alpha_range': [2.0, 2.5],
+                        'tier_4_distribution': 'invalid_distribution',
+                        'percentile_factors': {'P50': 1.0, 'P80': 1.2,
+                                               'P95': 1.5, 'P99': 2.0},
+                        'max_multiplier_cap': 10.0,
+                    },
+                },
+            },
+        })
+        assert resp.status_code == 400
+        assert 'tier_4_distribution' in resp.get_json()['error']
+
+    def test_extreme_alpha_rejected(self, client):
+        """alpha < 0.5 numerically unstable, > 5 essentially thin tail."""
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': 'A', 'Duration': 10, 'TimeUnits': 'days'}],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {
+                'custom_reference_classes': {
+                    'extreme': {
+                        'fat_tail_from': 0.55, 'pareto_offset': 0.25,
+                        'pareto_alpha_range': [0.1, 0.3],
+                        'tier_4_distribution': 'birnbaum_saunders',
+                        'percentile_factors': {'P50': 1.0, 'P80': 1.2,
+                                               'P95': 1.5, 'P99': 2.0},
+                        'max_multiplier_cap': 10.0,
+                    },
+                },
+            },
+        })
+        assert resp.status_code == 400
+        assert 'pareto_alpha_range' in resp.get_json()['error']
+
+    def test_aliases_resolve_via_get_reference_class(self):
+        from solver.reference_classes import get_reference_class
+        for alias, canonical in [
+            ('oil and gas', 'oil_gas_offshore'),
+            ('Oil-Gas', 'oil_gas_offshore'),
+            ('Petrochemical', 'oil_gas_onshore_lng'),
+            ('Data Centre', 'data_centre_hyperscale'),
+            ('Data-Center', 'data_centre_hyperscale'),
+            ('hyperscale', 'data_centre_hyperscale'),
+            ('IT', 'it_software'),
+            ('NUCLEAR', 'nuclear_new_build'),
+        ]:
+            r = get_reference_class(alias)
+            from solver.reference_classes import REFERENCE_CLASS_TIERS
+            assert r is REFERENCE_CLASS_TIERS[canonical], \
+                f'alias {alias!r} should resolve to {canonical!r}'
+
+    def test_validate_class_definition_returns_errors(self):
+        from solver.reference_classes import validate_class_definition
+        # Valid class -> no errors
+        assert validate_class_definition('test', {
+            'fat_tail_from': 0.5, 'pareto_offset': 0.2,
+            'pareto_alpha_range': [1.5, 2.5],
+            'tier_4_distribution': 'birnbaum_saunders',
+            'percentile_factors': {'P50': 1.1, 'P80': 1.3,
+                                   'P95': 1.6, 'P99': 2.1},
+            'max_multiplier_cap': 10.0,
+        }) == []
+        # Multiple errors enumerated
+        errs = validate_class_definition('bad', {
+            'fat_tail_from': -0.1,
+            'pareto_offset': 2.0,
+            'pareto_alpha_range': [10.0, 15.0],
+            'tier_4_distribution': 'wrong',
+            'percentile_factors': {'P95': -1.0},
+            'max_multiplier_cap': 500.0,
+        })
+        assert len(errs) >= 4
+
+
 class TestRecoveryLagUnits:
     """Locks the Copilot fix: lagUnits normalised before build_dag."""
 

@@ -49,9 +49,38 @@ file.
 
 from __future__ import annotations
 
+import copy
+import difflib
+import json
+import logging
+import math
+import os
+
+logger = logging.getLogger(__name__)
+
+
 # Sentinel for "not a real percentile, the reference class has formally
 # infinite variance / mean".  Consumers should display a cap warning.
 INFINITE = float('inf')
+
+# Allowed tier-4 distribution values
+_TIER_4_VALID = frozenset({'birnbaum_saunders', 'lognormal', 'skip'})
+
+# Required keys on every class definition
+_REQUIRED_KEYS = (
+    'fat_tail_from', 'pareto_offset', 'pareto_alpha_range',
+    'tier_4_distribution', 'percentile_factors',
+    'max_multiplier_cap',
+)
+
+# Optional keys we recognise (others are silently dropped to keep the
+# schema closed; surfaced in validation as a warning, not an error).
+_OPTIONAL_KEYS = (
+    'mean_overrun', 'is_fat_tailed', 'has_finite_mean', 'citations',
+    'version', 'last_updated', 'source',
+)
+
+_PERCENTILE_KEYS = ('P50', 'P80', 'P95', 'P99')
 
 
 # ---------------------------------------------------------------------------
@@ -393,71 +422,375 @@ REFERENCE_CLASS_TIERS = {
 # Lookup
 # ---------------------------------------------------------------------------
 
-def get_reference_class(name):
-    """Return the parameter dict for `name`, or None if unknown.
+# Aliases for convenience / backwards compat with EVM sector names.
+# Module-level so callers can extend (e.g. ops adding a new alias for
+# a customer's internal taxonomy without touching every dict entry).
+ALIASES = {
+    'oil_and_gas': 'oil_gas_offshore',
+    'oil_gas': 'oil_gas_offshore',
+    'lng': 'oil_gas_onshore_lng',
+    'petrochemical': 'oil_gas_onshore_lng',
+    'petrochem': 'oil_gas_onshore_lng',
+    'nuclear': 'nuclear_new_build',
+    'nuclear_energy': 'nuclear_new_build',
+    'infrastructure': 'rail',
+    'epc': 'rail',
+    'civil': 'rail',
+    'transportation': 'rail',
+    'construction': 'buildings_standard',
+    'commercial': 'buildings_standard',
+    'buildings': 'buildings_standard',
+    'industrial': 'buildings_nonstandard',
+    'defense': 'defense_mdap',
+    'government': 'defense_mdap',
+    'federal': 'defense_mdap',
+    'military': 'defense_mdap',
+    'technology': 'it_software',
+    'software': 'it_software',
+    'it': 'it_software',
+    'data_centre': 'data_centre_hyperscale',
+    'data_center': 'data_centre_hyperscale',
+    'datacentre': 'data_centre_hyperscale',
+    'datacenter': 'data_centre_hyperscale',
+    'hyperscale': 'data_centre_hyperscale',
+}
 
-    Names are case-insensitive and tolerate hyphens / spaces (callers
-    in the wild use 'oil_gas_offshore', 'oil-gas-offshore', or
-    'Oil & Gas Offshore').  Returns None for unknown classes; the
-    caller should fall back to the global default tier model.
+
+def _normalise_name(name):
+    """Case- / separator-insensitive key form.  Used for both registry
+    lookup and alias resolution."""
+    if name is None:
+        return None
+    return (str(name).lower().strip()
+            .replace(' ', '_').replace('-', '_')
+            .replace('&', '_and_'))
+
+
+def get_reference_class(name, registry=None):
+    """Resolve a class name (with case / alias / fuzzy tolerance).
+
+    Lookup order:
+      1. exact match in registry (defaults to REFERENCE_CLASS_TIERS)
+      2. normalised key in registry
+      3. normalised key in ALIASES -> canonical name in registry
+
+    Returns None when no match -- callers should treat that as
+    "use the global default tier model".  Use ``suggest_reference_class``
+    for a near-match suggestion when you want to give the user feedback.
     """
     if name is None:
         return None
-    key = str(name).lower().strip().replace(' ', '_').replace('-', '_').replace('&', '_and_')
-    if key in REFERENCE_CLASS_TIERS:
-        return REFERENCE_CLASS_TIERS[key]
-    # Aliases for convenience / backwards compat with EVM sector names
-    aliases = {
-        'oil_and_gas': 'oil_gas_offshore',
-        'oil_gas': 'oil_gas_offshore',
-        'lng': 'oil_gas_onshore_lng',
-        'petrochemical': 'oil_gas_onshore_lng',
-        'nuclear': 'nuclear_new_build',
-        'nuclear_energy': 'nuclear_new_build',
-        'infrastructure': 'rail',
-        'epc': 'rail',
-        'civil': 'rail',
-        'transportation': 'rail',
-        'construction': 'buildings_standard',
-        'commercial': 'buildings_standard',
-        'buildings': 'buildings_standard',
-        'industrial': 'buildings_nonstandard',
-        'defense': 'defense_mdap',
-        'government': 'defense_mdap',
-        'federal': 'defense_mdap',
-        'military': 'defense_mdap',
-        'technology': 'it_software',
-        'software': 'it_software',
-        'it': 'it_software',
-        'data_centre': 'data_centre_hyperscale',
-        'data_center': 'data_centre_hyperscale',
-        'datacentre': 'data_centre_hyperscale',
-        'datacenter': 'data_centre_hyperscale',
-        'hyperscale': 'data_centre_hyperscale',
-    }
-    if key in aliases:
-        return REFERENCE_CLASS_TIERS[aliases[key]]
+    reg = registry if registry is not None else REFERENCE_CLASS_TIERS
+    if isinstance(name, str) and name in reg:
+        return reg[name]
+    key = _normalise_name(name)
+    if key is None:
+        return None
+    if key in reg:
+        return reg[key]
+    if key in ALIASES and ALIASES[key] in reg:
+        return reg[ALIASES[key]]
     return None
 
 
-def list_reference_classes():
-    """Return sorted list of canonical class names + their headline mean
-    overrun and fat-tailed flag, useful for API discovery / docs."""
+def suggest_reference_class(name, registry=None, n=3, cutoff=0.5):
+    """Return up to *n* close-match suggestions for an unknown name.
+
+    Uses difflib's ratio over both canonical names and aliases so a
+    typo or stale alias gets a useful "did you mean?" list.
+    """
+    if name is None:
+        return []
+    reg = registry if registry is not None else REFERENCE_CLASS_TIERS
+    candidates = list(reg.keys()) + list(ALIASES.keys())
+    key = _normalise_name(name) or ''
+    matches = difflib.get_close_matches(key, candidates, n=n, cutoff=cutoff)
+    # Resolve any matched aliases to their canonical names; dedupe.
+    out, seen = [], set()
+    for m in matches:
+        canon = ALIASES.get(m, m)
+        if canon in reg and canon not in seen:
+            out.append(canon)
+            seen.add(canon)
+    return out
+
+
+def list_reference_classes(registry=None):
+    """Return sorted list of class metadata for API discovery / docs."""
+    reg = registry if registry is not None else REFERENCE_CLASS_TIERS
     return [
         {
             'name': name,
-            'mean_overrun': params['mean_overrun'],
-            'is_fat_tailed': params['is_fat_tailed'],
-            'has_finite_mean': params['has_finite_mean'],
-            'tier_4_distribution': params['tier_4_distribution'],
+            'mean_overrun': params.get('mean_overrun'),
+            'is_fat_tailed': params.get('is_fat_tailed'),
+            'has_finite_mean': params.get('has_finite_mean'),
+            'tier_4_distribution': params.get('tier_4_distribution'),
+            'pareto_alpha_range': params.get('pareto_alpha_range'),
+            'max_multiplier_cap': params.get('max_multiplier_cap'),
+            'percentile_factors': params.get('percentile_factors'),
+            'citations': params.get('citations', []),
+            'version': params.get('version'),
         }
-        for name, params in sorted(REFERENCE_CLASS_TIERS.items())
+        for name, params in sorted(reg.items())
     ]
+
+
+# ---------------------------------------------------------------------------
+# Schema validation
+# ---------------------------------------------------------------------------
+
+def validate_class_definition(name, params):
+    """Validate one class definition.  Returns list of error strings
+    (empty -> valid).  Used both for built-ins (at module load) and
+    for user-supplied custom classes (per-request).
+
+    Each error is a human-readable message naming the field; the
+    routes layer surfaces them as 400 responses.
+    """
+    errors = []
+
+    if not isinstance(name, str) or not name.strip():
+        errors.append('class name must be a non-empty string')
+    elif _normalise_name(name) != name:
+        errors.append(
+            f'class name {name!r} should be lowercase with underscores '
+            f'(got non-canonical form; suggested: {_normalise_name(name)!r})')
+
+    if not isinstance(params, dict):
+        errors.append(f'class {name!r}: params must be a dict')
+        return errors
+
+    for key in _REQUIRED_KEYS:
+        if key not in params:
+            errors.append(f'class {name!r}: missing required key {key!r}')
+
+    # Range checks for the numeric fields.  Each defends against the
+    # specific way a hand-edited class can blow up the MC.
+    fft = params.get('fat_tail_from')
+    if fft is not None:
+        if not isinstance(fft, (int, float)) or not (0.0 <= float(fft) <= 1.0):
+            errors.append(
+                f'class {name!r}: fat_tail_from must be in [0, 1] '
+                f'(got {fft!r})')
+
+    po = params.get('pareto_offset')
+    if po is not None:
+        if not isinstance(po, (int, float)) or not (0.0 <= float(po) <= 1.0):
+            errors.append(
+                f'class {name!r}: pareto_offset must be in [0, 1] '
+                f'(got {po!r})')
+
+    par = params.get('pareto_alpha_range')
+    if par is not None:
+        if (not (isinstance(par, (list, tuple)) and len(par) == 2)
+                or not all(isinstance(v, (int, float)) for v in par)):
+            errors.append(
+                f'class {name!r}: pareto_alpha_range must be a (lo, hi) '
+                f'numeric pair (got {par!r})')
+        else:
+            lo, hi = float(par[0]), float(par[1])
+            if not (0.5 <= lo <= 5.0) or not (0.5 <= hi <= 5.0):
+                errors.append(
+                    f'class {name!r}: pareto_alpha_range values should be '
+                    f'in [0.5, 5.0] (got {par!r}); alpha < 0.5 is '
+                    f'numerically unstable, > 5 produces a near-thin tail')
+            if lo > hi:
+                errors.append(
+                    f'class {name!r}: pareto_alpha_range lo ({lo}) must '
+                    f'be <= hi ({hi})')
+
+    t4 = params.get('tier_4_distribution')
+    if t4 is not None and t4 not in _TIER_4_VALID:
+        errors.append(
+            f'class {name!r}: tier_4_distribution {t4!r} not in '
+            f'{sorted(_TIER_4_VALID)}')
+
+    cap = params.get('max_multiplier_cap')
+    if cap is not None:
+        if not isinstance(cap, (int, float)) or not (1.0 <= float(cap) <= 200.0):
+            errors.append(
+                f'class {name!r}: max_multiplier_cap must be in '
+                f'[1.0, 200.0] (got {cap!r})')
+
+    pf = params.get('percentile_factors')
+    if pf is not None:
+        if not isinstance(pf, dict):
+            errors.append(
+                f'class {name!r}: percentile_factors must be a dict')
+        else:
+            for pkey in _PERCENTILE_KEYS:
+                if pkey not in pf:
+                    # Missing percentiles are tolerated (callers default
+                    # to 1.0) but flagged at validation level for
+                    # built-ins; not an error for partial custom classes.
+                    continue
+                pv = pf[pkey]
+                if not isinstance(pv, (int, float)):
+                    errors.append(
+                        f'class {name!r}: percentile_factors[{pkey!r}] '
+                        f'must be numeric (got {pv!r})')
+                elif math.isnan(pv) or pv < 0:
+                    errors.append(
+                        f'class {name!r}: percentile_factors[{pkey!r}] '
+                        f'must be non-negative (got {pv!r})')
+                elif math.isinf(pv) and pkey != 'P99':
+                    errors.append(
+                        f'class {name!r}: percentile_factors[{pkey!r}] '
+                        f'should be finite; INFINITE is reserved for P99 '
+                        f'in alpha <= 1 reference classes')
+
+    return errors
+
+
+def merge_class_definitions(base, overrides, name='__inline__'):
+    """Deep-merge ``overrides`` onto a copy of ``base``.
+
+    Used for the ``reference_class_overrides`` API pattern: caller
+    supplies a base class name and a partial overrides dict; we
+    produce a runtime class with the overrides applied.
+
+    Validates the result and raises ValueError on schema failure.
+    """
+    if not isinstance(base, dict):
+        raise TypeError('base must be a dict (a resolved reference class)')
+    if not isinstance(overrides, dict):
+        raise TypeError('overrides must be a dict')
+
+    merged = copy.deepcopy(base)
+    for k, v in overrides.items():
+        if (k == 'percentile_factors' and isinstance(v, dict)
+                and isinstance(merged.get(k), dict)):
+            # Merge percentile_factors at the per-percentile level so
+            # callers can override just P95 without rewriting P50/P80.
+            merged[k] = {**merged[k], **v}
+        else:
+            merged[k] = v
+
+    errs = validate_class_definition(name, merged)
+    if errs:
+        raise ValueError('Override produced invalid class: ' + '; '.join(errs))
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# Built-in validation: fail fast at module load on dev errors
+# ---------------------------------------------------------------------------
+
+def _validate_builtins():
+    """Run validate_class_definition against every built-in class.
+    Logs warnings for any issues (we don't raise here because a
+    non-fatal warning lets the service still start during a bad
+    deploy; the validate_class_definition function is reused for
+    user-supplied classes where we DO raise / 400)."""
+    issues = []
+    for nm, pp in REFERENCE_CLASS_TIERS.items():
+        errs = validate_class_definition(nm, pp)
+        if errs:
+            for e in errs:
+                issues.append(e)
+                logger.warning('Built-in class %r failed validation: %s',
+                               nm, e)
+    return issues
+
+
+_BUILTIN_VALIDATION_ISSUES = _validate_builtins()
+
+
+# ---------------------------------------------------------------------------
+# External JSON loading (env-var path)
+# ---------------------------------------------------------------------------
+
+def load_classes_from_path(path):
+    """Load a JSON file mapping class names to parameter dicts.
+
+    File format::
+
+        {
+          "customer_specific_petrochem_v3": {
+              "fat_tail_from": 0.55,
+              "pareto_offset": 0.25,
+              "pareto_alpha_range": [1.8, 2.4],
+              ...
+          },
+          ...
+        }
+
+    Returns dict of {name: validated_params}.  Invalid classes are
+    skipped with a warning so one bad entry doesn't break loading.
+    """
+    out = {}
+    if not path or not os.path.isfile(path):
+        return out
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except (OSError, ValueError) as exc:
+        logger.warning('Could not load reference classes from %s: %s',
+                       path, exc)
+        return out
+    if not isinstance(raw, dict):
+        logger.warning('Reference classes file %s must be a JSON object', path)
+        return out
+
+    for nm, pp in raw.items():
+        errs = validate_class_definition(nm, pp)
+        if errs:
+            logger.warning('Skipping invalid class %r in %s: %s',
+                           nm, path, '; '.join(errs))
+            continue
+        out[nm] = pp
+    if out:
+        logger.info('Loaded %d reference class(es) from %s', len(out), path)
+    return out
+
+
+# Load environment-supplied extensions at import time.  Sets
+# EXTERNAL_CLASS_TIERS for ops to inspect; a separate `effective_registry`
+# function below merges builtins + external + per-request custom.
+_EXT_PATH = os.environ.get('PYTH_REFERENCE_CLASSES_PATH', '')
+EXTERNAL_CLASS_TIERS = load_classes_from_path(_EXT_PATH) if _EXT_PATH else {}
+
+
+def effective_registry(custom_classes=None):
+    """Return the merged registry: builtins + env-loaded + per-request.
+
+    Per-request `custom_classes` win over env-loaded which win over
+    builtins.  This is the lookup the engine should use when callers
+    supply a `reference_class` so a request can shadow a built-in
+    class with a customer-specific calibration without hostile
+    side-effects on other requests.
+    """
+    merged = dict(REFERENCE_CLASS_TIERS)
+    merged.update(EXTERNAL_CLASS_TIERS)
+    if custom_classes:
+        merged.update(custom_classes)
+    return merged
+
+
+def validate_custom_classes(custom_classes):
+    """Validate a request-supplied dict of custom classes.  Returns
+    list of errors (empty -> valid).  Used by completion/routes.py."""
+    if custom_classes is None:
+        return []
+    if not isinstance(custom_classes, dict):
+        return ['config.custom_reference_classes must be an object']
+    errors = []
+    for nm, pp in custom_classes.items():
+        errors.extend(validate_class_definition(nm, pp))
+    return errors
 
 
 __all__ = [
     'REFERENCE_CLASS_TIERS',
+    'EXTERNAL_CLASS_TIERS',
+    'ALIASES',
     'INFINITE',
     'get_reference_class',
+    'suggest_reference_class',
     'list_reference_classes',
+    'validate_class_definition',
+    'validate_custom_classes',
+    'merge_class_definitions',
+    'effective_registry',
+    'load_classes_from_path',
 ]

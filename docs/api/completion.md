@@ -179,7 +179,7 @@ generic five-tier model to a sector-calibrated one drawn from
   to the OVERRUN portion of each percentile after the MC, so the
   deterministic baseline stays anchored at `expected_finish`.
 
-### Supported reference classes
+### Supported reference classes (built-in)
 
 `oil_gas_offshore`, `oil_gas_onshore_lng`, `nuclear_new_build`,
 `nuclear_decommissioning`, `rail`, `tunnels`, `bridges_fixed_links`,
@@ -187,7 +187,139 @@ generic five-tier model to a sector-calibrated one drawn from
 `it_software`, `olympics`, `mining`, `solar_pv`, `wind_onshore`,
 `wind_offshore`, `battery_storage`, `data_centre_hyperscale`.  Common
 aliases (`oil and gas` → `oil_gas_offshore`, `infrastructure` → `rail`,
-`nuclear` → `nuclear_new_build`, etc.) are accepted.
+`nuclear` → `nuclear_new_build`, etc.) are accepted.  Use the
+discovery endpoint (below) to fetch the live list, including
+environment-loaded extensions.
+
+### Extensibility (5 mechanisms)
+
+The 19 built-ins won't fit every customer.  Five layers of extension
+are available, with later layers winning over earlier ones:
+
+| Mechanism | Who controls | Persistence | Use case |
+|---|---|---|---|
+| Built-in 19 sectors | Pyth team (source code) | committed | published RCF data |
+| `PYTH_REFERENCE_CLASSES_PATH` env var | Ops at deploy time | per-environment | customer-tenant calibrations bundled with deploy |
+| `config.custom_reference_classes` request field | API caller | per-request | one-off custom class without ops involvement |
+| `config.reference_class_overrides` (`{base, overrides}`) | API caller | per-request | tweak a built-in for a single project |
+| `GET /completion/reference-classes` discovery | Frontend | read-only | populate sector dropdowns dynamically |
+
+#### Env-var extension
+
+Set `PYTH_REFERENCE_CLASSES_PATH=/etc/pyth/customer_classes.json` in
+the deploy environment.  The file is a JSON object mapping class
+names to parameter dicts (same schema as the built-in entries).
+Loaded once at module import.  Invalid entries are skipped with a
+log warning so one bad row doesn't break loading.
+
+#### Per-request custom classes
+
+```jsonc
+{
+  "config": {
+    "reference_class": "customer_acme_petrochem",
+    "custom_reference_classes": {
+      "customer_acme_petrochem": {
+        "fat_tail_from":      0.50,
+        "pareto_offset":      0.20,
+        "pareto_alpha_range": [1.7, 2.3],
+        "tier_4_distribution": "birnbaum_saunders",
+        "percentile_factors": {"P50": 1.15, "P80": 1.40,
+                                "P95": 1.85, "P99": 2.80},
+        "max_multiplier_cap": 12.0,
+        "mean_overrun":       0.40,
+        "is_fat_tailed":      true,
+        "has_finite_mean":    true,
+        "citations":          ["ACME internal portfolio analysis 2026"]
+      }
+    }
+  }
+}
+```
+
+A custom class with the same name as a built-in **shadows** the
+built-in for that request.  Validated against the same schema as
+built-ins; malformed entries return a 400 with the specific field
+that broke (e.g. `fat_tail_from must be in [0, 1] (got 1.5)`).
+
+#### Per-request overrides
+
+For a one-off tweak of a built-in:
+
+```jsonc
+{
+  "config": {
+    "reference_class_overrides": {
+      "base": "rail",
+      "overrides": {
+        "percentile_factors": {"P95": 2.5, "P99": 4.0}
+      }
+    }
+  }
+}
+```
+
+The `overrides` dict is deep-merged onto a copy of the base class.
+`percentile_factors` is merged at the per-percentile level so you
+can override just P95 without rewriting P50/P80.  The merged result
+is validated; any out-of-range value is rejected.
+
+#### Discovery endpoint
+
+```
+GET /completion/reference-classes  →  200
+{
+  "classes": [
+    {
+      "name": "data_centre_hyperscale",
+      "mean_overrun": 0.30,
+      "is_fat_tailed": true,
+      "has_finite_mean": true,
+      "tier_4_distribution": "birnbaum_saunders",
+      "pareto_alpha_range": [1.9, 2.6],
+      "max_multiplier_cap": 8.0,
+      "percentile_factors": {"P50": 1.10, "P80": 1.40,
+                              "P95": 1.85, "P99": 2.75},
+      "citations": ["JLL 2026 Global Data Center Outlook", ...],
+      "version": null
+    },
+    ...
+  ],
+  "aliases": {"oil_and_gas": "oil_gas_offshore", ...},
+  "builtin_count": 19,
+  "external_count": 0,
+  "external_path": ""
+}
+```
+
+Frontends should call this once on page load and cache it.  A JS
+helper `window.fetchReferenceClasses()` is provided in
+`Reference/Completionprediction.js` that does the fetch + caches.
+
+### Error handling
+
+Invalid `reference_class` returns 400 with a fuzzy suggestion when
+one exists:
+
+```
+config.reference_class "oilgaz" not recognised. did you mean: oil_gas_offshore?
+```
+
+When no fuzzy match crosses the 0.5 ratio cutoff, the full list of
+supported classes is included instead.  Custom-class validation
+errors enumerate every broken field:
+
+```
+config.custom_reference_classes: class 'broken': missing required key
+'pareto_offset'; class 'broken': missing required key 'tier_4_distribution';
+class 'broken': fat_tail_from must be in [0, 1] (got 1.5); class
+'broken': pareto_alpha_range values should be in [0.5, 5.0]
+```
+
+Partial classes (missing some percentile factors) are accepted with
+a `partial_percentile_factors` warning in `calibration_warnings[]`;
+missing factors default to 1.0 (no calibration shift) and `P99`
+defaults to `null`.
 
 When set, the response gains a `reference_class_calibrated` companion
 with the empirically-corrected percentiles AND the citations behind

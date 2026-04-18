@@ -65,6 +65,15 @@ class CompletionMCConfig:
     # Names are case-insensitive; see solver/reference_classes.py for
     # the canonical list.
     reference_class: str = None
+    # Per-request extension to the registry: {name: params, ...}
+    # Validated at the routes layer; passed through here so callers
+    # can use a one-off custom class without committing it to source.
+    custom_reference_classes: dict = None
+    # Per-request override of an existing class:
+    #   {'base': 'rail', 'overrides': {'percentile_factors': {'P95': 2.5}}}
+    # The merged class takes precedence over reference_class when both
+    # are set.  Useful for tuning without registering a full new class.
+    reference_class_overrides: dict = None
 
     @classmethod
     def from_dict(cls, d):
@@ -84,6 +93,8 @@ class CompletionMCConfig:
             max_mult_high=float(caps.get('max_mult_high', 6.0)),
             enable_risk=bool(d.get('enable_risk', True)),
             reference_class=d.get('reference_class'),
+            custom_reference_classes=d.get('custom_reference_classes'),
+            reference_class_overrides=d.get('reference_class_overrides'),
         )
 
 
@@ -304,6 +315,42 @@ def _duration_sensitive_cap(risk, dur_days, base, high):
     return base + (high - base) * t
 
 
+def _resolve_reference_class(config):
+    """Resolve a reference class for this MC run, honouring (in order):
+
+      1. ``config.reference_class_overrides`` -- {base, overrides} merge.
+         Wins over plain reference_class when both are set.
+      2. ``config.reference_class`` looked up in the merged registry of
+         built-ins + env-loaded + per-request custom classes.
+
+    Returns the parameter dict, or None if no class was selected.
+    Raises ValueError on a malformed override (caller should already
+    have run validate_custom_classes; this is the second line of
+    defence).
+    """
+    from solver.reference_classes import (
+        get_reference_class, merge_class_definitions, effective_registry,
+    )
+    custom = getattr(config, 'custom_reference_classes', None)
+    registry = effective_registry(custom_classes=custom)
+
+    overrides_spec = getattr(config, 'reference_class_overrides', None)
+    if overrides_spec and isinstance(overrides_spec, dict):
+        base_name = overrides_spec.get('base')
+        if base_name:
+            base = get_reference_class(base_name, registry=registry)
+            if base is None:
+                raise ValueError(
+                    f'reference_class_overrides.base {base_name!r} '
+                    f'not in registry')
+            return merge_class_definitions(
+                base, overrides_spec.get('overrides') or {},
+                name=f'{base_name}__overridden')
+
+    name = getattr(config, 'reference_class', None)
+    return get_reference_class(name, registry=registry)
+
+
 def _apply_percentile_factor(model_finish_ms, expected_ms, factor):
     """Scale a model-output finish-date toward later by a published
     reference-class factor.
@@ -422,6 +469,22 @@ def _build_calibration_warnings(nodes, in_scope, risk, ref_params,
 
     # 5. Reference-class advisories
     if ref_params is not None:
+        # Partial custom classes / overrides can miss percentile
+        # factors; we silently default them to 1.0 in the result-builder
+        # but the user should see WHY their calibrated P95 looks the
+        # same as their model P95.
+        pf = ref_params.get('percentile_factors') or {}
+        missing_pcts = [k for k in ('P50', 'P80', 'P95')
+                        if k not in pf]
+        if missing_pcts:
+            warnings.append({
+                'code': 'partial_percentile_factors',
+                'severity': 'info',
+                'message': (
+                    f'Reference class has no factor for: '
+                    f'{", ".join(missing_pcts)}.  Those calibrated '
+                    f'percentiles default to factor 1.0 (no shift).'),
+            })
         if not ref_params.get('has_finite_mean', True):
             warnings.append({
                 'code': 'infinite_mean_reference_class',
@@ -478,9 +541,13 @@ def _sample_multipliers(risk, activity_types, remaining, calendar, config):
     fat_tail_from / pareto_offset / pareto_alpha_range / tier_4
     distribution / max_multiplier_cap override the defaults for THIS
     MC run.  Without a class, behaviour is byte-identical to before.
-    """
-    from solver.reference_classes import get_reference_class
 
+    Custom classes / overrides:
+      - config.custom_reference_classes: per-request extension dict.
+      - config.reference_class_overrides: {base, overrides} merge.
+    Both are honoured; per-request always wins over the env-loaded
+    extensions which win over the built-ins.
+    """
     n = len(risk)
     if not config.enable_risk or n == 0:
         return np.ones((config.iterations, n), dtype=np.float64), config.iterations
@@ -493,7 +560,7 @@ def _sample_multipliers(risk, activity_types, remaining, calendar, config):
     # Resolve the reference class once.  When None, we use the historic
     # (config.fat_tail_from, default tier 4 = BS, default Pareto alpha
     # formula, default 6/10x cap) behaviour.
-    ref = get_reference_class(getattr(config, 'reference_class', None))
+    ref = _resolve_reference_class(config)
 
     fat_default = ref['fat_tail_from'] if ref else config.fat_tail_from
     pareto_offset = ref['pareto_offset'] if ref else None
@@ -834,35 +901,52 @@ def run_completion_mc(nodes, links, status_date,
     # adjusted finish dates per the table in solver/reference_classes.py.
     # The raw model fields stay unchanged so consumers reading the
     # existing contract (CompletionPrediction.js etc.) are unaffected.
-    from solver.reference_classes import get_reference_class
-    ref_params = get_reference_class(getattr(config, 'reference_class', None))
+    # _resolve_reference_class honours custom classes + overrides.
+    try:
+        ref_params = _resolve_reference_class(config)
+    except ValueError as exc:
+        # Defensive: validate_custom_classes / validate_class_definition
+        # at the routes layer should already have caught this.  Log + None
+        # so the request still returns the raw model output.
+        logger.warning("Failed to resolve reference class: %s", exc)
+        ref_params = None
     calibrated = None
     if ref_params is not None:
-        factors = ref_params['percentile_factors']
+        # Defensive: missing percentile factors default to 1.0 (no
+        # calibration shift) rather than crashing the response; surfaces
+        # via calibration_warnings below so the partial config is
+        # visible to the caller.
+        factors = ref_params.get('percentile_factors') or {}
+        f50 = factors.get('P50', 1.0)
+        f80 = factors.get('P80', 1.0)
+        f95 = factors.get('P95', 1.0)
+        f99 = factors.get('P99')
         calibrated = {
             'p50_finish': _ms_to_iso(_apply_percentile_factor(
-                p50, expected_finish_ms, factors.get('P50'))),
+                p50, expected_finish_ms, f50)),
             'p80_finish': _ms_to_iso(_apply_percentile_factor(
-                p80, expected_finish_ms, factors.get('P80'))),
+                p80, expected_finish_ms, f80)),
             'p95_finish': _ms_to_iso(_apply_percentile_factor(
-                p95, expected_finish_ms, factors.get('P95'))),
-            # P99 may be Inf for IT / Olympics; render as None and
-            # surface via calibration_warnings instead.
+                p95, expected_finish_ms, f95)),
+            # P99 may be Inf for IT / Olympics or missing for partial
+            # custom classes; render as None and surface via
+            # calibration_warnings instead.
             'p99_finish': (
                 _ms_to_iso(_apply_percentile_factor(
-                    p95, expected_finish_ms, factors.get('P99')))
-                if (factors.get('P99') is not None
-                    and np.isfinite(factors.get('P99')))
+                    p95, expected_finish_ms, f99))
+                if (f99 is not None and np.isfinite(f99))
                 else None),
-            'reference_class':  config.reference_class,
+            'reference_class':  (config.reference_class
+                                 or (config.reference_class_overrides
+                                     or {}).get('base')),
             'percentile_factors': factors,
-            'mean_overrun_published': ref_params['mean_overrun'],
-            'is_fat_tailed':         ref_params['is_fat_tailed'],
-            'has_finite_mean':       ref_params['has_finite_mean'],
-            'tier_4_distribution':   ref_params['tier_4_distribution'],
-            'pareto_alpha_range':    ref_params['pareto_alpha_range'],
-            'max_multiplier_cap':    ref_params['max_multiplier_cap'],
-            'citations':             ref_params['citations'],
+            'mean_overrun_published': ref_params.get('mean_overrun'),
+            'is_fat_tailed':         ref_params.get('is_fat_tailed'),
+            'has_finite_mean':       ref_params.get('has_finite_mean', True),
+            'tier_4_distribution':   ref_params.get('tier_4_distribution'),
+            'pareto_alpha_range':    ref_params.get('pareto_alpha_range'),
+            'max_multiplier_cap':    ref_params.get('max_multiplier_cap'),
+            'citations':             ref_params.get('citations', []),
         }
 
     project_dates = None
