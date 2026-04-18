@@ -2442,9 +2442,17 @@ async function getCumulativeDistributionAsync(nodes, links) {
         const f = result.forecasted;
         if (f && typeof displayForecastedEVMetrics === 'function') {
             try {
+                // Match the sync path: display raw SPI/CPIcum so the
+                // frontend's Infinity-is-data-quality-signal rendering
+                // works identically whether the backend or the JS
+                // fallback produced the numbers.  Fall back to *_model
+                // when raw is null (backend serialises non-finite to
+                // null; sync preserves Infinity literal).
+                const spiDisp = (f.SPI != null) ? f.SPI : f.SPI_model;
+                const cpiDisp = (f.CPIcum != null) ? f.CPIcum : f.CPIcum_model;
                 displayForecastedEVMetrics(
-                    f.BCWP, f.ACWP, f.BCWS, f.SPI_model, f.SV, f.CV,
-                    f.CPIcum_model, f.EAC);
+                    f.BCWP, f.ACWP, f.BCWS, spiDisp, f.SV, f.CV,
+                    cpiDisp, f.EAC);
             } catch (e) { console.warn('[EVM] displayForecastedEVMetrics:', e); }
         }
         if (f && typeof populateForecastedEVMTable === 'function') {
@@ -2489,9 +2497,14 @@ async function createActualEVMChartAsync(nodes, links) {
         const a = result.actual;
         if (a && typeof displayActualEVMetrics === 'function') {
             try {
+                // Display raw SPI/CPIcum with _model fallback when raw
+                // is null -- matches sync path so Infinity-as-signal
+                // rendering is consistent with the JS fallback.
+                const spiDisp = (a.SPI != null) ? a.SPI : a.SPI_model;
+                const cpiDisp = (a.CPIcum != null) ? a.CPIcum : a.CPIcum_model;
                 displayActualEVMetrics(
-                    a.BCWP, a.ACWP, a.BCWS, a.SPI_model, a.SV, a.CV,
-                    a.CPIcum_model, a.EAC);
+                    a.BCWP, a.ACWP, a.BCWS, spiDisp, a.SV, a.CV,
+                    cpiDisp, a.EAC);
             } catch (e) { console.warn('[EVM] displayActualEVMetrics:', e); }
         }
         if (a && typeof populateActualEVMTable === 'function') {
