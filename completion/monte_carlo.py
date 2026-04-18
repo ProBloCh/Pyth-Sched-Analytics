@@ -497,18 +497,23 @@ def _build_calibration_warnings(nodes, in_scope, risk, ref_params,
                     f'measurement.  Recommended: cap exposure rather '
                     f'than predict the tail.'),
             })
-        # Judgement / no peer-reviewed fit
-        for cit in ref_params.get('citations', []):
-            if 'JUDGEMENT' in cit:
-                warnings.append({
-                    'code': 'reference_class_judgement',
-                    'severity': 'info',
-                    'message': (
-                        f'Reference class parameters include judgement '
-                        f'calls (no peer-reviewed distribution fit yet).  '
-                        f'See citations field for source notes.'),
-                })
-                break
+        # Judgement / no peer-reviewed fit -- surface the specific
+        # source statement so the customer sees exactly which parts
+        # of the parameter table aren't on solid empirical ground.
+        judgement_notes = [
+            cit for cit in ref_params.get('citations', [])
+            if 'JUDGEMENT' in cit
+        ]
+        if judgement_notes:
+            warnings.append({
+                'code': 'reference_class_judgement',
+                'severity': 'info',
+                'message': (
+                    'Reference class parameters include judgement calls; '
+                    'no peer-reviewed distribution fit yet.  Source notes:\n  '
+                    + '\n  '.join(judgement_notes)),
+                'notes': judgement_notes,
+            })
 
     # 6. Honest blanket caveat when no reference class is set
     if ref_params is None and n_scope > 0:

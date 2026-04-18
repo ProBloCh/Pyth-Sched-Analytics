@@ -132,7 +132,9 @@ def build_forecasted_branch(nodes, links, options):
         percent_complete_100)
 
     distributions = build_forecasted_distributions(
-        nodes, status_date, cost_rate, currency, hpd, dpw)
+        nodes, status_date, cost_rate, currency, hpd, dpw,
+        max_distribution_points=options.get('maxDistributionPoints')
+                                or options.get('max_distribution_points'))
 
     out = {
         # Dollars (unit-consistent for CPI/SPI/EAC)
@@ -251,7 +253,9 @@ def build_actual_branch(nodes, links, options):
         precomputed_frontier=frontier)
 
     distributions = build_actual_distributions(
-        nodes, status_date, cost_rate, currency, hpd, dpw)
+        nodes, status_date, cost_rate, currency, hpd, dpw,
+        max_distribution_points=options.get('maxDistributionPoints')
+                                or options.get('max_distribution_points'))
 
     out = {
         # Dollars (unit-consistent for CPI/SPI/EAC)

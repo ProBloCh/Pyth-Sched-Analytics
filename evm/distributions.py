@@ -48,9 +48,17 @@ _SEC_PER_DAY = 86400.0
 # Date grid construction (unchanged semantics; still a single pass)
 # ---------------------------------------------------------------------------
 
-def _significant_dates(nodes, extra_dates=None, weekly_fill=True):
+def _significant_dates(nodes, extra_dates=None, weekly_fill=True,
+                       max_points=None):
     """Collect unique 'YYYY-MM-DD' dates from nodes plus weekly fills
-    (mirrors the JS v5 FIX #24 for smoother S-curves)."""
+    (mirrors the JS v5 FIX #24 for smoother S-curves).
+
+    When ``max_points`` is set and the date count exceeds it, the dates
+    are uniformly subsampled (preserving the first and last) so the
+    O(N x D) matrix work stays bounded for very large projects.  500
+    points is more than any chart can usefully display; the natural
+    quality knob for 10K+ activity projects.
+    """
     date_set = set()
     for node in nodes or []:
         for key in ('Start', 'Finish', 'riskAdjustedStart', 'riskAdjustedEnd',
@@ -78,7 +86,13 @@ def _significant_dates(nodes, extra_dates=None, weekly_fill=True):
                 date_set.add(date_to_iso_date(cur))
                 cur = cur + timedelta(days=7)
 
-    return sorted(date_set)
+    sorted_dates = sorted(date_set)
+    if max_points is not None and len(sorted_dates) > max_points:
+        # Keep first and last; uniformly subsample the middle.
+        # np.linspace gives indices that include both endpoints.
+        idx = np.linspace(0, len(sorted_dates) - 1, max_points).astype(int)
+        sorted_dates = [sorted_dates[i] for i in sorted(set(idx))]
+    return sorted_dates
 
 
 def _dates_to_seconds(iso_dates):
@@ -294,7 +308,8 @@ def _activity_arrays(nodes, cost_rate_default, hours_per_day,
 # ---------------------------------------------------------------------------
 
 def build_forecasted_distributions(nodes, status_date, cost_rate, currency,
-                                   hours_per_day, working_days_per_week):
+                                   hours_per_day, working_days_per_week,
+                                   max_distribution_points=None):
     """Build the 'forecasted' branch of evmMetrics (vectorised).
 
     Three curve variants, each as an (N, D) cumulative matrix:
@@ -305,7 +320,7 @@ def build_forecasted_distributions(nodes, status_date, cost_rate, currency,
     Matches the scalar _accrued_hours semantics exactly.  Cost variants
     scale by per-activity cost_rate.
     """
-    iso_dates = _significant_dates(nodes)
+    iso_dates = _significant_dates(nodes, max_points=max_distribution_points)
     if not iso_dates:
         return _empty_distributions()
 
@@ -377,7 +392,8 @@ def build_forecasted_distributions(nodes, status_date, cost_rate, currency,
 # ---------------------------------------------------------------------------
 
 def build_actual_distributions(nodes, status_date, cost_rate, currency,
-                               hours_per_day, working_days_per_week):
+                               hours_per_day, working_days_per_week,
+                               max_distribution_points=None):
     """Build the 'actual' branch of evmMetrics (vectorised).
 
     EV curve (4 cases from EVM.js calculateTimePhasedEV, lines 215-299)
@@ -406,7 +422,7 @@ def build_actual_distributions(nodes, status_date, cost_rate, currency,
     branch semantics -- distinct from the forecasted branch which uses
     the in-window step-function daily rate).
     """
-    iso_dates = _significant_dates(nodes)
+    iso_dates = _significant_dates(nodes, max_points=max_distribution_points)
     if not iso_dates:
         return _empty_distributions()
 

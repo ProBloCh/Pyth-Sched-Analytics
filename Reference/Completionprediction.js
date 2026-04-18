@@ -1977,6 +1977,68 @@
         window.fetchReferenceClasses = fetchReferenceClasses;
     }
 
+    // -------------------------------------------------------------------------
+    // Outcome registration: customers can submit project actuals so the
+    // backend accumulates real predicted-vs-actual data.  Without this,
+    // the reference-class table is "trust the literature"; with it, the
+    // customer can validate their own portfolio over time.
+    //
+    // Call when a project closes out (or at any milestone with reliable
+    // actuals).  Backend storage is best-effort -- backend failures
+    // log a warning but don't block the calling UI.
+    // -------------------------------------------------------------------------
+    async function registerProjectOutcome(record) {
+        const disabled = !CONFIG.useBackendCompletion
+            || typeof fetch !== 'function'
+            || !CONFIG.completionEndpoint;
+        if (disabled) {
+            console.warn('[CompletionPrediction] Backend disabled; outcome not registered');
+            return null;
+        }
+        const base = CONFIG.completionEndpoint.replace(/\/monte-carlo\/?$/, '');
+        try {
+            const resp = await fetch(base + '/register-outcome', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(record),
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+                console.warn('[CompletionPrediction] register-outcome rejected:',
+                             data && data.error);
+                return null;
+            }
+            return data;
+        } catch (err) {
+            console.warn('[CompletionPrediction] register-outcome failed:', err);
+            return null;
+        }
+    }
+
+    async function fetchCalibrationReport(referenceClass) {
+        const disabled = !CONFIG.useBackendCompletion
+            || typeof fetch !== 'function'
+            || !CONFIG.completionEndpoint;
+        if (disabled) return null;
+        const base = CONFIG.completionEndpoint.replace(/\/monte-carlo\/?$/, '');
+        const url = referenceClass
+            ? `${base}/calibration-report?reference_class=${encodeURIComponent(referenceClass)}`
+            : `${base}/calibration-report`;
+        try {
+            const resp = await fetch(url, { method: 'GET' });
+            if (!resp.ok) return null;
+            return await resp.json();
+        } catch (err) {
+            console.warn('[CompletionPrediction] calibration-report failed:', err);
+            return null;
+        }
+    }
+
+    if (typeof window !== 'undefined') {
+        window.registerProjectOutcome = registerProjectOutcome;
+        window.fetchCalibrationReport = fetchCalibrationReport;
+    }
+
     // =========================================================================
     // BACKEND-FIRST RECOVERY OPTIONS WRAPPER
     // =========================================================================
@@ -6311,7 +6373,16 @@
         analyze,
         destroy,
         CONFIG,
-        getLastAnalysis: () => _lastAnalysis
+        getLastAnalysis: () => _lastAnalysis,
+        // Internal helpers exposed for the JS<->Python diff harness only.
+        // Not part of the production API; using these from app code is
+        // unsupported and may break across versions.
+        _internals: {
+            classifyCrashProfile,
+            getLagInHours,
+            normalizePercentComplete,
+            convertToHours,
+        },
     };
 
 })(typeof window !== 'undefined' ? window : this);

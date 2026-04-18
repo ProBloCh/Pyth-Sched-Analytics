@@ -63,8 +63,15 @@ logger = logging.getLogger(__name__)
 # infinite variance / mean".  Consumers should display a cap warning.
 INFINITE = float('inf')
 
-# Allowed tier-4 distribution values
-_TIER_4_VALID = frozenset({'birnbaum_saunders', 'lognormal', 'skip'})
+# Allowed tier-4 distribution values.  'skip' is preserved as a
+# back-compat alias for 'direct_normal_to_pareto' (the explicit name
+# describes the actual semantics: BS is bypassed and the normal tier
+# extends directly to a low-alpha Pareto, used for alpha <= 1 regimes
+# like IT and Olympics).
+_TIER_4_VALID = frozenset({
+    'birnbaum_saunders', 'lognormal',
+    'direct_normal_to_pareto', 'skip',
+})
 
 # Required keys on every class definition
 _REQUIRED_KEYS = (
@@ -279,7 +286,7 @@ REFERENCE_CLASS_TIERS = {
         'fat_tail_from':       0.30,    # short / nonexistent BS bridge
         'pareto_offset':       0.05,    # Pareto kicks in almost immediately
         'pareto_alpha_range':  (0.8, 1.5),
-        'tier_4_distribution': 'skip',  # straight from normal to Pareto
+        'tier_4_distribution': 'direct_normal_to_pareto',  # straight from normal to Pareto
         'percentile_factors':  {'P50': 1.15, 'P80': 1.50, 'P95': 2.50, 'P99': INFINITE},
         'max_multiplier_cap':  50.0,
         'mean_overrun':        4.47,    # 447% in the tail; 18% exceed +50%
@@ -298,7 +305,7 @@ REFERENCE_CLASS_TIERS = {
         'fat_tail_from':       0.20,
         'pareto_offset':       0.05,
         'pareto_alpha_range':  (0.9, 1.4),
-        'tier_4_distribution': 'skip',
+        'tier_4_distribution': 'direct_normal_to_pareto',
         'percentile_factors':  {'P50': 1.50, 'P80': 2.40, 'P95': 4.50, 'P99': INFINITE},
         'max_multiplier_cap':  50.0,
         'mean_overrun':        1.72,    # 172% per Oxford Olympics Study 2024

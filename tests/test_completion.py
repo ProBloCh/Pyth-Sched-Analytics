@@ -625,7 +625,9 @@ class TestReferenceClassCalibration:
         cal = r['reference_class_calibrated']
         assert cal['p99_finish'] is None
         assert cal['has_finite_mean'] is False
-        assert cal['tier_4_distribution'] == 'skip'
+        # 'direct_normal_to_pareto' is the canonical name; 'skip' is
+        # the back-compat alias.  Built-ins use the explicit name.
+        assert cal['tier_4_distribution'] in ('direct_normal_to_pareto', 'skip')
         codes = {w['code'] for w in r['calibration_warnings']}
         assert 'infinite_mean_reference_class' in codes
 
@@ -1013,6 +1015,171 @@ class TestReferenceClassExtensibility:
             'max_multiplier_cap': 500.0,
         })
         assert len(errs) >= 4
+
+
+class TestOutcomesEndpoint:
+    """register-outcome + calibration-report basic functionality."""
+
+    def test_register_outcome_minimal(self, client):
+        resp = client.post('/completion/register-outcome', json={
+            'project_id': 'PRJ-001',
+            'reference_class': 'oil_gas_offshore',
+            'predicted': {
+                'p80_finish': '2026-12-31T00:00:00Z',
+                'baseline_finish': '2026-06-01T00:00:00Z',
+            },
+            'actual': {'finish': '2027-03-15T00:00:00Z'},
+        })
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['status'] == 'stored'
+        assert 'submitted_at' in data['record']
+
+    def test_register_outcome_validation(self, client):
+        # Missing project_id
+        resp = client.post('/completion/register-outcome', json={
+            'predicted': {'p80_finish': '2026-12-31'},
+            'actual': {'finish': '2027-03-15'},
+        })
+        assert resp.status_code == 400
+        # Missing actual.finish
+        resp = client.post('/completion/register-outcome', json={
+            'project_id': 'X',
+            'predicted': {'p80_finish': '2026-12-31'},
+            'actual': {},
+        })
+        assert resp.status_code == 400
+
+    def test_calibration_report_aggregates(self, client):
+        # Register a few outcomes that average to ratio > 1.3 (the
+        # "P80 acts like P10" signature).
+        for i, actual in enumerate(['2027-06-01', '2027-09-01', '2027-12-01']):
+            client.post('/completion/register-outcome', json={
+                'project_id': f'PRJ-cal-{i}',
+                'reference_class': 'data_centre_hyperscale',
+                'predicted': {
+                    'baseline_finish': '2026-06-01T00:00:00Z',
+                    'p80_finish':      '2026-12-01T00:00:00Z',
+                },
+                'actual': {'finish': actual + 'T00:00:00Z'},
+            })
+        resp = client.get(
+            '/completion/calibration-report?reference_class=data_centre_hyperscale')
+        assert resp.status_code == 200
+        report = resp.get_json()
+        assert report['n'] >= 3
+        dc = report['by_class'].get('data_centre_hyperscale')
+        assert dc is not None
+        # actual overrun > predicted overrun -> mean ratio > 1
+        assert dc['mean_ratio'] > 1.0
+
+
+class TestMaxDistributionPoints:
+    """config.maxDistributionPoints subsamples the date grid for very
+    large projects without breaking downstream consumers."""
+
+    def test_evm_analyze_caps_distribution_count(self, client):
+        from datetime import datetime, timedelta, timezone
+        # 200 activities over a long horizon -> would otherwise produce
+        # ~400+ comparison dates with weekly fill.
+        nodes = [{'ID': str(i), 'Duration': 5, 'TimeUnits': 'days',
+                  'Start': (datetime(2025, 1, 1, tzinfo=timezone.utc)
+                            + timedelta(days=i*5)).isoformat(),
+                  'Finish': (datetime(2025, 1, 1, tzinfo=timezone.utc)
+                             + timedelta(days=(i+1)*5)).isoformat()}
+                 for i in range(200)]
+        # Without cap
+        r1 = client.post('/evm/analyze', json={
+            'nodes': nodes, 'links': [],
+            'options': {'statusDate': '2025-06-01T00:00:00Z',
+                        'costRate': 100},
+        }).get_json()
+        # With cap at 50
+        r2 = client.post('/evm/analyze', json={
+            'nodes': nodes, 'links': [],
+            'options': {'statusDate': '2025-06-01T00:00:00Z',
+                        'costRate': 100,
+                        'maxDistributionPoints': 50},
+        }).get_json()
+        n1 = len(r1['forecasted']['distributionPlanned'])
+        n2 = len(r2['forecasted']['distributionPlanned'])
+        assert n1 > 50
+        assert n2 <= 50
+        # First and last dates preserved (so chart endpoints are correct)
+        assert (r2['forecasted']['distributionPlanned'][0]['date']
+                == r1['forecasted']['distributionPlanned'][0]['date'])
+        assert (r2['forecasted']['distributionPlanned'][-1]['date']
+                == r1['forecasted']['distributionPlanned'][-1]['date'])
+
+
+class TestTier4AliasBackcompat:
+    """'skip' is preserved as alias for 'direct_normal_to_pareto'."""
+
+    def test_skip_alias_accepted_in_custom_class(self, client):
+        # Old-style 'skip' value should still validate + behave the same
+        # as the new 'direct_normal_to_pareto'.
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': f'A{i}', 'Duration': 10, 'TimeUnits': 'days',
+                       'riskScore': 0.5} for i in range(40)],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {
+                'reference_class': 'old_style',
+                'iterations': 200,
+                'custom_reference_classes': {
+                    'old_style': {
+                        'fat_tail_from': 0.30, 'pareto_offset': 0.05,
+                        'pareto_alpha_range': [0.9, 1.5],
+                        'tier_4_distribution': 'skip',  # legacy name
+                        'percentile_factors': {'P50': 1.2, 'P80': 1.6,
+                                               'P95': 3.0, 'P99': 8.0},
+                        'max_multiplier_cap': 50.0,
+                    },
+                },
+            },
+        })
+        assert resp.status_code == 200
+
+    def test_explicit_name_accepted(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': 'A', 'Duration': 10, 'TimeUnits': 'days'}],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {
+                'custom_reference_classes': {
+                    'new_style': {
+                        'fat_tail_from': 0.30, 'pareto_offset': 0.05,
+                        'pareto_alpha_range': [0.9, 1.5],
+                        'tier_4_distribution': 'direct_normal_to_pareto',
+                        'percentile_factors': {'P50': 1.2, 'P80': 1.6,
+                                               'P95': 3.0, 'P99': 8.0},
+                        'max_multiplier_cap': 50.0,
+                    },
+                },
+            },
+        })
+        assert resp.status_code == 200
+
+
+class TestJudgementWarningEnhanced:
+    """reference_class_judgement warning surfaces the actual source notes."""
+
+    def test_judgement_notes_in_warning(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': f'A{i}', 'Duration': 10, 'TimeUnits': 'days',
+                       'riskScore': 0.4} for i in range(40)],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {'reference_class': 'data_centre_hyperscale',
+                       'iterations': 100},
+        })
+        assert resp.status_code == 200
+        data = resp.get_json()
+        warns = data['calibration_warnings']
+        judgement = next(
+            (w for w in warns if w['code'] == 'reference_class_judgement'),
+            None)
+        assert judgement is not None
+        # The warning now carries the actual source statements
+        assert 'notes' in judgement
+        assert any('JUDGEMENT' in n for n in judgement['notes'])
 
 
 class TestRecoveryLagUnits:

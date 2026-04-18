@@ -351,6 +351,49 @@ warning rather than fabricating a number.  The recommended action in
 those classes is to cap exposure (modular delivery, stop-loss) rather
 than predict the tail.
 
+### Percentile-factor semantics (honest caveat)
+
+The percentile-factor calibration scales the **overrun portion** of
+each percentile, not the absolute finish date.  Concretely:
+
+```
+calibrated_p80 = expected_finish + (model_p80 - expected_finish) * factor_P80
+```
+
+Two implications worth being explicit about:
+
+1. **The published Flyvbjerg / Cantarelli / TII tables were calibrated
+   against deterministic point estimates** (e.g. "to absorb a 20% chance
+   of overrun, multiply your point estimate by X").  We're applying
+   them to MC-output overrun.  If the underlying MC already produces
+   a wider-than-baseline distribution, this could partially
+   double-count uncertainty.  Without a customer-specific calibration
+   loop (see `/completion/calibration-report`), we don't yet know the
+   magnitude of this bias for any given sector.
+
+2. **When `model_finish == expected_finish`** (no model-side overrun),
+   the calibrated finish equals the model finish regardless of factor.
+   This is intentional -- the calibration shouldn't manufacture
+   overrun where the model says there is none -- but it also means
+   for very early-phase / very low-risk projects the calibrated
+   percentiles can look identical to the raw model.
+
+The honest end-state is to use the **empirical CDF transform**
+(option (h) from the design discussion) rather than per-percentile
+factors: take the customer's accumulated outcome distribution from
+`/completion/calibration-report` and remap MC percentiles directly.
+That's not implemented yet -- documented in `REMAINING_WORK.md`.
+
+### Outcome registration (foundation for empirical calibration)
+
+`POST /completion/register-outcome` stores per-project predicted-vs-
+actual records; `GET /completion/calibration-report` aggregates them
+into ratios per reference class.  When the mean ratio for a class
+exceeds 1.3, the report emits a "P80 acts like P10" advisory --
+the LinkedIn-discussion signature -- and the customer can tighten
+the corresponding `percentile_factors` via a custom class or
+override.
+
 ### Model vs reality
 
 Even with reference-class calibration in place, the published P80 is a

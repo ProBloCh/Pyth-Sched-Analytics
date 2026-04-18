@@ -406,6 +406,57 @@ def recovery_options():
         return jsonify({'error': 'Internal completion-service error'}), 500
 
 
+@completion_bp.route('/register-outcome', methods=['POST', 'OPTIONS'])
+def register_outcome_route():
+    """Store a project outcome record (predicted-vs-actual) for later
+    calibration analysis.  See completion/outcomes.py for the schema.
+
+    Lightweight: validates + writes; doesn't itself update any
+    distribution parameters.  The calibration-report endpoint
+    aggregates accumulated outcomes into ratios the customer can use
+    to validate (or refute) the reference-class percentiles.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'})
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({'error': 'Invalid or missing JSON body'}), 400
+    from .outcomes import validate_outcome, register_outcome
+    errs = validate_outcome(data)
+    if errs:
+        return jsonify({'error': '; '.join(errs)}), 400
+    try:
+        stored = register_outcome(data)
+        return jsonify({'status': 'stored', 'record': stored})
+    except Exception as exc:
+        logger.exception('register_outcome failed: %s', exc)
+        return jsonify({'error': 'Internal storage error'}), 500
+
+
+@completion_bp.route('/calibration-report', methods=['GET', 'OPTIONS'])
+def calibration_report_route():
+    """Aggregated empirical calibration of accumulated outcomes.
+
+    Query params:
+        ?reference_class=oil_gas_offshore  -- filter to one class
+
+    Returns ratios of (actual_overrun_days / predicted_P80_overrun_days)
+    per reference class.  A mean ratio >> 1 is the LinkedIn-discussion
+    signature ("P80 acts like P10") -- the customer can decide whether
+    to tighten the corresponding percentile_factors in their custom
+    classes or pick a fatter-tail base.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'})
+    rc = request.args.get('reference_class')
+    from .outcomes import calibration_report
+    try:
+        return jsonify(calibration_report(reference_class=rc))
+    except Exception as exc:
+        logger.exception('calibration_report failed: %s', exc)
+        return jsonify({'error': 'Internal report error'}), 500
+
+
 @completion_bp.route('/reference-classes', methods=['GET', 'OPTIONS'])
 def reference_classes():
     """Discovery endpoint: list all built-in + env-loaded reference
@@ -439,5 +490,7 @@ def health():
             '/completion/monte-carlo',
             '/completion/recovery-options',
             '/completion/reference-classes',
+            '/completion/register-outcome',
+            '/completion/calibration-report',
         ],
     })

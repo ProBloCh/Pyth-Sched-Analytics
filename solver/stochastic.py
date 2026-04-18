@@ -223,12 +223,14 @@ def _compute_raw_multipliers(u, z, risk, fat_thresh,
                                      classify the sector as
                                      non-fat-tailed.  σ scales with
                                      risk: σ = 0.05 + 0.5*r.
-      'skip':                        Reference classes with α <= 1
-                                     (IT, Olympics) where Birnbaum-
-                                     Saunders cannot represent infinite
-                                     mean.  Tier 4 collapses into the
-                                     normal tier; Pareto takes over
-                                     directly above ``fat_thresh``.
+      'direct_normal_to_pareto'      Reference classes with α <= 1 (IT,
+                  (or 'skip'):       Olympics) where Birnbaum-Saunders
+                                     cannot represent infinite mean.
+                                     The normal tier extends to
+                                     ``pareto_thresh`` and Pareto takes
+                                     over directly; no separate tier-4
+                                     window.  ``'skip'`` is preserved
+                                     as a back-compat alias.
 
     Pareto α:
       pareto_alpha_range=(lo, hi) clamps α per reference class.  When
@@ -252,7 +254,8 @@ def _compute_raw_multipliers(u, z, risk, fat_thresh,
 
     # Tier masks
     tri_mask    = (risk >= noise_floor) & (risk < normal_from)
-    if tier_4_distribution == 'skip':
+    # 'skip' is the back-compat alias for 'direct_normal_to_pareto'.
+    if tier_4_distribution in ('direct_normal_to_pareto', 'skip'):
         # No tier 4 -- normal tier extends all the way to the Pareto
         # threshold, then Pareto takes over.  Used for IT / Olympics
         # where BS is empirically wrong (alpha <= 1 regimes).
