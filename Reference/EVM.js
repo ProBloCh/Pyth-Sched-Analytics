@@ -1080,16 +1080,20 @@ function calculateBCWP_Hours(nodes) {
 // ACWP_dollars, BCWS_hours), making CPI = hours/dollars -- off by a
 // factor of CostRate.  We now expose two siblings:
 //   calculateACWP        -- legacy behaviour (cost units; for cost-side
-//                           display, kept as-is for callers that depend
-//                           on it, including any external consumers).
-//   calculateACWP_Hours  -- hours (no cost rate applied); the value
-//                           that should be passed to calculateEVMetrics
-//                           so CPI = EV/AC is in consistent units.
+//                           display and for the dollars-consistent
+//                           metric call, kept as-is for callers that
+//                           depend on it (including external consumers).
+//   calculateACWP_Hours  -- hours (no cost rate applied); sibling for
+//                           callers that prefer hours-consistent CPI.
 //
-// The async backend wrapper now feeds calculateACWP_Hours into
-// calculateEVMetrics; the sync entry points (getCumulativeDistribution,
-// createActualEVMChart) likewise switched to calculateACWP_Hours for
-// the metric call but keep calculateACWP for cost-distribution arrays.
+// UNIT CHOICE: after the forecasted-ACWP double-multiply fix, the
+// sync entry points (getCumulativeDistribution, createActualEVMChart)
+// feed *dollars*-valued BCWS / BCWP / ACWP into calculateEVMetrics so
+// CPI = EV/AC is dimensionally consistent in cost.  The async backend
+// wrappers receive the same-shaped dollars values from /evm/analyze.
+// calculateACWP_Hours is retained as a public helper for downstream
+// code that needs the hours equivalent (e.g. computing a purely
+// effort-based CPI); it is NOT used on the main metric path.
 function calculateACWP(nodes, CostRate = 1, applyCostRate = true,
                        statusDate = null) {
     if (!Array.isArray(nodes)) return 0;
@@ -1166,9 +1170,16 @@ function calculateACWP(nodes, CostRate = 1, applyCostRate = true,
 }
 
 // Sibling: ACWP in HOURS (no cost rate applied).  Use this for the
-// calculateEVMetrics call so CPI = EV/AC is dimensionally consistent.
-function calculateACWP_Hours(nodes, CostRate = 1) {
-    return calculateACWP(nodes, CostRate, /*applyCostRate=*/false);
+// calculateEVMetrics call when hours-consistent CPI is preferred over
+// cost-consistent CPI.
+//
+// FIX (2026-04): forwards statusDate so the idempotency fix in the
+// cost-multiplier branch (no more new Date() drift) also applies when
+// callers use this sibling.  Falls back to the same
+// cybereumState.dataDate lookup as calculateACWP does.
+function calculateACWP_Hours(nodes, CostRate = 1, statusDate = null) {
+    return calculateACWP(nodes, CostRate, /*applyCostRate=*/false,
+                         statusDate);
 }
 
 // Calculate Budget at Completion (BAC) - in HOURS

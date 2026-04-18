@@ -169,7 +169,7 @@ def build_actual_branch(nodes, links, options):
     """Returns the dict that ends up at evmMetrics.actual.
 
     Pipeline:
-      1. Compute scalar metrics (BCWS / BCWP / ACWP_hours / BAC / EAC).
+      1. Compute scalar metrics (BCWS / BCWP / ACWP / BAC / EAC).
       2. Compute duration-weighted progress and schedule-delay prediction.
       3. **Mutate nodes in place** with predictedStart/End/Duration via
          update_predicted_values -- ports JS updatePredictedValues_Improved
@@ -177,9 +177,13 @@ def build_actual_branch(nodes, links, options):
       4. Build cumulative + non-cumulative distributions (which now
          consume the updated predicted dates).
 
-    UNIT FIX: ACWP fed into compute_evm_metrics is in HOURS to keep
-    CPI = EV/AC dimensionally consistent.  ACWP_cost (dollars) is
-    exposed separately for cost-side display.
+    UNIT CHOICE: after the forecasted-ACWP double-multiply fix, the
+    metrics pipeline is dollars-consistent throughout: BCWS/BCWP are
+    hours multiplied by project cost_rate, ACWP is per-node CostRate
+    applied once (via compute_acwp), and compute_evm_metrics receives
+    all three in dollars so CPI = EV/AC is dimensionally clean.
+    Hours-only values are still exposed for callers that prefer them
+    (BCWS_hours / BCWP_hours / BAC_hours fields in the response).
     """
     status_date = options.get('statusDate') or options.get('status_date')
     cost_rate = float(options.get('costRate', options.get('cost_rate', 1.0)))

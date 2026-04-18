@@ -31,6 +31,8 @@ import numpy as np
 from solver.dag import build_dag, get_critical_path_indices
 
 from .calendar import advance_working_ms, WorkingCalendar
+from evm.helpers import convert_to_hours
+
 from .monte_carlo import (
     _parse_iso_to_ms, _ms_to_iso,
     _duration_to_ms, _duration_to_work_hours,
@@ -432,6 +434,39 @@ def _build_lag_candidates(links, id_to_idx, node_by_id, critical_set,
     return candidates
 
 
+def _normalise_link_lags(links, hours_per_day=8.0, working_days_per_week=5.0):
+    """Convert ``(lag, lagUnits)`` pairs to lag-in-hours on a copy.
+
+    solver/dag.py reads ``lag`` as an abstract scalar (no unit
+    awareness), so if callers supply lagUnits != hours, the CPM slack
+    and critical-path detection would disagree with the
+    _build_lag_candidates downstream filter (which uses
+    ``convert_to_hours``).  Harmonising here prevents the two paths
+    from diverging.
+
+    Input links are shallow-copied so the caller's list is never
+    mutated; downstream code reads ``lag`` as hours and can ignore
+    ``lagUnits``.
+    """
+    out = []
+    for link in links or []:
+        if not isinstance(link, dict):
+            out.append(link)
+            continue
+        raw = link.get('lag', 0) or 0
+        units = link.get('lagUnits') or link.get('TimeUnits') or 'h'
+        try:
+            hrs = convert_to_hours(raw, units, hours_per_day,
+                                   working_days_per_week)
+        except Exception:
+            hrs = raw
+        copy = dict(link)
+        copy['lag'] = hrs
+        copy['lagUnits'] = 'h'
+        out.append(copy)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Package into recovery options
 # ---------------------------------------------------------------------------
@@ -561,6 +596,17 @@ def run_recovery_options(nodes, links, status_date,
     status_ms = _parse_iso_to_ms(status_date)
     if status_ms is None:
         raise ValueError("status_date must be a valid ISO-8601 date string")
+
+    # Normalise link lag units BEFORE build_dag, so the CPM slack /
+    # critical-path calculation uses the same lag interpretation as
+    # the lag-compression candidate filter downstream.  solver/dag.py
+    # treats ``lag`` abstractly (no unit awareness), so we convert
+    # here while lagUnits is still available.  hours_per_day default
+    # is 8 because project_context is parsed slightly later; the
+    # small difference vs a non-default calendar is acceptable at
+    # the CPM-slack stage (the recovery filter itself re-reads the
+    # calendar when packaging options).
+    links = _normalise_link_lags(links)
 
     # Calendar reuse: same construction as the MC endpoint
     dag_state, id_to_idx = build_dag(nodes, links)

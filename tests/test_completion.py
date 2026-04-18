@@ -488,6 +488,104 @@ class TestCalendarPath:
         assert r['expected_finish'].startswith('2025-01-16')
 
 
+class TestThresholdConfigLivewire:
+    """Locks the Copilot fix: config.thresholds.* are no longer no-ops."""
+
+    _NODES = [{'ID': 'A', 'Duration': 10, 'TimeUnits': 'days',
+               'riskScore': 0.5}]
+
+    def test_fat_tail_from_affects_distribution(self):
+        """Lowering fat_tail_from makes a risk=0.5 activity land in the
+        Birnbaum-Saunders tier; raising it keeps the activity in the
+        normal tier.  The resulting MC spread must differ."""
+        r_bs = run_completion_mc(self._NODES, [], '2025-01-01T00:00:00Z',
+            config={'iterations': 300, 'seed': 42,
+                    'thresholds': {'fat_tail_from': 0.30}})
+        r_norm = run_completion_mc(self._NODES, [], '2025-01-01T00:00:00Z',
+            config={'iterations': 300, 'seed': 42,
+                    'thresholds': {'fat_tail_from': 0.80}})
+        assert r_bs['spread_days'] != r_norm['spread_days']
+
+    def test_normal_from_affects_distribution(self):
+        """Changing normal_from shifts the triangular/normal boundary
+        and must produce different results for a borderline activity."""
+        nodes = [{'ID': 'A', 'Duration': 10, 'TimeUnits': 'days',
+                  'riskScore': 0.15}]
+        r_tri = run_completion_mc(nodes, [], '2025-01-01T00:00:00Z',
+            config={'iterations': 300, 'seed': 42,
+                    'thresholds': {'normal_from': 0.25}})
+        r_norm = run_completion_mc(nodes, [], '2025-01-01T00:00:00Z',
+            config={'iterations': 300, 'seed': 42,
+                    'thresholds': {'normal_from': 0.10}})
+        assert r_tri['spread_days'] != r_norm['spread_days']
+
+
+class TestValidationOrdering:
+    """Locks the Copilot fix: threshold + cap ordering is validated."""
+
+    def test_thresholds_ordering_rejected(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': 'A', 'Duration': 10, 'TimeUnits': 'days'}],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {'thresholds': {'no_risk_below': 0.5,
+                                      'normal_from': 0.1}},
+        })
+        assert resp.status_code == 400
+        assert 'no_risk_below' in resp.get_json()['error']
+
+    def test_caps_ordering_rejected(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': 'A', 'Duration': 10, 'TimeUnits': 'days'}],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {'caps': {'min_mult': 3.0, 'max_mult_base': 2.0}},
+        })
+        assert resp.status_code == 400
+        assert 'min_mult' in resp.get_json()['error']
+
+    def test_cap_out_of_range_rejected(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': 'A', 'Duration': 10, 'TimeUnits': 'days'}],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {'caps': {'max_mult_high': 10000}},
+        })
+        assert resp.status_code == 400
+
+
+class TestRecoveryLagUnits:
+    """Locks the Copilot fix: lagUnits normalised before build_dag."""
+
+    def test_lag_days_interpreted_consistently(self, client):
+        """A 2-day lag (lagUnits='d') and a 16-hour lag (lagUnits='h')
+        should produce the same lag_candidates / recovery analysis at
+        hours_per_day=8, because both amount to the same number of
+        working hours on the calendar path."""
+        nodes = [
+            {'ID': 'A', 'Duration': 10, 'TimeUnits': 'days'},
+            {'ID': 'B', 'Duration': 10, 'TimeUnits': 'days'},
+        ]
+        opts = {
+            'status_date': '2025-01-01T00:00:00Z',
+            'project_context': {'calendar': {
+                'hours_per_day': 8, 'working_days': [1, 2, 3, 4, 5]}},
+        }
+        r_days = client.post('/completion/recovery-options', json={
+            **opts, 'nodes': nodes,
+            'links': [{'source': 'A', 'target': 'B',
+                       'type': 'FS', 'lag': 2, 'lagUnits': 'd'}],
+        }).get_json()
+        r_hours = client.post('/completion/recovery-options', json={
+            **opts, 'nodes': nodes,
+            'links': [{'source': 'A', 'target': 'B',
+                       'type': 'FS', 'lag': 16, 'lagUnits': 'h'}],
+        }).get_json()
+        # Lag candidates must agree on both hours and days.
+        assert (len(r_days['lag_candidates'])
+                == len(r_hours['lag_candidates']))
+        if r_days['lag_candidates']:
+            assert (r_days['lag_candidates'][0]['lag_hrs']
+                    == r_hours['lag_candidates'][0]['lag_hrs'])
+
+
 # =====================================================================
 # /completion/recovery-options
 # =====================================================================

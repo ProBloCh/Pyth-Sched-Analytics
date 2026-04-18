@@ -23,11 +23,20 @@ Weekday convention: ISO (Mon=1..Sun=7), matching solver.models.ProjectContext.
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
+import logging
 import numpy as np
+
+
+logger = logging.getLogger(__name__)
 
 
 _MS_PER_HOUR = 3_600_000.0
 _MS_PER_DAY = 86_400_000.0
+
+# Rate-limit the horizon-clip warnings so a single MC run with thousands
+# of out-of-horizon advances doesn't spam the log.  One warning per
+# process is plenty; the caller is usually the same bug each time.
+_HORIZON_WARNING_EMITTED = {'start': False, 'target': False}
 
 
 def _parse_holiday(value):
@@ -184,7 +193,9 @@ def advance_working_ms(start_ms, work_hours, cal):
           if start is on a weekend -- matches JS addWorkingHours() line
           384 short-circuit.
         - If the horizon is exhausted, the result is clipped to the
-          last day of the calendar and a warning is logged.
+          last day of the calendar and a warning is logged (once per
+          process per clip type, to avoid flooding during vectorised
+          Monte Carlo batches).
     """
     start_arr = np.asarray(start_ms, dtype=np.float64)
     work_arr = np.asarray(work_hours, dtype=np.float64)
@@ -199,7 +210,24 @@ def advance_working_ms(start_ms, work_hours, cal):
     # Zero-work passthrough: match JS short-circuit exactly.
     zero_work = work_arr <= 0.0
 
-    # Clip start into calendar range; log if an activity's start is out of range.
+    # Clip start into calendar range; rate-limited warning when any
+    # start falls outside the horizon (indicates stale calendar or
+    # activities with dates past the planning window).
+    out_of_range = ((start_arr < cal.epoch_start_ms)
+                    | (start_arr >= cal.end_ms))
+    if (np.any(out_of_range)
+            and not _HORIZON_WARNING_EMITTED['start']):
+        n_oor = int(np.count_nonzero(out_of_range))
+        logger.warning(
+            "advance_working_ms: %d start_ms values clipped into "
+            "calendar [%s .. %s); consider extending the horizon. "
+            "Suppressing further warnings.",
+            n_oor,
+            datetime.fromtimestamp(cal.epoch_start_ms / 1000.0,
+                                   tz=timezone.utc).isoformat(),
+            datetime.fromtimestamp(cal.end_ms / 1000.0,
+                                   tz=timezone.utc).isoformat())
+        _HORIZON_WARNING_EMITTED['start'] = True
     start_clipped = np.clip(start_arr,
                             cal.epoch_start_ms,
                             cal.end_ms - 1.0)
@@ -217,6 +245,19 @@ def advance_working_ms(start_ms, work_hours, cal):
     )
 
     target_hrs = cal.work_hours_before[day_idx] + intraday_hrs + work_arr
+
+    # If target exceeds the calendar's cumulative hours, the advance
+    # would run off the end of the horizon.  Warn once, then clamp.
+    max_work = cal.work_hours_before[-1]
+    if (np.any(target_hrs > max_work)
+            and not _HORIZON_WARNING_EMITTED['target']):
+        n_oor = int(np.count_nonzero(target_hrs > max_work))
+        logger.warning(
+            "advance_working_ms: %d advances exceed calendar horizon "
+            "(max cumulative %.0fh); finish clipped to last day. "
+            "Suppressing further warnings.",
+            n_oor, max_work)
+        _HORIZON_WARNING_EMITTED['target'] = True
 
     # side='right' gives first index strictly greater than target, so -1
     # gives the last day whose cumulative hours <= target.  For a target

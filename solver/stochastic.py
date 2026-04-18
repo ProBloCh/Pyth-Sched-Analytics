@@ -158,9 +158,14 @@ def _pareto_ppf(u, alpha):
 # Risk-tiered perturbation
 # ---------------------------------------------------------------------------
 
-def _fat_tail_thresholds(activity_types, n):
-    """Per-activity fat-tail threshold (supply-chain adjusted)."""
-    thresh = np.full(n, _DEFAULT_FAT_TAIL)
+def _fat_tail_thresholds(activity_types, n, default_fat_tail=_DEFAULT_FAT_TAIL):
+    """Per-activity fat-tail threshold (supply-chain adjusted).
+
+    Supply-chain activities (equipment/material/services) hit the
+    fat-tail threshold earlier than the configurable ``default_fat_tail``
+    for all other activity types.
+    """
+    thresh = np.full(n, default_fat_tail)
     if activity_types and len(activity_types) == n:
         for i, atype in enumerate(activity_types):
             if atype in _FAT_TAIL_THRESHOLDS:
@@ -168,7 +173,8 @@ def _fat_tail_thresholds(activity_types, n):
     return thresh
 
 
-def _compute_raw_multipliers(u, z, risk, fat_thresh):
+def _compute_raw_multipliers(u, z, risk, fat_thresh,
+                             noise_floor=0.06, normal_from=0.18):
     """
     Per-activity raw duration multipliers from the five-tier model.
 
@@ -176,20 +182,25 @@ def _compute_raw_multipliers(u, z, risk, fat_thresh):
     scipy.special.ndtri), passed in to avoid recomputing it inside
     the MC loop.
 
-    Tiers (risk as fraction 0–1):
-      < 6%:             noise floor → multiplier = 1.0
-      6–18%:            triangular (right-skewed, bounded)
-      18–fat_t:         normal (σ = risk)
-      fat_t–pareto_t:   Birnbaum-Saunders (α=0.25+0.65r, β=1.0+0.1r)
-      ≥ pareto_t:       Pareto power-law (α=2.0+1.5*(1-r))
+    Tiers (risk as fraction 0-1):
+      < noise_floor:    noise floor -> multiplier = 1.0          (default 0.06)
+      noise_floor..normal_from:  triangular (right-skewed, bounded)  (default 0.18)
+      normal_from..fat_t:        normal (sigma = risk)
+      fat_t..pareto_t:           Birnbaum-Saunders (alpha=0.25+0.65r, beta=1.0+0.1r)
+      >= pareto_t:               Pareto power-law (alpha=2.0+1.5*(1-r))
+
+    ``noise_floor`` and ``normal_from`` are exposed as parameters so
+    the /completion/monte-carlo endpoint can honour its documented
+    ``config.thresholds.no_risk_below`` / ``normal_from`` contract.
+    Defaults preserve the historic behaviour used by solver callers.
     """
     n = len(risk)
     mult = np.ones(n, dtype=np.float64)
     pareto_thresh = fat_thresh + _PARETO_OFFSET
 
     # Tier masks
-    tri_mask    = (risk >= 0.06) & (risk < 0.18)
-    norm_mask   = (risk >= 0.18) & (risk < fat_thresh)
+    tri_mask    = (risk >= noise_floor) & (risk < normal_from)
+    norm_mask   = (risk >= normal_from) & (risk < fat_thresh)
     bs_mask     = (risk >= fat_thresh) & (risk < pareto_thresh)
     pareto_mask = risk >= pareto_thresh
 

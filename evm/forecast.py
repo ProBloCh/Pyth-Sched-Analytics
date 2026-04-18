@@ -15,6 +15,7 @@ comments at the top of the file (lines 41-46).
 from __future__ import annotations
 
 import math
+from collections import deque
 
 from .helpers import (
     Bounds, clamp, safe_date, convert_to_hours,
@@ -429,10 +430,12 @@ def _topological_order(nodes, succ_map, node_by_id):
             tgt = e['target']
             if tgt in in_deg:
                 in_deg[tgt] += 1
-    queue = [nid for nid, d in in_deg.items() if d == 0]
+    # deque for O(1) popleft; a plain list would be O(n) per pop and
+    # make Kahn's algorithm quadratic on 10K+ activity projects.
+    queue = deque(nid for nid, d in in_deg.items() if d == 0)
     order = []
     while queue:
-        nid = queue.pop(0)
+        nid = queue.popleft()
         order.append(nid)
         for e in succ_map.get(nid, []):
             tgt = e['target']
@@ -541,14 +544,14 @@ def _apply_distance_decay(nodes, frontier_ids, node_by_id, succ_map,
         return
 
     distance = {}
-    queue = []
+    queue = deque()
     for fid in frontier_ids:
         sid = str(fid)
         distance[sid] = 0
         queue.append(sid)
 
     while queue:
-        nid = queue.pop(0)
+        nid = queue.popleft()
         d = distance[nid]
         for edge in succ_map.get(nid, []):
             sid = edge['target']

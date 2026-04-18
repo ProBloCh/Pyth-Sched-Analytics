@@ -142,8 +142,10 @@ def _validate_mc_config(data):
         if iters < 1 or iters > MAX_ITERATIONS:
             return f'config.iterations must be 1-{MAX_ITERATIONS}'
 
+    thresholds = cfg.get('thresholds') or {}
+    thresh_vals = {}
     for key in ('no_risk_below', 'normal_from', 'fat_tail_from'):
-        v = (cfg.get('thresholds') or {}).get(key)
+        v = thresholds.get(key)
         if v is not None:
             try:
                 fv = float(v)
@@ -151,6 +153,41 @@ def _validate_mc_config(data):
                 return f'config.thresholds.{key} must be a number'
             if math.isnan(fv) or math.isinf(fv) or fv < 0 or fv > 1:
                 return f'config.thresholds.{key} must be in [0, 1]'
+            thresh_vals[key] = fv
+
+    # Ordering: no_risk_below <= normal_from <= fat_tail_from.  Mixed
+    # orderings silently produce nonsensical tier assignments.
+    if ('no_risk_below' in thresh_vals and 'normal_from' in thresh_vals
+            and thresh_vals['no_risk_below'] > thresh_vals['normal_from']):
+        return ('config.thresholds.no_risk_below must be '
+                '<= normal_from')
+    if ('normal_from' in thresh_vals and 'fat_tail_from' in thresh_vals
+            and thresh_vals['normal_from'] > thresh_vals['fat_tail_from']):
+        return ('config.thresholds.normal_from must be <= fat_tail_from')
+
+    caps = cfg.get('caps') or {}
+    cap_checks = [
+        ('min_mult',      0.0,  10.0),
+        ('max_mult_base', 1.0,  100.0),
+        ('max_mult_high', 1.0,  1000.0),
+    ]
+    cap_vals = {}
+    for key, lo, hi in cap_checks:
+        if key not in caps:
+            continue
+        try:
+            fv = float(caps[key])
+        except (TypeError, ValueError):
+            return f'config.caps.{key} must be a number'
+        if math.isnan(fv) or math.isinf(fv) or fv < lo or fv > hi:
+            return f'config.caps.{key} must be in [{lo}, {hi}]'
+        cap_vals[key] = fv
+    if ('min_mult' in cap_vals and 'max_mult_base' in cap_vals
+            and cap_vals['min_mult'] > cap_vals['max_mult_base']):
+        return 'config.caps.min_mult must be <= max_mult_base'
+    if ('max_mult_base' in cap_vals and 'max_mult_high' in cap_vals
+            and cap_vals['max_mult_base'] > cap_vals['max_mult_high']):
+        return 'config.caps.max_mult_base must be <= max_mult_high'
     return None
 
 

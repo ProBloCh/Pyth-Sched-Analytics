@@ -314,12 +314,18 @@ def _sample_multipliers(risk, activity_types, remaining, calendar, config):
     from scipy.special import ndtri
     z_all = ndtri(u_all)
 
-    fat_thresh = _fat_tail_thresholds(activity_types, n)
+    # Honour config.thresholds.fat_tail_from by passing it as the
+    # supply-type default (supply-chain activities still use their
+    # tighter 0.35 / 0.40 / 0.45 thresholds).
+    fat_thresh = _fat_tail_thresholds(
+        activity_types, n, default_fat_tail=config.fat_tail_from)
 
     risk_tile = np.tile(risk, M)
     fat_tile = np.tile(fat_thresh, M)
     mult_flat = _compute_raw_multipliers(
-        u_all.ravel(), z_all.ravel(), risk_tile, fat_tile
+        u_all.ravel(), z_all.ravel(), risk_tile, fat_tile,
+        noise_floor=config.no_risk_below,
+        normal_from=config.normal_from,
     )
     mult = mult_flat.reshape(M, n)
 
