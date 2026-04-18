@@ -110,8 +110,17 @@ def build_forecasted_branch(nodes, links, options):
     dpw = float(options.get('workingDaysPerWeek',
                             options.get('working_days_per_week', 5.0)))
 
-    bcws_hours = compute_forecasted_bcwp(nodes, status_date, hpd, dpw)
-    bcwp_hours = compute_bcwp_hours(nodes, hpd, dpw)
+    # Mirror JS getCumulativeDistribution (EVM.js line 1746-1747):
+    #   BCWS = calculateBCWS_Hours(workingNodes, statusDate)
+    #   BCWP = calculateForecastedBCWP(workingNodes, statusDate)
+    # Earlier versions of this port had these two swapped, which meant
+    # backend output silently disagreed with the JS fallback (which
+    # defeats the "transparent fallback" goal).  The diff harness was
+    # ALSO swapped in the same way, so JS<->Python parity passed while
+    # both diverged from the live browser implementation.  Fixed in
+    # both places in the same commit so the diff harness still passes.
+    bcws_hours = compute_bcws_hours(nodes, status_date, hpd, dpw)
+    bcwp_hours = compute_forecasted_bcwp(nodes, status_date, hpd, dpw)
     bac_hours = compute_bac_hours(nodes, hpd, dpw)
 
     # Convert to dollars uniformly via project cost_rate.

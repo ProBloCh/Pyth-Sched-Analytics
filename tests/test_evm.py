@@ -611,11 +611,23 @@ class TestEndpointValidation:
         because browser JSON.parse rejects 'Infinity' and the consumer
         guard `isFinite(parseFloat(...))` treats both null and Infinity
         as 'skip'.  Missing this breaks Completionprediction.js:4871.
+
+        Fixture construction: PV (BCWS) uses planned Start/Finish while
+        EV (forecasted BCWP) uses riskAdjustedStart/End fallback to
+        Start/Finish.  By supplying planned dates that end AFTER the
+        status date (PV=0) + riskAdjusted dates that put the activity
+        fully complete by status date (EV>0 via PercentComplete), we
+        get SPI = EV/0 = Infinity.
         """
         import json
-        # Node with no planned dates but PercentComplete > 0 forces EV>0, PV=0
         resp = client.post('/evm/analyze', json={
             'nodes': [{'ID': '1', 'Duration': 10, 'TimeUnits': 'days',
+                       # Planned dates AFTER status -> BCWS (PV) = 0
+                       'Start': '2025-02-01',
+                       'Finish': '2025-02-11',
+                       # Risk-adjusted dates BEFORE status -> BCWP (EV) > 0
+                       'riskAdjustedStart': '2025-01-01',
+                       'riskAdjustedEnd':   '2025-01-05',
                        'PercentComplete': 50}],
             'options': {'statusDate': '2025-01-06T00:00:00Z'},
         })
@@ -624,7 +636,8 @@ class TestEndpointValidation:
         data = json.loads(resp.get_data(as_text=True))
         # Infinities on raw fields become None
         assert data['forecasted']['SPI'] is None
-        # _model versions stay finite (clamped)
+        # _model versions stay finite (compute_evm_metrics maps Inf -> 1.0
+        # on the non-finite branch rather than clamping to Bounds.MAX_SPI).
         assert data['forecasted']['SPI_model'] == 1.0
         # Consumer read path
         assert 'CPIcum' in data['actual']

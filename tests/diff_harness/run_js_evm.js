@@ -203,10 +203,17 @@ const calls = vm.runInContext('({' +
 calls.autoCompleteStartMilestone(nodes);
 
 // === Forecasted branch (mirrors fixed getCumulativeDistribution flow) ===
+// Align with the real JS getCumulativeDistribution (EVM.js 1746-1747):
+//   BCWS = calculateBCWS_Hours(workingNodes, statusDate)
+//   BCWP = calculateForecastedBCWP(workingNodes, statusDate)
+// Earlier versions of this harness swapped these two, which matched a
+// corresponding swap in the Python port but diverged from the real
+// browser JS flow.  Fixed in the same commit so both the harness and
+// the Python engine now mirror the live implementation.
 const totalPlanned = calls.calculateBAC_Hours(nodes);
 const BAC_f = totalPlanned * costRate;
-const BCWS_f_h = calls.calculateForecastedBCWP(nodes, statusDate);
-const BCWP_f_h = calls.calculateBCWP_Hours(nodes);
+const BCWS_f_h = calls.calculateBCWS_Hours(nodes, statusDate);
+const BCWP_f_h = calls.calculateForecastedBCWP(nodes, statusDate);
 const BCWS_f = BCWS_f_h * costRate;
 const BCWP_f = BCWP_f_h * costRate;
 // Bug-fixed: NO double multiplication
@@ -268,7 +275,6 @@ const evAtStatus = calls.calculateTimePhasedEV(nodes, statusDate, statusDate);
 function _buildForecastedDistributions(nodes, costRate) {
     const workingNodes = [...nodes].sort(
         (a, b) => parseInt(a.ID) - parseInt(b.ID));
-    const startNode = workingNodes.find(n => n.ID === '0') || workingNodes[0];
     const endNode = workingNodes.reduce(
         (a, b) => (Number(a.ID) > Number(b.ID)) ? a : b);
     const startDate = calls.safeDate(workingNodes[0].Start);
