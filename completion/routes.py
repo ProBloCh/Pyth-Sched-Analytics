@@ -188,6 +188,17 @@ def _validate_mc_config(data):
     if ('max_mult_base' in cap_vals and 'max_mult_high' in cap_vals
             and cap_vals['max_mult_base'] > cap_vals['max_mult_high']):
         return 'config.caps.max_mult_base must be <= max_mult_high'
+
+    rc = cfg.get('reference_class')
+    if rc is not None:
+        if not isinstance(rc, str) or not rc:
+            return 'config.reference_class must be a non-empty string'
+        from solver.reference_classes import get_reference_class
+        if get_reference_class(rc) is None:
+            from solver.reference_classes import REFERENCE_CLASS_TIERS
+            available = ', '.join(sorted(REFERENCE_CLASS_TIERS.keys()))
+            return (f'config.reference_class "{rc}" not recognised; '
+                    f'supported: {available}')
     return None
 
 

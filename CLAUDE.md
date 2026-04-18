@@ -243,6 +243,32 @@ prevents integration drift.
   al., PMJ 2022, KS p=.89).  The Pareto tier uses α=2.0+1.5*(1-risk),
   calibrated to Flyvbjerg's IT project α≈2.35.  Supply-chain activities
   (equipment/material/services) hit fat-tail thresholds earlier.
+- **Reference-class calibration** (`solver/reference_classes.py`):
+  per-sector tier-4 distribution choice (`birnbaum_saunders` /
+  `lognormal` / `skip`), Pareto α range, max multiplier cap, and
+  per-percentile inflation factors for 19 named classes (oil & gas,
+  nuclear, rail, tunnels, defense MDAP, IT, Olympics, mining, solar,
+  wind, batteries, data centres, etc.).  Driven by
+  `config.reference_class` on `/completion/monte-carlo`; emits a
+  `reference_class_calibrated` companion in the response with
+  empirically-corrected percentiles and citations.  When unset, the
+  response carries a `no_reference_class` info warning and the
+  historic global tier model applies (byte-equivalent to pre-2026-04).
+  Sources: Flyvbjerg & Bester 2021; Aaen, Flyvbjerg et al. PMJ 2025;
+  Cantarelli RCF review 2025; Sovacool & Gilbert 2014; HM Treasury
+  Green Book; TII RCF guidelines.  Empty `tier_4_distribution =
+  'skip'` semantics: for IT (α ≤ 1) and Olympics, BS cannot represent
+  infinite mean; normal tier extends directly to Pareto.  Thin-tailed
+  sectors (roads, solar, batteries) use `lognormal` instead of BS per
+  Flyvbjerg & Gardner 2023 classification.
+- **Calibration warnings** (`completion/monte_carlo._build_calibration_warnings`):
+  surfaces input-quality concerns in every response
+  (`zero_variance_risk`, `judgment_based_risk_default`,
+  `no_supply_chain_classification`, `small_scope_mc`,
+  `infinite_mean_reference_class`, `reference_class_judgement`,
+  `no_reference_class`).  Each carries `code`, `severity`, and a
+  human-readable `message`.  Mirrors the LinkedIn-discussion critique
+  that judgment-derived MC inputs get laundered into misleading P80s.
 - **Numerical correctness in adjoints:** The resource adjoint uses finite
   differences (review section 1.5) because the smoothed trapezoidal profile
   has non-differentiable step boundaries.  The risk adjoint is a first-order

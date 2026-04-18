@@ -1816,6 +1816,21 @@
             ? teamCal.holidays.map(h => (h && h.date) ? h.date : h).filter(Boolean)
             : [];
 
+        // Reference class for empirical-distribution calibration.  When
+        // set, the backend overrides tier-4 distribution / Pareto alpha /
+        // max multiplier per published sector data and emits a
+        // reference_class_calibrated companion alongside the model
+        // percentiles (Flyvbjerg / Cantarelli / Sovacool sources).
+        // Looks for explicit opt-in first, then maps cybereumState
+        // sector tags to canonical class names.
+        const project = (typeof window !== 'undefined'
+                         && window.cybereumState?.project) || null;
+        const referenceClass = opts.referenceClass
+            ?? project?.referenceClass
+            ?? project?.sector
+            ?? project?.projectType
+            ?? null;
+
         const body = {
             nodes: sentNodes,
             links: sentLinks,
@@ -1843,6 +1858,7 @@
                     max_mult_base: opts.maxMultBase ?? CONFIG.mcMaxMultBase,
                     max_mult_high: opts.maxMultHigh ?? CONFIG.mcMaxMultHigh,
                 },
+                reference_class: referenceClass,
             },
         };
         return body;
@@ -1854,6 +1870,30 @@
             const d = new Date(iso);
             return Number.isFinite(d.getTime()) ? clampDate(d) : null;
         };
+        // Reference-class calibration: when the backend resolved a
+        // class via config.reference_class (set from
+        // cybereumState.project.referenceClass / sector / projectType),
+        // it returns a `reference_class_calibrated` companion with
+        // empirically-corrected percentiles + citations.  Mapped here
+        // to camelCase so UI code can show "Model P80: X | Calibrated
+        // P80: Y" alongside each other.
+        const cal = payload.reference_class_calibrated || null;
+        const calibrated = cal ? {
+            p50Finish:           toDate(cal.p50_finish),
+            p80Finish:           toDate(cal.p80_finish),
+            p95Finish:           toDate(cal.p95_finish),
+            p99Finish:           toDate(cal.p99_finish),
+            referenceClass:      cal.reference_class,
+            percentileFactors:   cal.percentile_factors,
+            meanOverrunPublished: cal.mean_overrun_published,
+            isFatTailed:         cal.is_fat_tailed,
+            hasFiniteMean:       cal.has_finite_mean,
+            tier4Distribution:   cal.tier_4_distribution,
+            paretoAlphaRange:    cal.pareto_alpha_range,
+            maxMultiplierCap:    cal.max_multiplier_cap,
+            citations:           cal.citations,
+        } : null;
+
         return {
             p20Finish: toDate(payload.p20_finish),
             p50Finish: toDate(payload.p50_finish),
@@ -1862,15 +1902,14 @@
                 ? Math.round(payload.spread_days) : 0,
             iterations: payload.iterations ?? 0,
             seed: payload.seed ?? 0,
-            // finishSamples intentionally empty -- downstream consumers guard
-            // on .length > 0 and degrade gracefully.
             finishSamples: [],
-            // Extras the backend provides; downstream ignores unknown keys.
             expectedFinish: toDate(payload.expected_finish),
             p20ImpactDays: payload.p20_impact_days,
             p50ImpactDays: payload.p50_impact_days,
             p80ImpactDays: payload.p80_impact_days,
             activityPercentiles: payload.activity_percentiles,
+            referenceClassCalibrated: calibrated,
+            calibrationWarnings: payload.calibration_warnings || [],
             source: 'backend',
         };
     }

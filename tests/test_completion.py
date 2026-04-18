@@ -551,6 +551,174 @@ class TestValidationOrdering:
         assert resp.status_code == 400
 
 
+class TestReferenceClassCalibration:
+    """Per-sector empirical calibration via solver/reference_classes.py."""
+
+    _NODES = [{'ID': f'A{i}', 'Duration': 10, 'TimeUnits': 'days',
+               'riskScore': 0.4 if i % 2 else 0.7}
+              for i in range(50)]
+
+    @property
+    def _LINKS(self):
+        return [{'source': f'A{i}', 'target': f'A{i+1}'} for i in range(49)]
+
+    def test_default_no_reference_class_field(self):
+        """Without reference_class, the calibrated companion is None."""
+        r = run_completion_mc(
+            self._NODES, self._LINKS, '2025-01-01T00:00:00Z',
+            config={'iterations': 200, 'seed': 42})
+        assert r['reference_class_calibrated'] is None
+        # Default also surfaces the no-class warning
+        codes = {w['code'] for w in r['calibration_warnings']}
+        assert 'no_reference_class' in codes
+
+    def test_reference_class_emits_calibrated(self):
+        """Setting reference_class produces P50/P80/P95/P99 calibrated fields."""
+        r = run_completion_mc(
+            self._NODES, self._LINKS, '2025-01-01T00:00:00Z',
+            config={'iterations': 300, 'seed': 42,
+                    'reference_class': 'rail'})
+        cal = r['reference_class_calibrated']
+        assert cal is not None
+        assert cal['reference_class'] == 'rail'
+        assert cal['p50_finish'] is not None
+        assert cal['p80_finish'] is not None
+        assert cal['p95_finish'] is not None
+        assert cal['percentile_factors'] == {
+            'P50': 1.15, 'P80': 1.45, 'P95': 1.95, 'P99': 3.00}
+        assert any('Cantarelli' in c for c in cal['citations'])
+
+    def test_calibrated_p80_at_or_after_model_p80(self):
+        """When the reference class has overrun > 0, calibrated P80
+        should land at or after the raw model P80."""
+        r = run_completion_mc(
+            self._NODES, self._LINKS, '2025-01-01T00:00:00Z',
+            config={'iterations': 300, 'seed': 42,
+                    'reference_class': 'nuclear_new_build'})
+        cal = r['reference_class_calibrated']
+        model_p80 = _parse_iso_to_ms(r['p80_finish'])
+        cal_p80 = _parse_iso_to_ms(cal['p80_finish'])
+        # Nuclear factor 1.85 at P80, so calibrated > model
+        assert cal_p80 >= model_p80
+
+    def test_calibrated_percentile_ordering(self):
+        """Calibrated P50 <= P80 <= P95 <= P99 (when finite)."""
+        r = run_completion_mc(
+            self._NODES, self._LINKS, '2025-01-01T00:00:00Z',
+            config={'iterations': 300, 'seed': 42,
+                    'reference_class': 'data_centre_hyperscale'})
+        cal = r['reference_class_calibrated']
+        p50 = _parse_iso_to_ms(cal['p50_finish'])
+        p80 = _parse_iso_to_ms(cal['p80_finish'])
+        p95 = _parse_iso_to_ms(cal['p95_finish'])
+        assert p50 <= p80 <= p95
+        if cal['p99_finish']:
+            assert p95 <= _parse_iso_to_ms(cal['p99_finish'])
+
+    def test_it_software_p99_capped(self):
+        """Reference classes with infinite mean (alpha <= 1) report
+        P99 as None and emit infinite_mean_reference_class warning."""
+        r = run_completion_mc(
+            self._NODES, self._LINKS, '2025-01-01T00:00:00Z',
+            config={'iterations': 300, 'seed': 42,
+                    'reference_class': 'it_software'})
+        cal = r['reference_class_calibrated']
+        assert cal['p99_finish'] is None
+        assert cal['has_finite_mean'] is False
+        assert cal['tier_4_distribution'] == 'skip'
+        codes = {w['code'] for w in r['calibration_warnings']}
+        assert 'infinite_mean_reference_class' in codes
+
+    def test_olympics_p99_capped(self):
+        r = run_completion_mc(
+            self._NODES, self._LINKS, '2025-01-01T00:00:00Z',
+            config={'iterations': 300, 'seed': 42,
+                    'reference_class': 'olympics'})
+        cal = r['reference_class_calibrated']
+        assert cal['p99_finish'] is None
+        assert cal['has_finite_mean'] is False
+
+    def test_thin_tailed_uses_lognormal(self):
+        """Solar / roads / batteries select lognormal as tier 4."""
+        for cls in ('solar_pv', 'roads', 'battery_storage', 'wind_onshore'):
+            r = run_completion_mc(
+                self._NODES, [], '2025-01-01T00:00:00Z',
+                config={'iterations': 200, 'seed': 42,
+                        'reference_class': cls})
+            cal = r['reference_class_calibrated']
+            assert cal['tier_4_distribution'] == 'lognormal', \
+                f'{cls} should use lognormal tier 4'
+            assert cal['is_fat_tailed'] is False
+
+    def test_tier_4_skip_widens_pareto_window(self):
+        """For IT (tier_4 = skip), normal tier extends to pareto_thresh
+        and Pareto kicks in earlier than default."""
+        # Same project, default vs IT class
+        r_def = run_completion_mc(
+            self._NODES, self._LINKS, '2025-01-01T00:00:00Z',
+            config={'iterations': 500, 'seed': 42})
+        r_it = run_completion_mc(
+            self._NODES, self._LINKS, '2025-01-01T00:00:00Z',
+            config={'iterations': 500, 'seed': 42,
+                    'reference_class': 'it_software'})
+        # IT's Pareto-tier kicks in very early (fat_tail_from=0.30,
+        # offset=0.05) so spreads are dramatically wider.
+        assert r_it['spread_days'] > r_def['spread_days']
+
+    def test_data_centre_judgement_warning(self):
+        """data_centre_hyperscale citations include JUDGEMENT marker;
+        warning surfaces."""
+        r = run_completion_mc(
+            self._NODES, self._LINKS, '2025-01-01T00:00:00Z',
+            config={'iterations': 200, 'seed': 42,
+                    'reference_class': 'data_centre_hyperscale'})
+        codes = {w['code'] for w in r['calibration_warnings']}
+        assert 'reference_class_judgement' in codes
+
+    def test_alias_resolution(self):
+        """get_reference_class accepts EVM-style sector tags."""
+        r1 = run_completion_mc(
+            self._NODES, [], '2025-01-01T00:00:00Z',
+            config={'iterations': 100, 'seed': 42,
+                    'reference_class': 'oil_gas_offshore'})
+        r2 = run_completion_mc(
+            self._NODES, [], '2025-01-01T00:00:00Z',
+            config={'iterations': 100, 'seed': 42,
+                    'reference_class': 'Oil and Gas'})  # alias
+        # Same calibrated factors
+        assert (r1['reference_class_calibrated']['percentile_factors']
+                == r2['reference_class_calibrated']['percentile_factors'])
+
+    def test_unknown_reference_class_rejected(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': self._NODES, 'links': [],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {'reference_class': 'no_such_sector'},
+        })
+        assert resp.status_code == 400
+        assert 'reference_class' in resp.get_json()['error']
+
+    def test_calibration_warning_zero_variance_risk(self):
+        """All-identical risk scores produce zero_variance_risk warning."""
+        nodes = [{'ID': f'A{i}', 'Duration': 10, 'TimeUnits': 'days',
+                  'riskScore': 0.5} for i in range(10)]
+        r = run_completion_mc(
+            nodes, [], '2025-01-01T00:00:00Z',
+            config={'iterations': 100, 'seed': 42})
+        codes = {w['code'] for w in r['calibration_warnings']}
+        assert 'zero_variance_risk' in codes
+
+    def test_calibration_warning_small_scope(self):
+        """Fewer than 30 in-scope activities produces small_scope_mc warning."""
+        nodes = [{'ID': f'A{i}', 'Duration': 10, 'TimeUnits': 'days',
+                  'riskScore': 0.3 + 0.05 * i} for i in range(10)]
+        r = run_completion_mc(
+            nodes, [], '2025-01-01T00:00:00Z',
+            config={'iterations': 100, 'seed': 42})
+        codes = {w['code'] for w in r['calibration_warnings']}
+        assert 'small_scope_mc' in codes
+
+
 class TestRecoveryLagUnits:
     """Locks the Copilot fix: lagUnits normalised before build_dag."""
 

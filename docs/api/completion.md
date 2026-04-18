@@ -159,6 +159,99 @@ error"}` with HTTP 500.  Consult server logs for the stack trace.
 
 ---
 
+## Reference-Class Calibration (Empirical Distribution Selection)
+
+When `config.reference_class` is supplied, the MC switches from the
+generic five-tier model to a sector-calibrated one drawn from
+`solver/reference_classes.py`.  Each class encodes:
+
+- **Tier-4 distribution choice**: `birnbaum_saunders` (Natarajan-validated
+  for offshore O&G), `lognormal` (thin-tailed sectors per Flyvbjerg &
+  Gardner 2023 — roads, solar, batteries), or `skip` (for IT / Olympics
+  where α ≤ 1 makes BS empirically wrong; the normal tier extends
+  directly to a low-α Pareto).
+- **Pareto α range**: clamps the tail thickness per sector instead of
+  the global `α = 2.0 + 1.5(1-r)` formula.  Lower α = fatter tail.
+- **Max multiplier cap**: replaces the global 10× ceiling.  Olympics /
+  IT can run 50×; nuclear new build 20×; thin-tailed sectors 3-5×.
+- **Per-percentile inflation factors** (P50/P80/P95/P99): published RCF
+  values from Flyvbjerg / Cantarelli / TII / Sovacool tables.  Applied
+  to the OVERRUN portion of each percentile after the MC, so the
+  deterministic baseline stays anchored at `expected_finish`.
+
+### Supported reference classes
+
+`oil_gas_offshore`, `oil_gas_onshore_lng`, `nuclear_new_build`,
+`nuclear_decommissioning`, `rail`, `tunnels`, `bridges_fixed_links`,
+`roads`, `buildings_standard`, `buildings_nonstandard`, `defense_mdap`,
+`it_software`, `olympics`, `mining`, `solar_pv`, `wind_onshore`,
+`wind_offshore`, `battery_storage`, `data_centre_hyperscale`.  Common
+aliases (`oil and gas` → `oil_gas_offshore`, `infrastructure` → `rail`,
+`nuclear` → `nuclear_new_build`, etc.) are accepted.
+
+When set, the response gains a `reference_class_calibrated` companion
+with the empirically-corrected percentiles AND the citations behind
+each parameter.  When NOT set, the response carries a
+`no_reference_class` info-level entry in `calibration_warnings[]`.
+
+### What this addresses
+
+Empirical project research (Flyvbjerg & Bester 2021; Aaen, Flyvbjerg
+et al. 2025; Cantarelli RCF review 2025; Project Production Institute
+2024) has shown that judgment-derived MC inputs produce P80 estimates
+that empirically behave like P10-P20.  The reference-class layer
+addresses this in three complementary ways:
+
+1. **Per-class Pareto α and looser caps** mean the MC samples actually
+   reach the empirical tail extremes for fat-tailed sectors.
+2. **Per-percentile factors** anchor the reported P50/P80/P95 to
+   published outturn distributions, not just the model's internal
+   percentiles.
+3. **Calibration warnings** surface the input-quality concerns the
+   critics name (judgment-default risk, no supply-chain
+   classification, infinite-mean reference class, judgement parameters
+   for sectors without peer-reviewed fits like data centres).
+
+Per Aaen / Flyvbjerg 2025: for IT and Olympics (α ≤ 1, infinite mean
+& variance), **any single percentile is unstable**.  The response
+reports `p99_finish: null` with the `infinite_mean_reference_class`
+warning rather than fabricating a number.  The recommended action in
+those classes is to cap exposure (modular delivery, stop-loss) rather
+than predict the tail.
+
+### Model vs reality
+
+Even with reference-class calibration in place, the published P80 is a
+model prediction of the 80th percentile of the assumed distribution
+for the chosen reference class.  It is not a guarantee about your
+specific project.  Three structural caveats remain:
+
+- **Inputs are still partly judgmental.**  The activity-level
+  `riskScore` is an analyst-assigned 0..1 value, not an empirical
+  probability.  The `calibration_warnings[]` field flags when scores
+  cluster at the 0.5 default or have low variance.
+- **Distributions vary with time and culture.**  The published
+  parameters are calibrated to historical megaproject data; your
+  organisation's recent performance may differ.  Without per-customer
+  outcome ingestion (a planned future endpoint), the model cannot
+  Bayesian-update from your actuals.
+- **Reference-class fit per sector is uneven.**  Birnbaum-Saunders is
+  Natarajan-validated only for offshore O&G; other "BS" assignments
+  in the table are by analogy.  Data centres / hyperscale have no
+  peer-reviewed distribution fit — the parameters there are
+  practitioner-report-calibrated and flagged
+  (`reference_class_judgement` warning).
+
+These limits mirror the ones that David Porter, Roger Bradfield,
+Andrew Cooper, Michael Trumper and André Cavalcanti raised in their
+2026 LinkedIn discussion on MC misuse in capital projects.  The
+reference-class layer is the practical step we can take without
+customer-specific historical data; full Bayesian calibration would
+require a register-outcome endpoint and 6-12 months of in-flight
+project tracking before becoming meaningful.
+
+---
+
 ## Scope Rules
 
 An activity is **in scope** (subject to MC perturbation) iff:

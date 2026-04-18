@@ -58,6 +58,13 @@ class CompletionMCConfig:
     max_mult_base: float = 2.0
     max_mult_high: float = 6.0
     enable_risk: bool = True
+    # Reference class: when set, overrides fat_tail_from, max_mult_high,
+    # tier-4 distribution choice, and Pareto alpha range with empirically-
+    # calibrated values from solver/reference_classes.py.  Also drives
+    # post-MC percentile calibration (output _calibrated fields).
+    # Names are case-insensitive; see solver/reference_classes.py for
+    # the canonical list.
+    reference_class: str = None
 
     @classmethod
     def from_dict(cls, d):
@@ -76,6 +83,7 @@ class CompletionMCConfig:
             max_mult_base=float(caps.get('max_mult_base', 2.0)),
             max_mult_high=float(caps.get('max_mult_high', 6.0)),
             enable_risk=bool(d.get('enable_risk', True)),
+            reference_class=d.get('reference_class'),
         )
 
 
@@ -296,6 +304,166 @@ def _duration_sensitive_cap(risk, dur_days, base, high):
     return base + (high - base) * t
 
 
+def _apply_percentile_factor(model_finish_ms, expected_ms, factor):
+    """Scale a model-output finish-date toward later by a published
+    reference-class factor.
+
+    The factor is applied to the IMPACT (model finish - deterministic
+    expected finish), not to the absolute finish date.  Logic:
+
+      impact_days  = model_finish - expected
+      adjusted_imp = impact_days * factor
+      adjusted_fin = expected + adjusted_imp
+
+    This keeps the deterministic baseline anchored at the expected
+    finish (where there's no overrun, the calibrated finish equals the
+    raw finish) and only inflates the OVERRUN portion.  Matches how
+    Flyvbjerg / TII publish their tables: "to absorb a P% chance of
+    overrun, multiply your overrun by X".
+    """
+    if (model_finish_ms is None or expected_ms is None
+            or factor is None or not np.isfinite(factor)):
+        return model_finish_ms
+    impact = model_finish_ms - expected_ms
+    return expected_ms + impact * float(factor)
+
+
+def _build_calibration_warnings(nodes, in_scope, risk, ref_params,
+                                status_ms, project_dates):
+    """Detect input-quality concerns and surface them in the response.
+
+    These are NOT validation errors.  They flag things the caller can
+    see in the payload that suggest the resulting percentiles are less
+    trustworthy than the precision implies.  Mirrors the LinkedIn
+    critique that judgment-based MC inputs get laundered into
+    misleading P80s.
+
+    Each warning is a dict with `code` (machine-readable),
+    `severity` ('info' | 'warning'), and `message`.
+    """
+    warnings = []
+    n_scope = int(np.sum(in_scope)) if in_scope is not None else 0
+
+    # 1. Zero-variance / default-clustered risk scores
+    if n_scope >= 5 and len(risk) > 0:
+        scope_risk = risk[in_scope] if in_scope is not None else risk
+        if len(scope_risk) > 0:
+            risk_std = float(np.std(scope_risk))
+            risk_mean = float(np.mean(scope_risk))
+            # All-identical or near-default-clustered
+            if risk_std < 0.05:
+                warnings.append({
+                    'code': 'zero_variance_risk',
+                    'severity': 'warning',
+                    'message': (f'All {n_scope} in-scope activities have '
+                                f'near-identical risk scores '
+                                f'(std={risk_std:.3f}).  Suggests judgment-'
+                                f'based defaults rather than per-activity '
+                                f'assessment; MC spread will be artificial.'),
+                })
+            elif abs(risk_mean - 0.5) < 0.05 and risk_std < 0.15:
+                warnings.append({
+                    'code': 'judgment_based_risk_default',
+                    'severity': 'info',
+                    'message': (f'Risk scores cluster near the 0.5 default '
+                                f'(mean={risk_mean:.2f}, std={risk_std:.2f}).  '
+                                f'Consider per-activity risk scoring for '
+                                f'sharper percentiles.'),
+                })
+
+    # 2. Supply-chain classification missing on every activity
+    has_supplier = any(
+        n.get('SupplierType') or n.get('supplierType')
+        for n in nodes or [])
+    if not has_supplier and n_scope > 0:
+        warnings.append({
+            'code': 'no_supply_chain_classification',
+            'severity': 'info',
+            'message': ('No SupplierType set on any activity.  Supply-'
+                        'chain activities (equipment / material / service) '
+                        'use tighter fat-tail thresholds and would produce '
+                        'more accurate percentiles for procurement-heavy '
+                        'projects.'),
+        })
+
+    # 3. Small-scope MC instability
+    if 0 < n_scope < 30:
+        warnings.append({
+            'code': 'small_scope_mc',
+            'severity': 'warning',
+            'message': (f'Only {n_scope} activities in MC scope.  '
+                        f'Percentile estimates are noisy below ~30 '
+                        f'activities; treat P95 / P99 as illustrative.'),
+        })
+
+    # 4. Extreme horizon (well outside the calibration range)
+    if project_dates:
+        days = (project_dates['max'] - project_dates['min']) / _MS_PER_DAY
+        if days < 30:
+            warnings.append({
+                'code': 'extreme_horizon_short',
+                'severity': 'info',
+                'message': (f'Project horizon is {days:.0f} days.  '
+                            f'Reference-class tables (Flyvbjerg, '
+                            f'Cantarelli) are validated on multi-year '
+                            f'megaprojects; short-horizon factors are '
+                            f'extrapolations.'),
+            })
+        elif days > 365 * 10:
+            warnings.append({
+                'code': 'extreme_horizon_long',
+                'severity': 'info',
+                'message': (f'Project horizon is {days:.0f} days '
+                            f'(>10y).  Distribution parameters drift '
+                            f'with technology / regulation over decadal '
+                            f'spans; treat tail percentiles as model '
+                            f'predictions, not empirical guarantees.'),
+            })
+
+    # 5. Reference-class advisories
+    if ref_params is not None:
+        if not ref_params.get('has_finite_mean', True):
+            warnings.append({
+                'code': 'infinite_mean_reference_class',
+                'severity': 'warning',
+                'message': (
+                    f'Reference class has formally infinite mean '
+                    f'(alpha <= 1; e.g. IT, Olympics).  Per Flyvbjerg / '
+                    f'Aaen 2025, ANY single percentile is unstable; the '
+                    f'P99 is reported as a hard cap, not an empirical '
+                    f'measurement.  Recommended: cap exposure rather '
+                    f'than predict the tail.'),
+            })
+        # Judgement / no peer-reviewed fit
+        for cit in ref_params.get('citations', []):
+            if 'JUDGEMENT' in cit:
+                warnings.append({
+                    'code': 'reference_class_judgement',
+                    'severity': 'info',
+                    'message': (
+                        f'Reference class parameters include judgement '
+                        f'calls (no peer-reviewed distribution fit yet).  '
+                        f'See citations field for source notes.'),
+                })
+                break
+
+    # 6. Honest blanket caveat when no reference class is set
+    if ref_params is None and n_scope > 0:
+        warnings.append({
+            'code': 'no_reference_class',
+            'severity': 'info',
+            'message': (
+                'No reference_class supplied; using global default '
+                'tier model.  Per Flyvbjerg & Bester 2021 and the '
+                '2025 Cantarelli RCF review, sector-specific reference '
+                'classes give better-calibrated percentiles.  See '
+                'solver/reference_classes.py for the supported '
+                'classes.'),
+        })
+
+    return warnings
+
+
 def _sample_multipliers(risk, activity_types, remaining, calendar, config):
     """
     Generate an (M, n) matrix of capped duration multipliers via the
@@ -304,7 +472,15 @@ def _sample_multipliers(risk, activity_types, remaining, calendar, config):
     ``remaining`` is either wall-clock ms (no calendar) or working hours
     (calendar); *calendar* disambiguates when computing the per-activity
     duration in days for the cap heuristic.
+
+    Reference-class overrides: when ``config.reference_class`` resolves
+    via solver/reference_classes.get_reference_class, the class's
+    fat_tail_from / pareto_offset / pareto_alpha_range / tier_4
+    distribution / max_multiplier_cap override the defaults for THIS
+    MC run.  Without a class, behaviour is byte-identical to before.
     """
+    from solver.reference_classes import get_reference_class
+
     n = len(risk)
     if not config.enable_risk or n == 0:
         return np.ones((config.iterations, n), dtype=np.float64), config.iterations
@@ -314,11 +490,18 @@ def _sample_multipliers(risk, activity_types, remaining, calendar, config):
     from scipy.special import ndtri
     z_all = ndtri(u_all)
 
-    # Honour config.thresholds.fat_tail_from by passing it as the
-    # supply-type default (supply-chain activities still use their
-    # tighter 0.35 / 0.40 / 0.45 thresholds).
+    # Resolve the reference class once.  When None, we use the historic
+    # (config.fat_tail_from, default tier 4 = BS, default Pareto alpha
+    # formula, default 6/10x cap) behaviour.
+    ref = get_reference_class(getattr(config, 'reference_class', None))
+
+    fat_default = ref['fat_tail_from'] if ref else config.fat_tail_from
+    pareto_offset = ref['pareto_offset'] if ref else None
+    tier_4 = ref['tier_4_distribution'] if ref else 'birnbaum_saunders'
+    alpha_range = ref['pareto_alpha_range'] if ref else None
+
     fat_thresh = _fat_tail_thresholds(
-        activity_types, n, default_fat_tail=config.fat_tail_from)
+        activity_types, n, default_fat_tail=fat_default)
 
     risk_tile = np.tile(risk, M)
     fat_tile = np.tile(fat_thresh, M)
@@ -326,6 +509,9 @@ def _sample_multipliers(risk, activity_types, remaining, calendar, config):
         u_all.ravel(), z_all.ravel(), risk_tile, fat_tile,
         noise_floor=config.no_risk_below,
         normal_from=config.normal_from,
+        pareto_offset=pareto_offset,
+        tier_4_distribution=tier_4,
+        pareto_alpha_range=alpha_range,
     )
     mult = mult_flat.reshape(M, n)
 
@@ -334,8 +520,13 @@ def _sample_multipliers(risk, activity_types, remaining, calendar, config):
     else:
         # Working hours -> working-day count (matches JS durDays definition).
         dur_days = remaining / max(calendar.hours_per_day, 1e-9)
+
+    # When a reference class is set, its max_multiplier_cap replaces
+    # config.max_mult_high (the latter remains the upper bound for
+    # callers without a reference class -- backwards compatible).
+    high_cap = ref['max_multiplier_cap'] if ref else config.max_mult_high
     caps = _duration_sensitive_cap(risk, dur_days,
-                                   config.max_mult_base, config.max_mult_high)
+                                   config.max_mult_base, high_cap)
     below_floor = risk <= config.no_risk_below
     if np.any(below_floor):
         mult[:, below_floor] = 1.0
@@ -635,6 +826,54 @@ def run_completion_mc(nodes, links, status_date,
     mean_f = float(np.mean(proj_finish))
     std_ms = float(np.std(proj_finish))
 
+    # P95 alongside P50/P80 for the calibrated companion (Flyvbjerg-
+    # style tables publish at P95).
+    p95 = float(proj_sorted[int(0.95 * (M_actual - 1))])
+
+    # Reference-class calibration: when set, attach percentile-specific
+    # adjusted finish dates per the table in solver/reference_classes.py.
+    # The raw model fields stay unchanged so consumers reading the
+    # existing contract (CompletionPrediction.js etc.) are unaffected.
+    from solver.reference_classes import get_reference_class
+    ref_params = get_reference_class(getattr(config, 'reference_class', None))
+    calibrated = None
+    if ref_params is not None:
+        factors = ref_params['percentile_factors']
+        calibrated = {
+            'p50_finish': _ms_to_iso(_apply_percentile_factor(
+                p50, expected_finish_ms, factors.get('P50'))),
+            'p80_finish': _ms_to_iso(_apply_percentile_factor(
+                p80, expected_finish_ms, factors.get('P80'))),
+            'p95_finish': _ms_to_iso(_apply_percentile_factor(
+                p95, expected_finish_ms, factors.get('P95'))),
+            # P99 may be Inf for IT / Olympics; render as None and
+            # surface via calibration_warnings instead.
+            'p99_finish': (
+                _ms_to_iso(_apply_percentile_factor(
+                    p95, expected_finish_ms, factors.get('P99')))
+                if (factors.get('P99') is not None
+                    and np.isfinite(factors.get('P99')))
+                else None),
+            'reference_class':  config.reference_class,
+            'percentile_factors': factors,
+            'mean_overrun_published': ref_params['mean_overrun'],
+            'is_fat_tailed':         ref_params['is_fat_tailed'],
+            'has_finite_mean':       ref_params['has_finite_mean'],
+            'tier_4_distribution':   ref_params['tier_4_distribution'],
+            'pareto_alpha_range':    ref_params['pareto_alpha_range'],
+            'max_multiplier_cap':    ref_params['max_multiplier_cap'],
+            'citations':             ref_params['citations'],
+        }
+
+    project_dates = None
+    if len(proj_finish) > 0:
+        project_dates = {
+            'min': float(np.min(proj_finish)),
+            'max': float(np.max(proj_finish)),
+        }
+    calibration_warnings = _build_calibration_warnings(
+        nodes, in_scope, risk, ref_params, status_ms, project_dates)
+
     result = {
         'status_date':      _ms_to_iso(status_ms),
         'expected_finish':  _ms_to_iso(expected_finish_ms),
@@ -656,12 +895,15 @@ def run_completion_mc(nodes, links, status_date,
         'iterations':           int(M_actual),
         'seed':                 config.seed,
         'config': {
-            'antithetic':    config.antithetic,
-            'enable_risk':   config.enable_risk,
-            'no_risk_below': config.no_risk_below,
-            'normal_from':   config.normal_from,
-            'fat_tail_from': config.fat_tail_from,
+            'antithetic':      config.antithetic,
+            'enable_risk':     config.enable_risk,
+            'no_risk_below':   config.no_risk_below,
+            'normal_from':     config.normal_from,
+            'fat_tail_from':   config.fat_tail_from,
+            'reference_class': config.reference_class,
         },
+        'reference_class_calibrated': calibrated,
+        'calibration_warnings':       calibration_warnings,
         'computation_ms': round((time.time() - t0) * 1000, 1),
     }
     return result
