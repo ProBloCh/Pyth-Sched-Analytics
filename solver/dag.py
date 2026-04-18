@@ -137,11 +137,18 @@ def build_dag(nodes, links):
 
     topo_arr = np.array(topo, dtype=np.int64)
 
-    durations = np.array(
-        [float(nodes[i].get('Duration', nodes[i].get('duration', 1.0)))
-         for i in range(n)],
-        dtype=np.float64,
-    )
+    def _dur(node):
+        # Milestones may pass '' / None for Duration; treat as zero
+        # rather than crashing the caller with a float('') ValueError.
+        v = node.get('Duration', node.get('duration', 1.0))
+        if v in ('', None):
+            return 0.0
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+    durations = np.array([_dur(nodes[i]) for i in range(n)],
+                         dtype=np.float64)
 
     state = DAGState(n, topo_arr, pred, succ, durations,
                      pred_edges, succ_edges)

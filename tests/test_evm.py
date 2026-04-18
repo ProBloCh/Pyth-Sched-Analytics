@@ -1159,6 +1159,57 @@ class TestDurationToWorkHoursCalendar:
         assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
 
 
+class TestSerialiseNdarrayNonFinite:
+    """Locks Copilot fix: evm.routes._serialise must scrub NaN/Infinity
+    inside numpy ndarrays before they reach jsonify.  Previously
+    `obj.tolist()` preserved them and json.dumps emitted invalid
+    JSON (`NaN` / `Infinity` literals)."""
+
+    def test_ndarray_with_nan_becomes_null(self):
+        import numpy as np
+        from evm.routes import _serialise
+        arr = np.array([1.0, float('nan'), float('inf'), -float('inf'), 3.5])
+        out = _serialise(arr)
+        assert out == [1.0, None, None, None, 3.5]
+
+    def test_nested_ndarray_recurses(self):
+        import numpy as np
+        from evm.routes import _serialise
+        payload = {'values': np.array([float('inf'), 2.0])}
+        assert _serialise(payload) == {'values': [None, 2.0]}
+
+
+class TestCompletionMilestoneDuration:
+    """Locks Copilot fix: completion/routes._validate_common must accept
+    null/blank Duration as milestone-zero, matching EVM validator +
+    MC/recovery engine tolerance."""
+
+    def test_null_duration_accepted_as_milestone(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [
+                {'ID': '0', 'Duration': None, 'Milestone': 1,
+                 'Start': '2025-01-01', 'Finish': '2025-01-01'},
+                {'ID': '1', 'Duration': 5, 'TimeUnits': 'days',
+                 'Start': '2025-01-01', 'Finish': '2025-01-06'},
+            ],
+            'links': [{'source': '0', 'target': '1', 'type': 'FS'}],
+            'status_date': '2025-01-01T00:00:00Z',
+        })
+        # Should NOT be a 400 validation rejection.
+        assert resp.status_code != 400, resp.get_json()
+
+    def test_empty_duration_accepted_as_milestone(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [
+                {'ID': '0', 'Duration': '', 'Milestone': 1},
+                {'ID': '1', 'Duration': 3, 'TimeUnits': 'days'},
+            ],
+            'links': [{'source': '0', 'target': '1', 'type': 'FS'}],
+            'status_date': '2025-01-01T00:00:00Z',
+        })
+        assert resp.status_code != 400, resp.get_json()
+
+
 class TestMinutesUnitParity:
     """Locks Copilot fix: 'm' means minutes (matching the canonical JS
     convertToHours in PathScripts.js line 158), not months.  The

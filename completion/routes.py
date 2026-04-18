@@ -107,13 +107,18 @@ def _validate_common(data):
             return None, f'Duplicate activity ID: {nid}'
         seen_ids.add(sid)
 
+        # Allow (0, '0', '', None) as milestone-zero -- matches
+        # evm/routes._validate_common and the MC/recovery engines
+        # that treat blank duration as zero rather than rejecting.
         dur = node.get('Duration', node.get('duration', 0))
-        try:
-            dur_f = float(dur)
-        except (TypeError, ValueError):
-            return None, f'nodes[{i}] (ID={nid}): Duration is not numeric'
-        if math.isnan(dur_f) or math.isinf(dur_f) or dur_f < 0:
-            return None, f'nodes[{i}] (ID={nid}): Duration must be a finite non-negative number'
+        if dur not in (0, '0', '', None):
+            try:
+                dur_f = float(dur)
+            except (TypeError, ValueError):
+                return None, f'nodes[{i}] (ID={nid}): Duration is not numeric'
+            if math.isnan(dur_f) or math.isinf(dur_f) or dur_f < 0:
+                return None, (f'nodes[{i}] (ID={nid}): Duration must be a '
+                              f'finite non-negative number')
 
     for i, link in enumerate(links):
         if not isinstance(link, dict):

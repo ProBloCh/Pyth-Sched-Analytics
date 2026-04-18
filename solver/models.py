@@ -142,7 +142,15 @@ def build_activity_params(nodes, activity_metadata):
     for node in nodes:
         aid = str(node.get('ID', node.get('id', '')))
         ids.append(aid)
-        dur = float(node.get('Duration', node.get('duration', 1.0)))
+        dur_raw = node.get('Duration', node.get('duration', 1.0))
+        # Milestones commonly pass '' / None / 0 for Duration; treat as 0.
+        if dur_raw in ('', None):
+            dur = 0.0
+        else:
+            try:
+                dur = float(dur_raw)
+            except (TypeError, ValueError):
+                dur = 0.0
         durs.append(dur)
 
         meta = activity_metadata.get(aid, {})

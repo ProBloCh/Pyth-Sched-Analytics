@@ -146,7 +146,10 @@ def _serialise(obj):
     if isinstance(obj, (list, tuple)):
         return [_serialise(v) for v in obj]
     if isinstance(obj, np.ndarray):
-        return obj.tolist()
+        # tolist() preserves NaN / Infinity which json.dumps emits as
+        # invalid JSON literals (NaN / Infinity).  Recurse so the float
+        # branch below scrubs each element to null.
+        return [_serialise(v) for v in obj.tolist()]
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating,)):
