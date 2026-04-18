@@ -286,10 +286,20 @@ def advance_working_ms(start_ms, work_hours, cal):
             n_oor, max_work)
         _HORIZON_WARNING_EMITTED['target'] = True
 
-    # side='right' gives first index strictly greater than target, so -1
-    # gives the last day whose cumulative hours <= target.  For a target
-    # landing exactly on a day boundary, this returns the next working day
-    # (natural "finish at start of next slot" behaviour).
+    # side='right' gives first index strictly greater than target, so
+    # -1 gives the last day whose cumulative hours <= target.  For a
+    # target landing exactly on a day boundary, this puts the finish at
+    # the next working day's start (frac = 0).
+    #
+    # NB: a Copilot review suggested side='left' here on the grounds
+    # that an exact-boundary advance should map to "end of previous
+    # working window".  We deliberately keep side='right' to match the
+    # JS addWorkingHours semantic (Reference/Completionprediction.js
+    # 396-423): N*hpd hours from a midnight start advances by N
+    # whole working days and returns the next working day at midnight,
+    # not the same-day end-of-work.  Test suite locks the JS-parity
+    # behaviour (see tests/test_completion.py
+    # TestWorkingCalendar.test_advance_weekdays_no_holidays).
     end_idx = np.searchsorted(cal.work_hours_before, target_hrs, side='right') - 1
     end_idx = np.clip(end_idx, 0, cal.K - 1)
 

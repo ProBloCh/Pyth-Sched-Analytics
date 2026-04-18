@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,11 @@ pytestmark = pytest.mark.skipif(
     reason='node not installed; install Node.js to run JS<->Py diff tests')
 
 
+# Cache by fixture path: the recovery diff suite invokes this 4x per
+# fixture (one per invariant), and each Node spawn is ~200-400 ms.
+# The harness output is deterministic for a given fixture and the
+# tests don't mutate the returned dict, so caching is safe.
+@lru_cache(maxsize=None)
 def _run_js(fixture_path):
     env = dict(os.environ)
     env['TZ'] = 'UTC'

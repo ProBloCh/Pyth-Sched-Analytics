@@ -18,6 +18,7 @@ import math
 import os
 import shutil
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,13 @@ pytestmark = pytest.mark.skipif(
 # Helpers
 # ---------------------------------------------------------------------------
 
+# The diff suite spawns 5 fixtures x ~6 tests = ~30 invocations.  Each
+# Node harness spawn is ~200-400 ms (cold-start v8 + load reference JS),
+# and the Python engine runs in ~50-150 ms; both are deterministic for
+# a given fixture.  Caching by fixture path collapses the ~30
+# invocations into 5 + 5 -- about a 5x speed-up of the diff suite when
+# Node is installed.
+@lru_cache(maxsize=None)
 def _run_js(fixture_path):
     """Invoke the Node harness; returns parsed JSON.
 
@@ -60,6 +68,7 @@ def _run_js(fixture_path):
     return json.loads(proc.stdout)
 
 
+@lru_cache(maxsize=None)
 def _run_py(fixture_path):
     """Run the Python engine on the same fixture file."""
     with open(fixture_path) as f:

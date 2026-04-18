@@ -182,8 +182,11 @@ def analyze():
         return err
 
     get_fn, set_fn = _cache()
-    key = _cache_key(data)
-    if get_fn:
+    # Skip the SHA256(json.dumps(sort_keys)) work entirely when caching
+    # is disabled / unavailable -- on a 20K-node payload the hash alone
+    # adds noticeable wall time for no benefit.
+    key = _cache_key(data) if (get_fn or set_fn) else None
+    if get_fn and key is not None:
         cached = get_fn(key)
         if cached:
             cached['cache_hit'] = True
@@ -197,7 +200,7 @@ def analyze():
         )
         result = _serialise(result)
         result['cache_hit'] = False
-        if set_fn:
+        if set_fn and key is not None:
             set_fn(key, result)
         return jsonify(result)
     except ValueError as e:
