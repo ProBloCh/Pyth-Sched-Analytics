@@ -76,10 +76,16 @@ def test_telemetry_counter_semantics():
     assert by['evm'] == {'calls': 1, 'successes': 1, 'fallbacks': 1}
 
 
-def test_telemetry_never_throws_on_missing_window():
-    """The helper must swallow any error rather than break the calling
-    wrapper.  Not directly testable from Python, but the Node harness
-    completes successfully which proves the try/catch is in place."""
+def test_telemetry_harness_completes_without_throwing():
+    """Sanity check that the Node harness completes without raising
+    and returns the expected shape.  Does NOT specifically exercise
+    the `typeof window === 'undefined'` branch (the sandbox always
+    defines window); that missing-window branch is exercised only by
+    the helper's try/catch and is asserted structurally by the
+    counter-semantics test above.  A targeted missing-window test
+    would need the harness to delete `sandbox.window` before invoking
+    the helpers, which isn't straightforward because both modules
+    expect `window.cybereumState` at load time."""
     t = _run_js()
     assert isinstance(t, dict)
     assert 'backend_calls' in t

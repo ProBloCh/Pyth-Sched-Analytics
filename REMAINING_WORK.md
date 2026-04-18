@@ -249,6 +249,36 @@ Tier-1 candidates (MC, recovery, EVM) covered the highest-payoff JS.
 
 **Unblocked by**: Concrete request.
 
+### 4.6 advance_working_ms time-of-day preservation
+
+**What**: `completion/calendar.py advance_working_ms` uses a
+cumulative work-hours array + `searchsorted` and treats the intraday
+component as "working hours since UTC midnight" clipped to
+`[0, hours_per_day]`.  The JS reference
+(`Reference/Completionprediction.js addWorkingHours`, lines 396-423)
+preserves the input's time-of-day, advances by whole working days,
+then adds remainder hours as wall-clock time.
+
+The two algorithms agree whenever start_ms is at UTC midnight (the
+path the MC pipeline takes -- statusDate is parsed from an ISO date
+string typically representing 00:00 UTC).  They CAN diverge by up
+to one working-day boundary when callers pass non-midnight start
+times into lag-shift helpers (e.g. an activity Finish at 13:00 +
+2-day lag: JS keeps 13:00, this implementation effectively pushes
+the time-of-day forward).
+
+**Why not now**: A faithful port loses the cumulative-array
+vectorisation that makes the MC hot path fast; restructuring around
+per-row searchsorted-on-day-index + remainder-add (preserving
+time-of-day) needs benchmarking and a focused diff harness with
+non-midnight start fixtures.  Currently no diff-harness fixture
+exercises non-midnight starts so the divergence isn't caught.
+
+**Unblocked by**: A non-midnight-start fixture in the EVM diff
+harness + a focused rewrite that keeps vectorisation (likely a
+separate "intraday offset" array carried alongside the existing
+cumulative arrays).
+
 ---
 
 ## 5. Done in this branch (for reference)

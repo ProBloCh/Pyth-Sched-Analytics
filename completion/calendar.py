@@ -203,6 +203,26 @@ def advance_working_ms(start_ms, work_hours, cal):
           last day of the calendar and a warning is logged (once per
           process per clip type, to avoid flooding during vectorised
           Monte Carlo batches).
+
+    Known limitation vs JS addWorkingHours
+    --------------------------------------
+    The JS reference (``Reference/Completionprediction.js`` lines 396-
+    423) preserves the input's time-of-day when advancing, then adds
+    the remainder hours as wall-clock time on top.  This implementation
+    uses a cumulative work-hours array + ``searchsorted``, which treats
+    the intraday portion as "working hours since midnight" clipped to
+    ``[0, hours_per_day]``.
+
+    The two agree whenever ``start_ms`` is at UTC midnight -- which is
+    the path the MC pipeline takes (statusDate is typically parsed from
+    an ISO date string representing 00:00 UTC).  They CAN disagree
+    when callers pass non-midnight start times to lag-shift helpers
+    downstream; the divergence is at most one working-day boundary.
+
+    Full JS-parity (time-of-day preservation) requires restructuring
+    away from the cumulative array + vectorised searchsorted, which
+    has cost implications for the MC hot path.  Tracked in
+    REMAINING_WORK.md section 4 as a follow-up.
     """
     start_arr = np.asarray(start_ms, dtype=np.float64)
     work_arr = np.asarray(work_hours, dtype=np.float64)

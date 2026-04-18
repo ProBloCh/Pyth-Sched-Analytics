@@ -218,7 +218,11 @@ def _compute_float_hours(dag_state, nodes, id_to_idx, calendar, hours_per_day,
             per_unit_hrs[j] = convert_to_hours(
                 1.0, units, float(hours_per_day), wpw)
         else:
-            # Wall-clock: 1 day = 24h, 1 week = 168h, 1 month = 30 days.
+            # Wall-clock: 1 day = 24h, 1 week = 168h.  Months / years go
+            # through the shared convert_to_hours averages (4.345 weeks
+            # per month, 52.14 per year) so `'month'` units stay
+            # consistent with the calendar path and the JS reference --
+            # NOT a flat 30-day month here.
             per_unit_hrs[j] = convert_to_hours(
                 1.0, units, hours_per_day=24.0, working_days_per_week=7.0)
 
