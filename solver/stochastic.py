@@ -174,6 +174,17 @@ def _lognormal_ppf(u, sigma=0.25, mu=0.0):
     return np.exp(mu + sigma * z)
 
 
+def _lognormal_ppf_z(z, sigma=0.25, mu=0.0):
+    """Lognormal PPF taking precomputed z = ndtri(u).
+
+    Avoids redundant ndtri() calls in the MC hot path: the caller
+    (_compute_raw_multipliers) already has z for the entire sample
+    matrix, so the tier-4 lognormal branch can reuse it directly
+    instead of re-inverting the CDF per invocation.
+    """
+    return np.exp(mu + sigma * z)
+
+
 # ---------------------------------------------------------------------------
 # Risk-tiered perturbation
 # ---------------------------------------------------------------------------
@@ -288,9 +299,10 @@ def _compute_raw_multipliers(u, z, risk, fat_thresh,
             mult[bs_mask] = _bs_ppf_z(z[bs_mask], alpha, beta)
         elif tier_4_distribution == 'lognormal':
             # σ scales gently with risk; mu=0 keeps the median at 1.0
-            # and the right tail is naturally bounded vs BS.
+            # and the right tail is naturally bounded vs BS.  Reuse the
+            # precomputed z to avoid a second ndtri() call per scenario.
             sigma = 0.05 + 0.50 * r
-            mult[bs_mask] = _lognormal_ppf(u[bs_mask], sigma=sigma, mu=0.0)
+            mult[bs_mask] = _lognormal_ppf_z(z[bs_mask], sigma=sigma, mu=0.0)
         else:
             # Unknown tier 4 type -> safe fallback to BS so existing
             # behaviour is preserved (defensive; configs are validated

@@ -16,6 +16,8 @@ consumers).
 | `/completion/monte-carlo` | POST | [completion.md](completion.md#post-completionmonte-carlo) | Remaining-work MC finish-date forecast (P20/P50/P80) |
 | `/completion/recovery-options` | POST | [completion.md](completion.md#post-completionrecovery-options) | Ranked crash + lag-compression options |
 | `/completion/reference-classes` | GET | [completion.md](completion.md#discovery-endpoint) | List built-in + env-loaded reference classes for sector dropdowns |
+| `/completion/register-outcome` | POST | [completion.md](completion.md#post-completionregister-outcome) | Register a closed-project predicted-vs-actual outcome for calibration |
+| `/completion/calibration-report` | GET | [completion.md](completion.md#get-completioncalibration-report) | Aggregate accumulated outcomes into per-class calibration ratios + advisories |
 | `/evm/analyze` | POST | [evm.md](evm.md#post-evmanalyze) | EVM analysis: CPI/SPI/EAC + time-phased distributions |
 | `/health` | GET | [health.md](health.md#get-health) | Main app health check |
 | `/solver/health` | GET | [health.md](health.md#get-solverhealth) | Solver module health check |

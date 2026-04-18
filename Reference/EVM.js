@@ -2286,12 +2286,29 @@ function _evmBuildRequestBody(nodes, links) {
     const teamCal = (window.cybereumState && window.cybereumState.teamCalendar) || null;
     const hpd = (teamCal && teamCal.hoursPerDay) || evmConfig.WORKING_HOURS_PER_DAY
         || CONFIG?.WORKING_HOURS_PER_DAY || 8;
-    const dpw = (teamCal && Array.isArray(teamCal.workingDays) && teamCal.workingDays.length)
-        || evmConfig.WORKING_DAYS_PER_WEEK || CONFIG?.WORKING_DAYS_PER_WEEK || 5;
+    const workingDaysList = (teamCal && Array.isArray(teamCal.workingDays) && teamCal.workingDays.length)
+        ? teamCal.workingDays.slice()
+        : null;
+    const dpw = workingDaysList
+        ? workingDaysList.length
+        : (evmConfig.WORKING_DAYS_PER_WEEK || CONFIG?.WORKING_DAYS_PER_WEEK || 5);
+    const holidaysList = (teamCal && Array.isArray(teamCal.holidays))
+        ? teamCal.holidays.slice() : [];
     const startNode = (nodes || []).find(n => String(n.ID) === '0') || (nodes || [])[0] || {};
     const statusDate = (window.cybereumState && window.cybereumState.dataDate)
         ? new Date(window.cybereumState.dataDate).toISOString()
         : new Date().toISOString();
+
+    // Calendar block carries the full workingDays list + holidays so the
+    // backend's holiday-aware predicted-date propagation matches what
+    // the JS fallback would compute.  Omitting either would make the
+    // backend diverge on any project with non-default weekdays or
+    // holiday gaps.
+    const calendar = {
+        hoursPerDay: hpd,
+        workingDays: workingDaysList || [1, 2, 3, 4, 5],
+        holidays: holidaysList,
+    };
 
     return {
         nodes: nodes || [],
@@ -2302,7 +2319,9 @@ function _evmBuildRequestBody(nodes, links) {
             currency: startNode.Currency || 'USD',
             project: (window.cybereumState && window.cybereumState.project) || null,
             hoursPerDay: hpd,
-            workingDaysPerWeek: typeof dpw === 'number' ? dpw : 5,
+            workingDaysPerWeek: dpw,
+            workingDays: calendar.workingDays,
+            calendar,
         },
     };
 }

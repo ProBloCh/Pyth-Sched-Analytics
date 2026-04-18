@@ -372,7 +372,8 @@ def _build_crash_candidates(nodes, dag_state, id_to_idx, activity_metadata,
 # ---------------------------------------------------------------------------
 
 def _build_lag_candidates(links, id_to_idx, node_by_id, critical_set,
-                          hours_per_day, config):
+                          hours_per_day, config,
+                          working_days_per_week=5.0):
     """
     Produce a list of dicts (unsorted before return):
         {id, source, target, type, lag_hrs, lag_days,
@@ -398,15 +399,21 @@ def _build_lag_candidates(links, id_to_idx, node_by_id, critical_set,
         if not np.isfinite(lag_raw) or lag_raw <= 0:
             continue
 
+        # Links arriving here normally passed through _normalise_link_lags
+        # at the top of run_recovery_options, which sets lagUnits='h' and
+        # converts to working hours using the same working_days_per_week
+        # the CPM / float path uses.  Defensive fallback uses convert_to_hours
+        # with the same calendar so a direct caller that skips normalisation
+        # doesn't get a stale hardcoded 5-day-week answer.
         lag_units = str(link.get('lagUnits') or link.get('TimeUnits') or 'h').lower()
         if lag_units in ('h', 'hr', 'hrs', 'hour', 'hours'):
             lag_hrs = lag_raw
-        elif lag_units in ('d', 'day', 'days'):
-            lag_hrs = lag_raw * hpd
-        elif lag_units in ('w', 'wk', 'week', 'weeks'):
-            lag_hrs = lag_raw * hpd * 5.0
         else:
-            lag_hrs = lag_raw
+            try:
+                lag_hrs = convert_to_hours(
+                    lag_raw, lag_units, hpd, float(working_days_per_week))
+            except Exception:
+                lag_hrs = lag_raw
 
         lag_days = lag_hrs / max(hpd, 1e-9)
         if lag_days < config.min_lag_days_for_compression:
@@ -659,7 +666,7 @@ def run_recovery_options(nodes, links, status_date,
 
     lag_candidates = _build_lag_candidates(
         links, id_to_idx, node_by_id, critical_set,
-        hours_per_day, config)
+        hours_per_day, config, working_days_per_week)
 
     recovery_options, achieved_hrs = _package_recovery_options(
         crash_candidates, target_hours, is_scenario_mode,
