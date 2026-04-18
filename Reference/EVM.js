@@ -2235,6 +2235,36 @@ function createActualEVMChart(nodes, links) {
 // Module-scoped dedup cache: { fingerprint: string, promise: Promise }
 let _evmInFlight = null;
 
+// Telemetry: shares window.cybereumState.completionPredictionTelemetry
+// with Completionprediction.js so the main app surfaces a single banner
+// when the backend is degrading.  Never throws.
+function _evmRecordTelemetry(kind, detail) {
+    try {
+        if (typeof window === 'undefined') return;
+        window.cybereumState = window.cybereumState || {};
+        const t = window.cybereumState.completionPredictionTelemetry =
+            window.cybereumState.completionPredictionTelemetry || {
+                backend_calls: 0, backend_successes: 0,
+                fallback_count: 0, last_error: null,
+                by_service: {},
+            };
+        const per = t.by_service.evm =
+            t.by_service.evm || { calls: 0, successes: 0, fallbacks: 0 };
+        if (kind === 'call')        { t.backend_calls++;     per.calls++; }
+        else if (kind === 'success'){ t.backend_successes++; per.successes++; }
+        else if (kind === 'fallback') {
+            t.fallback_count++; per.fallbacks++;
+            if (detail) t.last_error = {
+                service: 'evm',
+                reason: detail.reason || null,
+                status: (detail.status != null) ? detail.status : null,
+                message: detail.message || null,
+                ts: Date.now(),
+            };
+        }
+    } catch (_) { /* never break the calling path */ }
+}
+
 function _evmFingerprint(nodes, links) {
     // Cheap fingerprint that changes when the project data changes but
     // not when the user just switches tabs.  Includes a monotonic
@@ -2290,6 +2320,7 @@ async function _ensureEvmAnalysis(nodes, links) {
         +evmBackendConfig.evmRequestTimeoutMs || 15000) : null;
 
     const promise = (async () => {
+        _evmRecordTelemetry('call');
         try {
             const body = _evmBuildRequestBody(nodes, links);
             const resp = await fetch(evmBackendConfig.evmEndpoint, {
@@ -2300,9 +2331,13 @@ async function _ensureEvmAnalysis(nodes, links) {
             });
             if (timer) clearTimeout(timer);
             if (!resp.ok) {
-                throw new Error('backend returned ' + resp.status);
+                const err = new Error('backend returned ' + resp.status);
+                err.__evmStatus = resp.status;
+                throw err;
             }
-            return await resp.json();
+            const data = await resp.json();
+            _evmRecordTelemetry('success');
+            return data;
         } finally {
             if (timer) clearTimeout(timer);
         }
@@ -2344,6 +2379,7 @@ async function getCumulativeDistributionAsync(nodes, links) {
         || typeof fetch !== 'function'
         || !evmBackendConfig.evmEndpoint;
     if (disabled) {
+        _evmRecordTelemetry('fallback', { reason: 'backend_disabled' });
         return getCumulativeDistribution(nodes, links);
     }
     try {
@@ -2371,6 +2407,13 @@ async function getCumulativeDistributionAsync(nodes, links) {
             cache_hit: result.cache_hit,
         });
     } catch (err) {
+        _evmRecordTelemetry('fallback', {
+            reason: err?.__evmStatus != null
+                    ? 'non_ok_status'
+                    : (err?.name === 'AbortError' ? 'timeout' : 'network_error'),
+            status: err?.__evmStatus,
+            message: err?.message || String(err),
+        });
         console.warn('[EVM] Backend failed (',
                      err?.name || 'error', err?.message || err,
                      ') -- falling back to JS getCumulativeDistribution');
@@ -2383,6 +2426,7 @@ async function createActualEVMChartAsync(nodes, links) {
         || typeof fetch !== 'function'
         || !evmBackendConfig.evmEndpoint;
     if (disabled) {
+        _evmRecordTelemetry('fallback', { reason: 'backend_disabled' });
         return createActualEVMChart(nodes, links);
     }
     try {
@@ -2419,6 +2463,13 @@ async function createActualEVMChartAsync(nodes, links) {
             cache_hit: result.cache_hit,
         });
     } catch (err) {
+        _evmRecordTelemetry('fallback', {
+            reason: err?.__evmStatus != null
+                    ? 'non_ok_status'
+                    : (err?.name === 'AbortError' ? 'timeout' : 'network_error'),
+            status: err?.__evmStatus,
+            message: err?.message || String(err),
+        });
         console.warn('[EVM] Backend failed (',
                      err?.name || 'error', err?.message || err,
                      ') -- falling back to JS createActualEVMChart');

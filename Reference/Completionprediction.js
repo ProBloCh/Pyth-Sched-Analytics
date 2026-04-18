@@ -1691,12 +1691,44 @@
     // (raw samples can balloon payloads into the MB range).  Callers that
     // rely on finishSamples already guard with ``mc.finishSamples?.length``.
 
+    // Telemetry: silent counters + last_error so the main app can detect
+    // a degrading backend (e.g. 30% 5xx rate).  Never throws.
+    function _recordTelemetry(service, kind, detail) {
+        try {
+            const root = (typeof window !== 'undefined') ? window : null;
+            if (!root) return;
+            root.cybereumState = root.cybereumState || {};
+            const t = root.cybereumState.completionPredictionTelemetry =
+                root.cybereumState.completionPredictionTelemetry || {
+                    backend_calls: 0, backend_successes: 0,
+                    fallback_count: 0, last_error: null,
+                    by_service: {},
+                };
+            const per = t.by_service[service] =
+                t.by_service[service] || { calls: 0, successes: 0, fallbacks: 0 };
+            if (kind === 'call')        { t.backend_calls++;     per.calls++; }
+            else if (kind === 'success'){ t.backend_successes++; per.successes++; }
+            else if (kind === 'fallback') {
+                t.fallback_count++; per.fallbacks++;
+                if (detail) t.last_error = {
+                    service,
+                    reason: detail.reason || null,
+                    status: (detail.status != null) ? detail.status : null,
+                    message: detail.message || null,
+                    ts: Date.now(),
+                };
+            }
+        } catch (_) { /* never break the calling path */ }
+    }
+
     async function runMonteCarloRemainingAsync(nodes, links, maps, expected,
                                                reachability, drivingChain, opts = {}) {
         const disabled = !CONFIG.useBackendCompletion
             || typeof fetch !== 'function'
             || !CONFIG.completionEndpoint;
         if (disabled) {
+            _recordTelemetry('monte_carlo', 'fallback',
+                             { reason: 'backend_disabled' });
             return runMonteCarloRemaining(nodes, links, maps, expected,
                                           reachability, drivingChain, opts);
         }
@@ -1706,10 +1738,13 @@
         const scope = reachability?.scopeToEnd;
         if (!maps?.statusDate || !maps?.endNode || !scope || scope.size === 0
             || scope.size > CONFIG.monteCarloMaxActivities) {
+            _recordTelemetry('monte_carlo', 'fallback',
+                             { reason: 'prereqs_missing' });
             return runMonteCarloRemaining(nodes, links, maps, expected,
                                           reachability, drivingChain, opts);
         }
 
+        _recordTelemetry('monte_carlo', 'call');
         try {
             const body = _buildCompletionRequestBody(
                 nodes, links, maps, reachability, opts);
@@ -1730,6 +1765,8 @@
             if (timer) clearTimeout(timer);
 
             if (!resp.ok) {
+                _recordTelemetry('monte_carlo', 'fallback',
+                                 { reason: 'non_ok_status', status: resp.status });
                 console.warn('[CompletionPrediction] Backend MC returned',
                              resp.status, '-- falling back to JS MC');
                 return runMonteCarloRemaining(nodes, links, maps, expected,
@@ -1738,6 +1775,7 @@
 
             const payload = await resp.json();
             const mapped = _mapCompletionResponse(payload);
+            _recordTelemetry('monte_carlo', 'success');
 
             console.log('[CompletionPrediction] Backend MC results:', {
                 p20: mapped.p20Finish?.toISOString?.().split?.('T')?.[0],
@@ -1752,6 +1790,10 @@
             return mapped;
 
         } catch (err) {
+            _recordTelemetry('monte_carlo', 'fallback', {
+                reason: err?.name === 'AbortError' ? 'timeout' : 'network_error',
+                message: err?.message || String(err),
+            });
             console.warn('[CompletionPrediction] Backend MC failed (',
                          err?.name || 'error', err?.message || err,
                          ') -- falling back to JS MC');
@@ -1957,18 +1999,30 @@
         const disabled = !CONFIG.useBackendCompletion
             || typeof fetch !== 'function'
             || !CONFIG.completionEndpoint;
-        if (disabled) return null;
+        if (disabled) {
+            _recordTelemetry('reference_classes', 'fallback',
+                             { reason: 'backend_disabled' });
+            return null;
+        }
         // Derive the discovery URL from the configured MC endpoint base
         // so callers don't need a second config knob.
         const base = CONFIG.completionEndpoint.replace(/\/monte-carlo\/?$/, '');
         const url = base + '/reference-classes';
+        _recordTelemetry('reference_classes', 'call');
         try {
             const resp = await fetch(url, { method: 'GET' });
-            if (!resp.ok) return null;
+            if (!resp.ok) {
+                _recordTelemetry('reference_classes', 'fallback',
+                                 { reason: 'non_ok_status', status: resp.status });
+                return null;
+            }
             const data = await resp.json();
             _referenceClassesCache = data;
+            _recordTelemetry('reference_classes', 'success');
             return data;
         } catch (err) {
+            _recordTelemetry('reference_classes', 'fallback',
+                             { reason: 'network_error', message: err?.message });
             console.warn('[CompletionPrediction] reference-class discovery failed:', err);
             return null;
         }
@@ -1992,10 +2046,13 @@
             || typeof fetch !== 'function'
             || !CONFIG.completionEndpoint;
         if (disabled) {
+            _recordTelemetry('outcome', 'fallback',
+                             { reason: 'backend_disabled' });
             console.warn('[CompletionPrediction] Backend disabled; outcome not registered');
             return null;
         }
         const base = CONFIG.completionEndpoint.replace(/\/monte-carlo\/?$/, '');
+        _recordTelemetry('outcome', 'call');
         try {
             const resp = await fetch(base + '/register-outcome', {
                 method: 'POST',
@@ -2004,12 +2061,18 @@
             });
             const data = await resp.json();
             if (!resp.ok) {
+                _recordTelemetry('outcome', 'fallback',
+                                 { reason: 'non_ok_status', status: resp.status,
+                                   message: data && data.error });
                 console.warn('[CompletionPrediction] register-outcome rejected:',
                              data && data.error);
                 return null;
             }
+            _recordTelemetry('outcome', 'success');
             return data;
         } catch (err) {
+            _recordTelemetry('outcome', 'fallback',
+                             { reason: 'network_error', message: err?.message });
             console.warn('[CompletionPrediction] register-outcome failed:', err);
             return null;
         }
@@ -2019,16 +2082,29 @@
         const disabled = !CONFIG.useBackendCompletion
             || typeof fetch !== 'function'
             || !CONFIG.completionEndpoint;
-        if (disabled) return null;
+        if (disabled) {
+            _recordTelemetry('calibration', 'fallback',
+                             { reason: 'backend_disabled' });
+            return null;
+        }
         const base = CONFIG.completionEndpoint.replace(/\/monte-carlo\/?$/, '');
         const url = referenceClass
             ? `${base}/calibration-report?reference_class=${encodeURIComponent(referenceClass)}`
             : `${base}/calibration-report`;
+        _recordTelemetry('calibration', 'call');
         try {
             const resp = await fetch(url, { method: 'GET' });
-            if (!resp.ok) return null;
-            return await resp.json();
+            if (!resp.ok) {
+                _recordTelemetry('calibration', 'fallback',
+                                 { reason: 'non_ok_status', status: resp.status });
+                return null;
+            }
+            const data = await resp.json();
+            _recordTelemetry('calibration', 'success');
+            return data;
         } catch (err) {
+            _recordTelemetry('calibration', 'fallback',
+                             { reason: 'network_error', message: err?.message });
             console.warn('[CompletionPrediction] calibration-report failed:', err);
             return null;
         }
@@ -2061,6 +2137,8 @@
             || typeof fetch !== 'function'
             || !CONFIG.recoveryEndpoint;
         if (disabled) {
+            _recordTelemetry('recovery', 'fallback',
+                             { reason: 'backend_disabled' });
             return buildCrashOptions(nodes, maps, expected, risk,
                                      reachability, drivingChain);
         }
@@ -2068,10 +2146,13 @@
         const scope = reachability?.scopeToEnd;
         if (!maps?.statusDate || !scope || scope.size === 0
             || scope.size > CONFIG.monteCarloMaxActivities) {
+            _recordTelemetry('recovery', 'fallback',
+                             { reason: 'prereqs_missing' });
             return buildCrashOptions(nodes, maps, expected, risk,
                                      reachability, drivingChain);
         }
 
+        _recordTelemetry('recovery', 'call');
         try {
             const body = _buildRecoveryRequestBody(
                 nodes, maps, expected, risk, reachability);
@@ -2092,6 +2173,8 @@
             if (timer) clearTimeout(timer);
 
             if (!resp.ok) {
+                _recordTelemetry('recovery', 'fallback',
+                                 { reason: 'non_ok_status', status: resp.status });
                 console.warn('[CompletionPrediction] Backend recovery returned',
                              resp.status, '-- falling back to JS buildCrashOptions');
                 return buildCrashOptions(nodes, maps, expected, risk,
@@ -2101,6 +2184,7 @@
             const payload = await resp.json();
             const mapped = _mapRecoveryResponse(payload, nodes, maps, expected,
                                                 scope, risk, drivingChain);
+            _recordTelemetry('recovery', 'success');
 
             // AI enrichment: reuse the existing sync helpers so the UI flow
             // (spinner + final replacement of recoveryOptions) continues to
@@ -2147,6 +2231,10 @@
             return mapped;
 
         } catch (err) {
+            _recordTelemetry('recovery', 'fallback', {
+                reason: err?.name === 'AbortError' ? 'timeout' : 'network_error',
+                message: err?.message || String(err),
+            });
             console.warn('[CompletionPrediction] Backend recovery failed (',
                          err?.name || 'error', err?.message || err,
                          ') -- falling back to JS buildCrashOptions');
@@ -6382,6 +6470,7 @@
             getLagInHours,
             normalizePercentComplete,
             convertToHours,
+            _recordTelemetry,
         },
     };
 

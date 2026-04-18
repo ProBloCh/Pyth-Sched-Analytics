@@ -192,7 +192,11 @@ const calls = vm.runInContext('({' +
     'createNodeMap,' +
     'buildPredecessorMap,' +
     'updatePredictedValues_Improved,' +
-    'calculateTimePhasedEV' +
+    'calculateTimePhasedEV,' +
+    'convertToHours,' +
+    'differenceInCalendarDays,' +
+    'safeDate,' +
+    'formatDateLocal' +
     '})', sandbox);
 
 // Apply auto-complete-start-milestone (FIX #9) like the engine does
@@ -257,6 +261,93 @@ calls.updatePredictedValues_Improved(
 // Time-phased EV at status date (sample point for diff)
 const evAtStatus = calls.calculateTimePhasedEV(nodes, statusDate, statusDate);
 
+// === Forecasted cumulative + period distributions =====================
+// Mirrors the JS getCumulativeDistribution daily-iteration algorithm
+// (EVM.js lines 1682-1730).  Inlined here (not called directly) so the
+// harness stays DOM-free and doesn't depend on evmMetrics globals.
+function _buildForecastedDistributions(nodes, costRate) {
+    const workingNodes = [...nodes].sort(
+        (a, b) => parseInt(a.ID) - parseInt(b.ID));
+    const startNode = workingNodes.find(n => n.ID === '0') || workingNodes[0];
+    const endNode = workingNodes.reduce(
+        (a, b) => (Number(a.ID) > Number(b.ID)) ? a : b);
+    const startDate = calls.safeDate(workingNodes[0].Start);
+    const endDate = calls.safeDate(endNode.riskAdjustedEnd || endNode.Finish);
+    const plannedEndDate = calls.safeDate(endNode.Finish);
+    if (!startDate || !endDate) return null;
+
+    // Collect significant comparison dates.
+    const dateSet = new Set();
+    workingNodes.forEach(n => {
+        [n.Start, n.riskAdjustedStart, n.Finish, n.riskAdjustedEnd].forEach(d => {
+            const dt = calls.safeDate(d);
+            if (dt) dateSet.add(calls.formatDateLocal(dt));
+        });
+    });
+    const compDateSet = new Set(dateSet);
+
+    // Pre-cache per-node daily rates.
+    const nodeDailyRates = new Map();
+    workingNodes.forEach(node => {
+        if (node.Duration === 0 || node.Duration === '0') return;
+        const taskStart = calls.safeDate(node.Start);
+        const taskEnd   = calls.safeDate(node.Finish);
+        const riskStart = calls.safeDate(node.riskAdjustedStart || node.Start);
+        const riskEnd   = calls.safeDate(node.riskAdjustedEnd || node.Finish);
+        if (!taskStart || !taskEnd || !riskStart || !riskEnd) return;
+        const plannedDays = Math.max(
+            1, calls.differenceInCalendarDays(taskEnd, taskStart));
+        const riskDays = Math.max(
+            1, calls.differenceInCalendarDays(riskEnd, riskStart));
+        const plannedHours = calls.convertToHours(
+            node.Duration, node.TimeUnits || 'Hours');
+        const riskHours = calls.convertToHours(
+            node.riskAdjustedDuration || node.Duration, node.TimeUnits || 'Hours');
+        nodeDailyRates.set(node.ID, {
+            plannedDaily: plannedHours / plannedDays,
+            riskDaily:    riskHours / riskDays,
+            evDaily:      plannedHours / riskDays,
+            taskStart, taskEnd, riskStart, riskEnd,
+        });
+    });
+
+    const dist = { planned: [], withOverrun: [], ev: [],
+                   nonCumPlanned: [], nonCumOverrun: [], nonCumEv: [] };
+    let cumHours = 0, cumOverrun = 0, cumEv = 0;
+    let currentDate = new Date(startDate);
+
+    while (currentDate <= endDate) {
+        let dailyPlanned = 0, dailyOverrun = 0, dailyEv = 0;
+        nodeDailyRates.forEach(r => {
+            if (r.taskStart <= currentDate && currentDate <= r.taskEnd) {
+                dailyPlanned += r.plannedDaily;
+            }
+            if (r.riskStart <= currentDate && currentDate <= r.riskEnd) {
+                dailyOverrun += r.riskDaily;
+                dailyEv      += r.evDaily;
+            }
+        });
+        cumHours += dailyPlanned;
+        cumOverrun += dailyOverrun;
+        cumEv += dailyEv;
+        const dateStr = calls.formatDateLocal(currentDate);
+        if (compDateSet.has(dateStr)) {
+            if (currentDate <= plannedEndDate) {
+                dist.planned.push({ date: dateStr, hours: cumHours });
+            }
+            dist.withOverrun.push({ date: dateStr, hours: cumOverrun });
+            dist.ev.push({ date: dateStr, hours: cumEv });
+            dist.nonCumPlanned.push({ date: dateStr, hours: dailyPlanned });
+            dist.nonCumOverrun.push({ date: dateStr, hours: dailyOverrun });
+            dist.nonCumEv.push({ date: dateStr, hours: dailyEv });
+        }
+        currentDate.setDate(currentDate.getDate() + 1);
+    }
+    return dist;
+}
+
+const forecastedDist = _buildForecastedDistributions(nodes, costRate);
+
 // Helper to make values JSON-safe (Infinity -> null, NaN -> null)
 function safe(v) {
     if (typeof v === 'number') {
@@ -303,6 +394,14 @@ const out = {
         frontierNodes: frontier,
     },
     timePhasedEvAtStatus: safe(evAtStatus),
+    distributions: forecastedDist ? {
+        planned:       forecastedDist.planned,
+        withOverrun:   forecastedDist.withOverrun,
+        ev:            forecastedDist.ev,
+        nonCumPlanned: forecastedDist.nonCumPlanned,
+        nonCumOverrun: forecastedDist.nonCumOverrun,
+        nonCumEv:      forecastedDist.nonCumEv,
+    } : null,
     predictedDates: nodes.map(n => ({
         id:                String(n.ID),
         predictedStart:    n.predictedStart instanceof Date

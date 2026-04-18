@@ -192,6 +192,194 @@ def _cumulative_points(matrix_sum, iso_dates, value_key='hours'):
 
 
 # ---------------------------------------------------------------------------
+# Sweep-line summed cumulative: O((N + D) log N) replacement for
+# _cumulative_matrix(...).sum(axis=0).  Mathematically identical:
+# per-activity contribution at date d is
+#     0                          if d <= start
+#     cap * (d - start) / (end - start)   if start < d < end
+#     cap                        if d >= end
+# The sum over activities becomes piecewise-linear with slope changes
+# at each event (start / end).  Events are sorted once; cum values at
+# each event are computed by prefix sum; query dates are resolved via
+# searchsorted + linear interpolation.
+#
+# Memory:  O(N + D)  instead of the matrix path's O(N x D).
+# Runtime: O((N + D) log N) instead of O(N * D).
+# ---------------------------------------------------------------------------
+
+def _cumulative_sum_sweep(starts, ends, caps, rates, dates):
+    """Return (hours_sum, cost_sum) (D,) arrays from activity events.
+
+    ``rates[i]`` is activity i's per-hour cost-rate multiplier so the
+    cost-sum scales every contribution by it.  Signatures match the
+    matrix path's ``(matrix.sum(axis=0), (matrix * rates[:, None]).sum(axis=0))``
+    outputs but never materialises the (N, D) matrix.
+    """
+    n = len(starts)
+    d = len(dates)
+    hours = np.zeros(d, dtype=np.float64)
+    cost = np.zeros(d, dtype=np.float64)
+    if n == 0 or d == 0:
+        return hours, cost
+
+    duration = ends - starts
+    # Per-activity rate of hour accrual (hours per second of wall-clock).
+    # Degenerate (duration <= 0) activities deposit their full cap as a
+    # step at start -- use zero-rate and a step entry instead.
+    nondeg = duration > 0
+    deg = ~nondeg
+
+    # --- Non-degenerate events: (time, +/- rate_h, +/- rate_c) ---
+    rate_h_pos = np.zeros(n, dtype=np.float64)
+    rate_h_pos[nondeg] = caps[nondeg] / duration[nondeg]
+    rate_c_pos = rate_h_pos * rates
+    # Two events per non-degenerate activity: +rate at start, -rate at end.
+    nd_idx = np.where(nondeg)[0]
+    ev_times = np.empty(2 * len(nd_idx), dtype=np.float64)
+    ev_times[0::2] = starts[nd_idx]
+    ev_times[1::2] = ends[nd_idx]
+    ev_drate_h = np.empty(2 * len(nd_idx), dtype=np.float64)
+    ev_drate_h[0::2] = rate_h_pos[nd_idx]
+    ev_drate_h[1::2] = -rate_h_pos[nd_idx]
+    ev_drate_c = np.empty(2 * len(nd_idx), dtype=np.float64)
+    ev_drate_c[0::2] = rate_c_pos[nd_idx]
+    ev_drate_c[1::2] = -rate_c_pos[nd_idx]
+    ev_step_h = np.zeros(2 * len(nd_idx), dtype=np.float64)
+    ev_step_c = np.zeros(2 * len(nd_idx), dtype=np.float64)
+
+    # --- Degenerate events: step of cap at start ---
+    if np.any(deg):
+        deg_idx = np.where(deg)[0]
+        deg_times = starts[deg_idx]
+        deg_step_h = caps[deg_idx]
+        deg_step_c = caps[deg_idx] * rates[deg_idx]
+        deg_drate = np.zeros(len(deg_idx), dtype=np.float64)
+        ev_times = np.concatenate([ev_times, deg_times])
+        ev_drate_h = np.concatenate([ev_drate_h, deg_drate])
+        ev_drate_c = np.concatenate([ev_drate_c, deg_drate])
+        ev_step_h = np.concatenate([ev_step_h, deg_step_h])
+        ev_step_c = np.concatenate([ev_step_c, deg_step_c])
+
+    if ev_times.size == 0:
+        return hours, cost
+
+    # Sort events by time.  Stable sort so ties keep insertion order.
+    order = np.argsort(ev_times, kind='stable')
+    ev_times = ev_times[order]
+    ev_drate_h = ev_drate_h[order]
+    ev_drate_c = ev_drate_c[order]
+    ev_step_h = ev_step_h[order]
+    ev_step_c = ev_step_c[order]
+
+    # Collapse events at the same time so cum_at_event_time is defined
+    # after ALL steps at that time but BEFORE any rate changes apply.
+    # unique() returns the first index of each group; we sum deltas
+    # within each group.
+    uniq_t, group_start = np.unique(ev_times, return_index=True)
+    # np.add.reduceat groups [group_start[k] : group_start[k+1]).
+    drate_h = np.add.reduceat(ev_drate_h, group_start)
+    drate_c = np.add.reduceat(ev_drate_c, group_start)
+    step_h = np.add.reduceat(ev_step_h, group_start)
+    step_c = np.add.reduceat(ev_step_c, group_start)
+
+    # Walk the events computing cum at each (AFTER any steps at that
+    # time, BEFORE that event's rate change applies).  Rate_after[k] is
+    # the slope in (uniq_t[k], uniq_t[k+1]].
+    k = len(uniq_t)
+    cum_h_at_event = np.empty(k, dtype=np.float64)
+    cum_c_at_event = np.empty(k, dtype=np.float64)
+    cur_rate_h = 0.0
+    cur_rate_c = 0.0
+    cur_cum_h = 0.0
+    cur_cum_c = 0.0
+    prev_t = uniq_t[0]
+    # At the first event: no prior accrual; steps apply first, then rate.
+    for kk in range(k):
+        dt = uniq_t[kk] - prev_t
+        if dt > 0:
+            cur_cum_h += cur_rate_h * dt
+            cur_cum_c += cur_rate_c * dt
+        cur_cum_h += step_h[kk]
+        cur_cum_c += step_c[kk]
+        cum_h_at_event[kk] = cur_cum_h
+        cum_c_at_event[kk] = cur_cum_c
+        cur_rate_h += drate_h[kk]
+        cur_rate_c += drate_c[kk]
+        prev_t = uniq_t[kk]
+    # Rate_after[kk] is the slope in segment (uniq_t[kk], uniq_t[kk+1]].
+    # cur_rate_h/c after the loop is the final rate; for dates past the
+    # last event, it should be ~0 (rates balance) and cum plateaus.
+    rate_h_after = np.empty(k, dtype=np.float64)
+    rate_c_after = np.empty(k, dtype=np.float64)
+    r_h = 0.0
+    r_c = 0.0
+    for kk in range(k):
+        r_h += drate_h[kk]
+        r_c += drate_c[kk]
+        rate_h_after[kk] = r_h
+        rate_c_after[kk] = r_c
+
+    # For each query date, find the largest event time <= date.
+    idx = np.searchsorted(uniq_t, dates, side='right') - 1
+    # Dates before the first event -> 0 cumulative.
+    before = idx < 0
+    idx_clip = np.where(before, 0, idx)
+    # Cumulative at segment start + rate * (date - segment_start).
+    seg_dt = dates - uniq_t[idx_clip]
+    hours_raw = cum_h_at_event[idx_clip] + rate_h_after[idx_clip] * seg_dt
+    cost_raw = cum_c_at_event[idx_clip] + rate_c_after[idx_clip] * seg_dt
+    hours = np.where(before, 0.0, hours_raw)
+    cost = np.where(before, 0.0, cost_raw)
+
+    return hours, cost
+
+
+def _period_sum_sweep(starts, ends, caps, rates, dates):
+    """Return (hours_sum, cost_sum) (D,) arrays of period (non-cumulative)
+    values.  Matches ``_period_matrix(...).sum(axis=0)`` semantics:
+    activity i contributes its daily_rate at every date d with
+    start_i <= d <= end_i (inclusive).
+    """
+    n = len(starts)
+    d = len(dates)
+    hours = np.zeros(d, dtype=np.float64)
+    cost = np.zeros(d, dtype=np.float64)
+    if n == 0 or d == 0:
+        return hours, cost
+
+    duration_days = np.maximum((ends - starts) / _SEC_PER_DAY, 1.0)
+    daily_h = caps / duration_days
+    daily_c = daily_h * rates
+
+    # Sort starts ascending + their rates; likewise for ends.  For each
+    # date d, active_rate = sum(daily where start <= d) - sum(daily
+    # where end < d)  -- strictly-less so activity still active at end.
+    start_order = np.argsort(starts, kind='stable')
+    end_order = np.argsort(ends, kind='stable')
+    s_sorted = starts[start_order]
+    e_sorted = ends[end_order]
+    s_cum_h = np.cumsum(daily_h[start_order])
+    s_cum_c = np.cumsum(daily_c[start_order])
+    e_cum_h = np.cumsum(daily_h[end_order])
+    e_cum_c = np.cumsum(daily_c[end_order])
+
+    start_idx = np.searchsorted(s_sorted, dates, side='right')
+    end_idx = np.searchsorted(e_sorted, dates, side='left')
+
+    def _sum_upto(cum, idx):
+        return np.where(idx > 0, cum[np.clip(idx - 1, 0, len(cum) - 1)], 0.0)
+
+    started_h = _sum_upto(s_cum_h, start_idx)
+    ended_h = _sum_upto(e_cum_h, end_idx)
+    started_c = _sum_upto(s_cum_c, start_idx)
+    ended_c = _sum_upto(e_cum_c, end_idx)
+
+    hours = started_h - ended_h
+    cost = started_c - ended_c
+    return hours, cost
+
+
+# ---------------------------------------------------------------------------
 # Per-activity state extraction (single pass, NumPy output)
 # ---------------------------------------------------------------------------
 
@@ -334,40 +522,29 @@ def build_forecasted_distributions(nodes, status_date, cost_rate, currency,
 
     dates = _dates_to_seconds(iso_dates)                  # (D,)
     rates = arrs['cost_rates']                            # (N,)
+    ev_caps = arrs['planned_hrs'] * arrs['pct']
 
-    # ---- Cumulative matrices ----
-    planned_cum = _cumulative_matrix(
-        arrs['task_start'], arrs['task_end'], arrs['planned_hrs'], dates)
-    risk_cum = _cumulative_matrix(
-        arrs['risk_start'], arrs['risk_end'], arrs['risk_hrs'], dates)
-    # EV "forecasted" curve time-phases by PLANNED dates, capped at
-    # planned_hrs * pct (reaching plateau earlier than planned_cum).
-    ev_cum = _cumulative_matrix(
+    # Sweep-line summed cumulatives + periods -- O((N+D) log N) and
+    # O(N+D) memory.  Byte-equivalent to the (N, D) matrix path.
+    planned_cum_h, planned_cum_c = _cumulative_sum_sweep(
         arrs['task_start'], arrs['task_end'],
-        arrs['planned_hrs'] * arrs['pct'], dates)
-
-    # ---- Non-cumulative matrices ----
-    planned_nc = _period_matrix(
-        arrs['task_start'], arrs['task_end'], arrs['planned_hrs'], dates)
-    risk_nc = _period_matrix(
-        arrs['risk_start'], arrs['risk_end'], arrs['risk_hrs'], dates)
-    ev_nc = _period_matrix(
+        arrs['planned_hrs'], rates, dates)
+    risk_cum_h, risk_cum_c = _cumulative_sum_sweep(
+        arrs['risk_start'], arrs['risk_end'],
+        arrs['risk_hrs'], rates, dates)
+    ev_cum_h, ev_cum_c = _cumulative_sum_sweep(
         arrs['task_start'], arrs['task_end'],
-        arrs['planned_hrs'] * arrs['pct'], dates)
+        ev_caps, rates, dates)
 
-    # Sum over activities for hours; multiply by cost_rate[:, None] then
-    # sum for cost.  Matches per-node rates (CostRate || cost_rate).
-    def sum_pair(matrix):
-        hrs = matrix.sum(axis=0)
-        cost = (matrix * rates[:, None]).sum(axis=0)
-        return hrs, cost
-
-    planned_cum_h, planned_cum_c = sum_pair(planned_cum)
-    risk_cum_h, risk_cum_c = sum_pair(risk_cum)
-    ev_cum_h, ev_cum_c = sum_pair(ev_cum)
-    planned_nc_h, planned_nc_c = sum_pair(planned_nc)
-    risk_nc_h, risk_nc_c = sum_pair(risk_nc)
-    ev_nc_h, ev_nc_c = sum_pair(ev_nc)
+    planned_nc_h, planned_nc_c = _period_sum_sweep(
+        arrs['task_start'], arrs['task_end'],
+        arrs['planned_hrs'], rates, dates)
+    risk_nc_h, risk_nc_c = _period_sum_sweep(
+        arrs['risk_start'], arrs['risk_end'],
+        arrs['risk_hrs'], rates, dates)
+    ev_nc_h, ev_nc_c = _period_sum_sweep(
+        arrs['task_start'], arrs['task_end'],
+        ev_caps, rates, dates)
 
     return {
         'distributionPlanned':           _cumulative_points(planned_cum_h, iso_dates, 'hours'),
@@ -495,19 +672,23 @@ def build_actual_distributions(nodes, status_date, cost_rate, currency,
     ev_end = np.where(case1, af_, ev_end)
     ev_cap = np.where(case1, planned, ev_cap)
 
-    ev_hist_matrix = _cumulative_matrix(ev_start, ev_end, ev_cap, dates)
+    # Sweep-line cumulative sums (hours only; earned cost = hours * project rate).
+    # Identity used here: np.where(mask[None, :], A, B).sum(axis=0) ==
+    # np.where(mask, A.sum(axis=0), B.sum(axis=0))  -- so summing first,
+    # masking second, matches the matrix path bit-for-bit.
+    ones_rates = np.ones(n_act, dtype=np.float64)
+    ev_hist_sum, _ = _cumulative_sum_sweep(
+        ev_start, ev_end, ev_cap, ones_rates, dates)
 
     # Future EV: case 4 -- predicted window when available, else fall
     # back to the historic cap (keeps curve flat past status_date).
     fut_start, fut_end, fut_cap = _assemble_case(
         has_pred, ps_, pe_, planned,
         fallback_start=ev_start, fallback_end=ev_end, fallback_cap=ev_cap)
-    ev_future_matrix = _cumulative_matrix(fut_start, fut_end, fut_cap, dates)
+    ev_future_sum, _ = _cumulative_sum_sweep(
+        fut_start, fut_end, fut_cap, ones_rates, dates)
 
-    # Combine historic + future by date using status_ts boundary
-    ev_matrix = np.where(historic_mask[None, :],
-                         ev_hist_matrix, ev_future_matrix)
-    earned_cum_h = ev_matrix.sum(axis=0)
+    earned_cum_h = np.where(historic_mask, ev_hist_sum, ev_future_sum)
     earned_cum_c = earned_cum_h * float(cost_rate)
 
     # ---------------------------------------------------------------
@@ -526,9 +707,8 @@ def build_actual_distributions(nodes, status_date, cost_rate, currency,
     ac_end = np.where(ac_eligible, ac_end, _ZERO_WINDOW_END)
 
     ac_cap_hours = np.where(ac_eligible, planned * pct, 0.0)
-    ac_hours_matrix = _cumulative_matrix(
-        ac_start, ac_end, ac_cap_hours, dates)
-    actual_cum_h = ac_hours_matrix.sum(axis=0)
+    actual_cum_h, _ = _cumulative_sum_sweep(
+        ac_start, ac_end, ac_cap_hours, ones_rates, dates)
 
     # Cost cap: explicit ActualCost (if positive and has_af) else imputed.
     explicit_ac_present = has_af & (arrs['actual_cost'] > 0)
@@ -537,19 +717,16 @@ def build_actual_distributions(nodes, status_date, cost_rate, currency,
         ac_eligible,
         np.where(explicit_ac_present, arrs['actual_cost'], cost_cap_imputed),
         0.0)
-    ac_cost_matrix = _cumulative_matrix(
-        ac_start, ac_end, ac_cap_cost, dates)
-    actual_cum_c = ac_cost_matrix.sum(axis=0)
+    actual_cum_c, _ = _cumulative_sum_sweep(
+        ac_start, ac_end, ac_cap_cost, ones_rates, dates)
 
     # ---------------------------------------------------------------
     # Predicted (future) curve
     # ---------------------------------------------------------------
     # Mirrors scalar version: predicted cumulative hours = time_phased_ev
     # for future dates (case 4); cost follows project rate.  Zero before
-    # status_date.
-    predicted_matrix = np.where(
-        historic_mask[None, :], 0.0, ev_future_matrix)
-    predicted_cum_h = predicted_matrix.sum(axis=0)
+    # status_date.  Uses the same sweep-line identity as earned above.
+    predicted_cum_h = np.where(historic_mask, 0.0, ev_future_sum)
     predicted_cum_c = predicted_cum_h * float(cost_rate)
 
     # ---------------------------------------------------------------
