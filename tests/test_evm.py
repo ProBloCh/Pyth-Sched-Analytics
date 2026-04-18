@@ -1172,6 +1172,93 @@ class TestDurationToWorkHoursCalendar:
         assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
 
 
+class TestAutoCompleteStartMilestoneJsParity:
+    """Locks Copilot fix: _auto_complete_start_milestone now mirrors
+    the JS reference autoCompleteStartMilestone (EVM.js 1355-1392):
+      - applies regardless of Duration value (no Duration==0 gate)
+      - sets ActualStart to the earliest ActualStart from non-zero nodes
+      - only fills missing fields rather than overwriting
+    """
+
+    def test_applies_when_duration_nonzero(self):
+        from evm.engine import _auto_complete_start_milestone
+        nodes = [
+            {'ID': '0', 'Duration': 1, 'TimeUnits': 'h'},  # not 0
+            {'ID': '1', 'Duration': 5, 'TimeUnits': 'days',
+             'ActualStart': '2025-01-15'},
+        ]
+        out = _auto_complete_start_milestone(nodes)
+        # Old port skipped patching when Duration != 0.  New port patches.
+        assert out[0]['PercentComplete'] == 100
+
+    def test_uses_earliest_actual_start_from_others(self):
+        from evm.engine import _auto_complete_start_milestone
+        from evm.helpers import safe_date
+        nodes = [
+            {'ID': '0', 'Duration': 0, 'Start': '2025-01-10'},
+            {'ID': '1', 'Duration': 5, 'TimeUnits': 'days',
+             'ActualStart': '2025-01-15'},
+            {'ID': '2', 'Duration': 5, 'TimeUnits': 'days',
+             'ActualStart': '2025-01-08'},  # earlier than #1
+        ]
+        out = _auto_complete_start_milestone(nodes)
+        ms = safe_date(out[0]['ActualStart'])
+        assert ms == safe_date('2025-01-08')
+
+    def test_preserves_existing_actual_start(self):
+        from evm.engine import _auto_complete_start_milestone
+        nodes = [
+            {'ID': '0', 'Duration': 0, 'ActualStart': '2025-01-01'},
+            {'ID': '1', 'Duration': 5, 'TimeUnits': 'days',
+             'ActualStart': '2025-01-15'},
+        ]
+        out = _auto_complete_start_milestone(nodes)
+        # Existing ActualStart wins over computed earliest.
+        assert out[0]['ActualStart'] == '2025-01-01'
+
+    def test_no_progress_no_patch(self):
+        from evm.engine import _auto_complete_start_milestone
+        nodes = [
+            {'ID': '0', 'Duration': 0, 'Start': '2025-01-10'},
+            {'ID': '1', 'Duration': 5, 'TimeUnits': 'days'},  # no ActualStart
+        ]
+        out = _auto_complete_start_milestone(nodes)
+        assert 'PercentComplete' not in out[0] or out[0].get(
+            'PercentComplete', 0) != 100
+
+
+class TestOutcomeStorageFlag:
+    """Locks Copilot fix: register_outcome surfaces the storage backend
+    in the returned record so the route can communicate Redis-fallback
+    degradation back to the client."""
+
+    def test_in_process_storage_flagged(self, monkeypatch):
+        import completion.outcomes as oc
+        # Force the in-process branch.
+        monkeypatch.setattr(oc, '_store', lambda: (None, oc._inproc))
+        rec = oc.register_outcome({
+            'project_id': 'STORAGE-1',
+            'predicted': {'p80_finish': '2026-01-01T00:00:00Z'},
+            'actual': {'finish': '2026-01-15T00:00:00Z'},
+        })
+        assert rec.get('storage') == 'in_process'
+
+    def test_redis_failure_flagged_as_fallback(self, monkeypatch):
+        import completion.outcomes as oc
+
+        class _BoomRedis:
+            def set(self, *a, **kw):
+                raise RuntimeError('redis went away')
+
+        monkeypatch.setattr(oc, '_store', lambda: (_BoomRedis(), None))
+        rec = oc.register_outcome({
+            'project_id': 'STORAGE-2',
+            'predicted': {'p80_finish': '2026-01-01T00:00:00Z'},
+            'actual': {'finish': '2026-01-15T00:00:00Z'},
+        })
+        assert rec.get('storage') == 'in_process_after_redis_failure'
+
+
 class TestOutcomeValidationHardening:
     """Locks Copilot fixes for completion/outcomes:
     - validate_outcome now parses timestamps and returns errors for

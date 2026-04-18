@@ -201,6 +201,7 @@ def register_outcome(record, ttl=None):
     key = f'outcomes:{rc_key}:{pid}'
 
     payload = json.dumps(rec, default=str)
+    storage = 'redis' if redis_cli is not None else 'in_process'
     try:
         if redis_cli is not None:
             redis_cli.set(key, payload, ex=(ttl or _DEFAULT_TTL_SECONDS))
@@ -209,12 +210,18 @@ def register_outcome(record, ttl=None):
         logger.info('Registered outcome project=%s class=%s', pid, rc_key)
     except Exception as exc:
         # Redis unavailable mid-flight: degrade to in-proc so the
-        # request still succeeds; client gets a warning in the response.
-        # When Redis is primary, fallback is None -- reach for _inproc
-        # directly so the recovery path is unconditional.
+        # request still succeeds.  When Redis is primary, fallback is
+        # None -- reach for _inproc directly so the recovery path is
+        # unconditional.  We surface the degraded mode via the returned
+        # `storage` field so the route layer can include it in the
+        # JSON response (the route currently passes the record through
+        # unchanged; with this field it can flag the in-proc fallback
+        # to the caller).
         logger.warning('Outcome storage failed (%s); using in-proc fallback',
                        exc)
         _inproc.set(key, payload, ttl=ttl)
+        storage = 'in_process_after_redis_failure'
+    rec['storage'] = storage
     return rec
 
 

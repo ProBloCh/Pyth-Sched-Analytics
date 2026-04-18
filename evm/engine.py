@@ -42,28 +42,53 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _auto_complete_start_milestone(nodes):
-    """If ID='0' is a milestone AND any task has ActualStart, mark it
-    complete.  Returns a new list so the caller's input isn't mutated.
+    """If ID='0' exists AND any task has ActualStart, mark the start
+    milestone complete.  Returns a new list so the caller's input isn't
+    mutated.
+
+    Mirrors the JS reference autoCompleteStartMilestone (EVM.js 1355-
+    1392):
+      - Apply when any non-zero node has ActualStart -- no Duration==0
+        gate (JS handles a Duration that wasn't set explicitly).
+      - Set the start node's ActualStart to the *earliest* ActualStart
+        across non-zero nodes (fallback to its own Start, then now()).
+      - Only fill ActualStart / ActualFinish / Duration when they
+        weren't already set, so callers retain their explicit values.
     """
     if not nodes:
         return nodes
-    any_progress = any(n.get('ActualStart') for n in nodes)
+    out = [dict(n) for n in nodes]
+
+    any_progress = any(n.get('ActualStart') for n in out)
     if not any_progress:
-        return [dict(n) for n in nodes]
+        return out
 
     start_id = '0'
-    out = []
-    for node in nodes:
-        if str(node.get('ID', node.get('id', ''))) == start_id and (
-                node.get('Duration') in (0, '0', 0.0)):
-            patched = dict(node)
-            patched['PercentComplete'] = 100
-            patched['ActualStart'] = patched.get('Start') or patched.get('ActualStart')
-            patched['ActualFinish'] = patched.get('Start') or patched.get('ActualFinish')
-            patched['ActualDuration'] = 0
-            out.append(patched)
-        else:
-            out.append(dict(node))
+    # Earliest ActualStart across non-zero nodes (mirrors JS lookup).
+    from datetime import datetime, timezone
+    from .helpers import safe_date
+    earliest = None
+    for n in out:
+        if str(n.get('ID', n.get('id', ''))) == start_id:
+            continue
+        a = safe_date(n.get('ActualStart'))
+        if a is not None and (earliest is None or a < earliest):
+            earliest = a
+
+    for n in out:
+        if str(n.get('ID', n.get('id', ''))) != start_id:
+            continue
+        n['PercentComplete'] = 100
+        if not n.get('ActualStart'):
+            n['ActualStart'] = (earliest
+                                or safe_date(n.get('Start'))
+                                or datetime.now(tz=timezone.utc))
+        if not n.get('ActualFinish'):
+            n['ActualFinish'] = n['ActualStart']
+        if n.get('Duration') in (None, '', '0'):
+            n['Duration'] = 0
+        n['ActualDuration'] = 0
+        break  # only one ID=='0' node
     return out
 
 
