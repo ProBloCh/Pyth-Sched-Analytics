@@ -28,7 +28,7 @@ from typing import Optional
 
 import numpy as np
 
-from solver.dag import build_dag, get_critical_path_indices
+from solver.dag import build_dag
 
 from .calendar import advance_working_ms, WorkingCalendar
 from evm.helpers import convert_to_hours
@@ -187,16 +187,22 @@ def _days_between_ms(a_ms, b_ms):
 # Deterministic CPM slack (float in hours)
 # ---------------------------------------------------------------------------
 
-def _compute_float_hours(dag_state, nodes, id_to_idx, calendar, hours_per_day):
+def _compute_float_hours(dag_state, nodes, id_to_idx, calendar, hours_per_day,
+                         working_days_per_week=5.0):
     """
     Per-activity total float in hours, aligned to DAG indices.
 
     The solver's CPM runs in the activity's native duration unit (i.e.,
     the Duration value with no unit conversion).  We convert that slack
     back to *hours* so the frontend's ``floatDays = floatHrs / hpd``
-    semantics apply cleanly.
+    semantics apply cleanly.  Week/month conversions honour the
+    caller's calendar (``working_days_per_week``) so 4x10 and 6-day
+    schedules produce correct float/leverage values.
     """
     n = dag_state.n
+    wpw = float(working_days_per_week) if working_days_per_week else 5.0
+    # Month = ~4.33 working weeks (matches evm/helpers.convert_to_hours)
+    month_days = wpw * 4.33
     # Determine per-activity time-unit scale to hours
     per_unit_hrs = np.ones(n, dtype=np.float64)
     for node in nodes:
@@ -213,9 +219,9 @@ def _compute_float_hours(dag_state, nodes, id_to_idx, calendar, hours_per_day):
             elif units in ('d', 'day', 'days'):
                 per_unit_hrs[j] = float(hours_per_day)
             elif units in ('w', 'wk', 'week', 'weeks'):
-                per_unit_hrs[j] = float(hours_per_day) * 5.0
+                per_unit_hrs[j] = float(hours_per_day) * wpw
             elif units in ('m', 'mo', 'month', 'months'):
-                per_unit_hrs[j] = float(hours_per_day) * 21.0
+                per_unit_hrs[j] = float(hours_per_day) * month_days
             else:
                 per_unit_hrs[j] = 1.0
         else:
@@ -627,7 +633,8 @@ def run_recovery_options(nodes, links, status_date,
     # Critical-path set: nodes with TF ~= 0.
     critical_set = set(int(i) for i in range(n) if dag_state.critical_mask[i])
     float_hrs = _compute_float_hours(dag_state, nodes, id_to_idx,
-                                     calendar, hours_per_day)
+                                     calendar, hours_per_day,
+                                     working_days_per_week)
 
     node_by_id = {str(node.get('ID', node.get('id', ''))): node
                   for node in nodes}

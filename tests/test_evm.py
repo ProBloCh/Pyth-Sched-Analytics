@@ -1079,3 +1079,104 @@ class TestBranchIsolation:
         # Caller's input must be untouched
         for orig, cur in zip(original, nodes):
             assert 'predictedStart' not in cur or cur.get('predictedStart') == orig.get('predictedStart')
+
+
+# =====================================================================
+# Idempotent normalisation helpers (holiday / working-day sets)
+# =====================================================================
+
+class TestNormaliseIdempotent:
+    """Locks the hot-path perf fix: _normalise_holiday_set and
+    _normalise_working_days return a pre-normalised set unchanged
+    instead of re-parsing, so update_predicted_values avoids
+    O(N * |holidays|) re-work inside _add/_subtract_working_hours.
+    """
+
+    def test_holiday_set_passed_through_unchanged(self):
+        from evm.forecast import _normalise_holiday_set
+        preset = {'2025-01-01', '2025-07-04'}
+        out = _normalise_holiday_set(preset)
+        assert out is preset
+
+    def test_working_days_set_passed_through_unchanged(self):
+        from evm.forecast import _normalise_working_days
+        preset = {0, 1, 2, 3, 4}
+        out = _normalise_working_days(preset)
+        assert out is preset
+
+    def test_frozenset_passed_through(self):
+        from evm.forecast import _normalise_holiday_set, _normalise_working_days
+        fh = frozenset({'2025-01-01'})
+        fwd = frozenset({0, 1, 2, 3, 4})
+        assert _normalise_holiday_set(fh) is fh
+        assert _normalise_working_days(fwd) is fwd
+
+    def test_list_still_gets_normalised(self):
+        from evm.forecast import _normalise_holiday_set, _normalise_working_days
+        assert _normalise_holiday_set(['2025-01-01', '2025-07-04']) == \
+            {'2025-01-01', '2025-07-04'}
+        assert _normalise_working_days([1, 2, 3, 4, 5]) == {0, 1, 2, 3, 4}
+
+    def test_empty_inputs(self):
+        from evm.forecast import _normalise_holiday_set, _normalise_working_days
+        assert _normalise_holiday_set(None) == set()
+        assert _normalise_holiday_set([]) == set()
+        assert _normalise_working_days(None) == {0, 1, 2, 3, 4}
+
+
+# =====================================================================
+# _compute_float_hours honours working_days_per_week
+# =====================================================================
+
+class TestRecoveryFloatHoursCalendar:
+    """Locks Copilot fix: _compute_float_hours uses caller's
+    working_days_per_week rather than the hardcoded 5.0 (week) and
+    21.0 (month) values."""
+
+    def test_week_scales_with_working_days_per_week(self):
+        import numpy as np
+        from completion.recovery import _compute_float_hours
+
+        class _FakeDag:
+            def __init__(self, tf):
+                self.n = len(tf)
+                self.TF = np.asarray(tf, dtype=np.float64)
+
+        nodes = [{'ID': '0', 'Duration': 1, 'TimeUnits': 'w'}]
+        dag = _FakeDag([2.0])
+        # 5-day week: 1 week slack = 40 hrs (5 * 8)
+        fh5 = _compute_float_hours(dag, nodes, {'0': 0},
+                                   calendar=object(),
+                                   hours_per_day=8.0,
+                                   working_days_per_week=5.0)
+        # 4-day week (4x10): 1 week slack = 40 hrs (4 * 10)
+        fh4x10 = _compute_float_hours(dag, nodes, {'0': 0},
+                                      calendar=object(),
+                                      hours_per_day=10.0,
+                                      working_days_per_week=4.0)
+        # 6-day week: 1 week slack = 48 hrs (6 * 8)
+        fh6 = _compute_float_hours(dag, nodes, {'0': 0},
+                                   calendar=object(),
+                                   hours_per_day=8.0,
+                                   working_days_per_week=6.0)
+        assert fh5[0] == 2.0 * 8.0 * 5.0     # 80
+        assert fh4x10[0] == 2.0 * 10.0 * 4.0 # 80
+        assert fh6[0] == 2.0 * 8.0 * 6.0     # 96
+
+    def test_default_week_stays_five_days(self):
+        """Default invocation (no working_days_per_week) must produce the
+        same result as the previous hardcoded 5.0 for backward compat."""
+        import numpy as np
+        from completion.recovery import _compute_float_hours
+
+        class _FakeDag:
+            def __init__(self, tf):
+                self.n = len(tf)
+                self.TF = np.asarray(tf, dtype=np.float64)
+
+        nodes = [{'ID': '0', 'Duration': 1, 'TimeUnits': 'w'}]
+        dag = _FakeDag([1.0])
+        fh = _compute_float_hours(dag, nodes, {'0': 0},
+                                  calendar=object(),
+                                  hours_per_day=8.0)
+        assert fh[0] == 1.0 * 8.0 * 5.0  # 40

@@ -276,9 +276,17 @@ def _normalise_holiday_set(holidays):
     """Accept iterable of 'YYYY-MM-DD' strings, ISO datetimes, or {'date': ...}
     dicts; return set of 'YYYY-MM-DD' strings.  Mirrors the JS
     _evmDateKey format so holiday lookups match.
+
+    Idempotent: a ``set`` / ``frozenset`` input is returned as-is so
+    callers that pre-normalise once at the top of a hot loop don't pay
+    a re-parse cost on every inner invocation.  A 10K-node predicted-
+    date pass through ``update_predicted_values`` with 20 holidays
+    previously did ~200K redundant parses; this cuts it to 1.
     """
     if not holidays:
-        return set()
+        return _EMPTY_FROZENSET
+    if isinstance(holidays, (set, frozenset)):
+        return holidays
     out = set()
     for h in holidays:
         if h is None:
@@ -299,16 +307,26 @@ def _normalise_working_days(working_days):
 
     Both conventions agree on 1-5 meaning Mon-Fri.  For Sun, JS uses 0
     and ISO uses 7; ``(d - 1) % 7`` correctly maps both to Python 6.
+
+    Idempotent: a ``set`` / ``frozenset`` input is returned as-is so
+    pre-normalised callers avoid re-work (same rationale as
+    ``_normalise_holiday_set``).
     """
     if not working_days:
-        return {0, 1, 2, 3, 4}
+        return _DEFAULT_WD_FROZENSET
+    if isinstance(working_days, (set, frozenset)):
+        return working_days
     out = set()
     for d in working_days:
         try:
             out.add((int(d) - 1) % 7)
         except (TypeError, ValueError):
             continue
-    return out or {0, 1, 2, 3, 4}
+    return out or _DEFAULT_WD_FROZENSET
+
+
+_EMPTY_FROZENSET = frozenset()
+_DEFAULT_WD_FROZENSET = frozenset({0, 1, 2, 3, 4})
 
 
 def _add_working_hours(start_dt, hours, calendar=None,
@@ -707,17 +725,21 @@ def update_predicted_values(nodes, links, status_date, schedule_multiplier,
     if working_days is None:
         working_days = [1, 2, 3, 4, 5]
 
-    # Pre-normalise the holiday set once so every call site uses the same
-    # 'YYYY-MM-DD' canonical form (saves per-call conversion overhead).
+    # Pre-normalise both sets once so every call site uses the same
+    # canonical form (saves per-call conversion overhead; the inner
+    # helpers detect a pre-normalised set and short-circuit).
     holiday_set = _normalise_holiday_set(holidays)
+    wd_set = _normalise_working_days(working_days)
 
     node_by_id = {str(n.get('ID', n.get('id', ''))): n for n in nodes}
 
-    # STEP 1: initial per-node assignment
+    # STEP 1: initial per-node assignment.  Pass the pre-normalised
+    # ``wd_set`` rather than the raw ``working_days`` list so the inner
+    # _add/_subtract_working_hours calls skip the re-parse.
     for n in nodes:
         _initial_predict(
             n, status_dt, schedule_multiplier, slip_days, safe_perf_delta,
-            hours_per_day, working_days, holidays=holiday_set)
+            hours_per_day, wd_set, holidays=holiday_set)
 
     # STEP 2: distance decay from frontier
     succ_map = _build_succ_map(links)
@@ -728,14 +750,14 @@ def update_predicted_values(nodes, links, status_date, schedule_multiplier,
     if frontier_ids:
         _apply_distance_decay(
             nodes, frontier_ids, node_by_id, succ_map,
-            safe_perf_delta, hours_per_day, working_days,
+            safe_perf_delta, hours_per_day, wd_set,
             decay_factor=decay_factor, holidays=holiday_set)
 
     # STEP 3: topological propagation under FS/SS/FF/SF + lag
     if links:
         _propagate_topologically(
             nodes, links, node_by_id,
-            hours_per_day, working_days_per_week, working_days,
+            hours_per_day, working_days_per_week, wd_set,
             holidays=holiday_set)
 
 
