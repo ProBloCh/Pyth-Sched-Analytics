@@ -734,7 +734,8 @@ def _deterministic_finish_ms(dag_state, remaining, earliest_start_ms,
 # ---------------------------------------------------------------------------
 
 def _maybe_build_calendar(nodes, dag_state, id_to_idx, status_ms,
-                          activity_metadata, project_context):
+                          activity_metadata, project_context,
+                          max_multiplier_cap=None):
     """
     Build a WorkingCalendar if project_context.calendar is supplied with
     sufficient information, else return None (wall-clock fall-back).
@@ -742,6 +743,11 @@ def _maybe_build_calendar(nodes, dag_state, id_to_idx, status_ms,
     A calendar is constructed when the context contains any of
     ``hours_per_day``, ``working_days``, or ``holidays``; if none are
     present the endpoint behaves as V1 (wall-clock time).
+
+    ``max_multiplier_cap`` is forwarded to ``estimate_horizon_days`` so
+    the precomputed calendar covers the worst-case Pareto-tier
+    multiplier.  Olympics/IT with 50x caps need a much longer horizon
+    than thin-tailed sectors with 3x caps.
     """
     ctx = project_context or {}
     if not isinstance(ctx, dict):
@@ -790,7 +796,9 @@ def _maybe_build_calendar(nodes, dag_state, id_to_idx, status_ms,
         pct = max(0.0, min(1.0, pct))
         total_work_hrs += total * (1.0 - pct)
 
-    horizon_days = estimate_horizon_days(total_work_hrs, hours_per_day)
+    horizon_days = estimate_horizon_days(
+        total_work_hrs, hours_per_day,
+        max_multiplier_cap=max_multiplier_cap)
 
     return WorkingCalendar.build(
         hours_per_day=hours_per_day,
@@ -842,11 +850,21 @@ def run_completion_mc(nodes, links, status_date,
     if n == 0:
         return _empty_result(status_date, t0)
 
+    # Resolve the effective Pareto-tier cap so the horizon sizing below
+    # covers the worst-case multiplier for this reference class.
+    # Falls back to config.max_mult_high when no class is set.
+    try:
+        _ref_for_cap = _resolve_reference_class(config)
+    except Exception:
+        _ref_for_cap = None
+    effective_cap = (_ref_for_cap['max_multiplier_cap']
+                     if _ref_for_cap else config.max_mult_high)
+
     # Build working calendar from project_context when supplied.  Absence
     # falls back to V1 wall-clock semantics (see _duration_to_ms).
     calendar = _maybe_build_calendar(
         nodes, dag_state, id_to_idx, status_ms, activity_metadata,
-        project_context)
+        project_context, max_multiplier_cap=effective_cap)
 
     (remaining, earliest_start_ms, risk, activity_types,
      in_scope, actual_finish_ms) = _build_scope(

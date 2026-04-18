@@ -201,8 +201,11 @@ def _compute_float_hours(dag_state, nodes, id_to_idx, calendar, hours_per_day,
     """
     n = dag_state.n
     wpw = float(working_days_per_week) if working_days_per_week else 5.0
-    # Month = ~4.33 working weeks (matches evm/helpers.convert_to_hours)
-    month_days = wpw * 4.33
+    # Reuse the shared weeks/month constant so float math stays
+    # aligned with evm.helpers.convert_to_hours and
+    # completion.monte_carlo._duration_to_work_hours.
+    from .monte_carlo import _WEEKS_PER_MONTH
+    month_days = wpw * _WEEKS_PER_MONTH
     # Determine per-activity time-unit scale to hours
     per_unit_hrs = np.ones(n, dtype=np.float64)
     for node in nodes:

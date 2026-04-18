@@ -1159,6 +1159,38 @@ class TestDurationToWorkHoursCalendar:
         assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
 
 
+class TestEstimateHorizonScalesWithCap:
+    """Locks Copilot fix: estimate_horizon_days derives safety_factor
+    from the configured max_multiplier_cap so 50x Olympics/IT caps
+    don't clip to the end of the precomputed calendar."""
+
+    def test_large_cap_gives_longer_horizon(self):
+        from completion.calendar import estimate_horizon_days
+        # 200 remaining working hours at 8 hpd = 25 deterministic days.
+        # Default cap None -> safety_factor=6 -> 150 days (>= min 30).
+        # Cap=50 -> safety_factor=75 -> ~1875 days.
+        h_default = estimate_horizon_days(200, 8.0)
+        h_50x = estimate_horizon_days(200, 8.0, max_multiplier_cap=50.0)
+        h_3x = estimate_horizon_days(200, 8.0, max_multiplier_cap=3.0)
+        assert h_50x > h_default, (h_50x, h_default)
+        # Small-cap sectors (cap<6/1.5=4) fall back to the 6x floor.
+        assert h_3x == h_default
+
+    def test_explicit_safety_factor_overrides_cap(self):
+        from completion.calendar import estimate_horizon_days
+        h_explicit = estimate_horizon_days(
+            200, 8.0, safety_factor=10.0, max_multiplier_cap=50.0)
+        # 25 * 10 = 250 days
+        assert h_explicit == 250
+
+    def test_capped_at_max_days(self):
+        from completion.calendar import estimate_horizon_days
+        # 10000 hours at 8hpd = 1250 days, cap 100 -> safety 150 ->
+        # 187500 days, clipped to 3650 (10-year max).
+        assert estimate_horizon_days(
+            10000, 8.0, max_multiplier_cap=100.0) == 3650
+
+
 # =====================================================================
 # _compute_float_hours honours working_days_per_week
 # =====================================================================

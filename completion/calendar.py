@@ -286,17 +286,31 @@ def advance_working_ms(start_ms, work_hours, cal):
 # ---------------------------------------------------------------------------
 
 def estimate_horizon_days(remaining_hours_total, hours_per_day,
-                          safety_factor=6.0, min_days=30, max_days=3650):
+                          safety_factor=None, min_days=30, max_days=3650,
+                          max_multiplier_cap=None):
     """
     Days of calendar to precompute.
 
     Heuristic: deterministic_remaining_working_days * safety_factor.
-    Safety factor of 6 covers the worst-case Pareto-tier multiplier
-    (~10x) plus weekend/holiday padding for a 5-day working week.
+    The safety factor is derived from the configured Pareto-tier cap
+    (``max_multiplier_cap``) so thin-tailed sectors get a smaller
+    horizon and fat-tailed classes (Olympics/IT with 50x caps, nuclear
+    new build with 20x caps) get enough to avoid ``advance_working_ms``
+    clipping.  Formula: max(6, ceil(cap * 1.5)) -- covers cap x blend=1
+    plus 50% weekend/holiday padding.  Fallback is 6 (the historic
+    default, sized for a 10x Pareto cap).
+
+    Explicit ``safety_factor`` overrides the derivation; pass None
+    (default) to let the cap drive it.
 
     Capped at 10 years to bound memory (3650 days = ~29 KB of arrays).
     """
     if hours_per_day <= 0 or remaining_hours_total <= 0:
         return min_days
+    if safety_factor is None:
+        if max_multiplier_cap is not None and max_multiplier_cap > 0:
+            safety_factor = max(6.0, float(max_multiplier_cap) * 1.5)
+        else:
+            safety_factor = 6.0
     det_days = remaining_hours_total / hours_per_day
     return int(np.clip(np.ceil(det_days * safety_factor), min_days, max_days))
