@@ -6,7 +6,17 @@ No external dependencies beyond numpy.
 """
 
 from dataclasses import dataclass, field
+import logging
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+# Rate-limited warning flag for malformed non-sentinel Duration values
+# in build_activity_params.  Same rationale as solver/dag.py:_dur --
+# route-layer validators catch this in the normal flow; this is
+# defense-in-depth + observability for any internal caller that
+# bypasses validation.
+_DUR_WARNED = {'emitted': False}
 
 # Phase-dependent default weights (from design doc)
 PHASE_WEIGHTS = {
@@ -143,13 +153,23 @@ def build_activity_params(nodes, activity_metadata):
         aid = str(node.get('ID', node.get('id', '')))
         ids.append(aid)
         dur_raw = node.get('Duration', node.get('duration', 1.0))
-        # Milestones commonly pass '' / None / 0 for Duration; treat as 0.
-        if dur_raw in ('', None):
+        # Explicit milestone sentinels -> 0 silently.
+        if dur_raw in ('', None, 0, 0.0, '0'):
             dur = 0.0
         else:
             try:
                 dur = float(dur_raw)
             except (TypeError, ValueError):
+                # Malformed (non-numeric, non-sentinel) Duration:
+                # log once with the node ID so field diagnostics can
+                # find "Duration = 'abc'" rather than the silently-
+                # zero activity it would otherwise become.
+                if not _DUR_WARNED['emitted']:
+                    logger.warning(
+                        "build_activity_params: node id=%s has non-numeric "
+                        "Duration=%r; treating as zero (further warnings "
+                        "suppressed for this build).", aid, dur_raw)
+                    _DUR_WARNED['emitted'] = True
                 dur = 0.0
         durs.append(dur)
 

@@ -137,15 +137,29 @@ def build_dag(nodes, links):
 
     topo_arr = np.array(topo, dtype=np.int64)
 
+    # Rate-limited warning for malformed non-sentinel Duration values
+    # so field diagnostics surface "Duration = 'abc'" rather than
+    # silently turning a real activity into a zero-duration milestone.
+    # The route-layer validators catch this before we get here in the
+    # normal flow; this is defense-in-depth + observability for any
+    # internal caller that bypasses the route validator.
+    _DUR_WARNED = {'emitted': False}
+
     def _dur(node):
-        # Milestones may pass '' / None for Duration; treat as zero
-        # rather than crashing the caller with a float('') ValueError.
         v = node.get('Duration', node.get('duration', 1.0))
-        if v in ('', None):
+        # Explicit milestone sentinels -> 0.0 silently.
+        if v in ('', None, 0, 0.0, '0'):
             return 0.0
         try:
             return float(v)
         except (TypeError, ValueError):
+            if not _DUR_WARNED['emitted']:
+                logger.warning(
+                    "build_dag: node id=%s has non-numeric Duration=%r; "
+                    "treating as zero (further warnings suppressed for "
+                    "this build).",
+                    node.get('ID', node.get('id', '<unknown>')), v)
+                _DUR_WARNED['emitted'] = True
             return 0.0
     durations = np.array([_dur(nodes[i]) for i in range(n)],
                          dtype=np.float64)

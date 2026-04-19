@@ -333,17 +333,28 @@ def _parse_request(validator=_validate):
 
 
 def _serialise(obj):
-    """Recursively convert numpy types to native Python for JSON."""
+    """Recursively convert numpy types + non-finite floats to JSON-safe
+    values.  NaN and Infinity become `null` because browser JSON.parse
+    rejects 'NaN' / 'Infinity' literals; callers should treat null as
+    a non-finite indicator.  Mirrors evm/routes.py::_serialise so both
+    services have the same cross-runtime contract.
+    """
     if isinstance(obj, dict):
         return {k: _serialise(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_serialise(v) for v in obj]
     if isinstance(obj, np.ndarray):
-        return obj.tolist()
+        # Recurse so each element is scrubbed (tolist() preserves
+        # NaN / Infinity which json.dumps then emits as invalid JSON).
+        return [_serialise(v) for v in obj.tolist()]
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating,)):
-        return float(obj)
+        obj = float(obj)
+    if isinstance(obj, float):
+        if not math.isfinite(obj):
+            return None
+        return obj
     if isinstance(obj, (np.bool_,)):
         return bool(obj)
     return obj

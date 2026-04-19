@@ -1172,6 +1172,77 @@ class TestDurationToWorkHoursCalendar:
         assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
 
 
+class TestMalformedDurationWarns:
+    """Locks Copilot fix: solver/dag and solver/models log a warning
+    (with node ID) for non-sentinel malformed Duration values instead
+    of silently turning a real activity into a zero-duration milestone.
+    """
+
+    def test_dag_non_numeric_duration_warns(self, caplog):
+        import logging
+        import solver.dag as d
+        d._DUR_WARNED = {'emitted': False}  # reset rate-limit flag
+        with caplog.at_level(logging.WARNING, logger='solver.dag'):
+            d.build_dag(
+                nodes=[{'ID': 'X', 'Duration': 'abc'}],
+                links=[])
+        assert any("non-numeric Duration" in r.message
+                   and "'abc'" in r.message for r in caplog.records)
+
+    def test_dag_sentinel_silent(self, caplog):
+        import logging
+        import solver.dag as d
+        d._DUR_WARNED = {'emitted': False}
+        with caplog.at_level(logging.WARNING, logger='solver.dag'):
+            d.build_dag(
+                nodes=[{'ID': 'A', 'Duration': ''},
+                       {'ID': 'B', 'Duration': None},
+                       {'ID': 'C', 'Duration': '0'}],
+                links=[])
+        # Sentinels are silent -- no "non-numeric" warning.
+        assert not any("non-numeric" in r.message for r in caplog.records)
+
+    def test_models_non_numeric_duration_warns(self, caplog):
+        import logging
+        import solver.models as sm
+        sm._DUR_WARNED = {'emitted': False}
+        with caplog.at_level(logging.WARNING, logger='solver.models'):
+            sm.build_activity_params(
+                nodes=[{'ID': 'Y', 'Duration': 'bogus'}],
+                activity_metadata={})
+        assert any("non-numeric Duration" in r.message
+                   and "'bogus'" in r.message for r in caplog.records)
+
+
+class TestCompletionSerialiseNonFinite:
+    """Locks Copilot fix: completion/routes._serialise scrubs
+    NaN/Infinity to null so the response is always valid JSON
+    regardless of numpy edge-case outputs.  Mirrors evm/routes.
+    """
+
+    def test_nan_becomes_null(self):
+        import math
+        from completion.routes import _serialise
+        assert _serialise(float('nan')) is None
+        assert _serialise(float('inf')) is None
+        assert _serialise(float('-inf')) is None
+        assert _serialise(1.5) == 1.5
+
+    def test_ndarray_with_nan_becomes_null_list(self):
+        import numpy as np
+        from completion.routes import _serialise
+        arr = np.array([1.0, float('nan'), float('inf'), 3.0])
+        assert _serialise(arr) == [1.0, None, None, 3.0]
+
+    def test_nested_dict_recurses(self):
+        import math
+        from completion.routes import _serialise
+        payload = {'p50': float('inf'), 'ok': 2.5,
+                   'arr': [float('nan'), 4.0]}
+        out = _serialise(payload)
+        assert out == {'p50': None, 'ok': 2.5, 'arr': [None, 4.0]}
+
+
 class TestCalibrationEarlyFinishClamp:
     """Locks Copilot fix: calibration_report clamps early-finish
     actual_overrun to 0 so a project that came in ahead of baseline
