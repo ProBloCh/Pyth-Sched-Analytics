@@ -56,6 +56,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -134,6 +135,18 @@ _REQUIRED_TOP = ('project_id', 'predicted', 'actual')
 _REQUIRED_PREDICTED = ('p80_finish',)
 _REQUIRED_ACTUAL = ('finish',)
 
+# project_id and reference_class are interpolated into Redis key names
+# and SCAN match patterns.  Restrict to a conservative charset so glob
+# metacharacters (`*`, `?`, `[`) in a user-supplied reference_class
+# can't expand the scan to other classes / leak aggregate stats across
+# tenants.  Alphanumeric + underscore + hyphen + dot covers every
+# built-in class name and every reasonable project ID.
+_SAFE_ID_PATTERN = re.compile(r'^[A-Za-z0-9_.\-]+$')
+
+
+def _is_safe_id(value):
+    return bool(value) and bool(_SAFE_ID_PATTERN.match(str(value)))
+
 
 def validate_outcome(record):
     """Returns list of error strings (empty -> valid)."""
@@ -144,8 +157,13 @@ def validate_outcome(record):
         if k not in record:
             errs.append(f'missing required field {k!r}')
     pid = record.get('project_id')
-    if pid is not None and (not isinstance(pid, str) or not pid.strip()):
-        errs.append('project_id must be a non-empty string')
+    if pid is not None:
+        if not isinstance(pid, str) or not pid.strip():
+            errs.append('project_id must be a non-empty string')
+        elif not _is_safe_id(pid.strip()):
+            errs.append(
+                "project_id must contain only letters, digits, "
+                "'_', '-', '.' (Redis key safety)")
 
     pred = record.get('predicted') or {}
     if not isinstance(pred, dict):
@@ -178,8 +196,13 @@ def validate_outcome(record):
                         f'timestamp: {a_finish!r}')
 
     rc = record.get('reference_class')
-    if rc is not None and not isinstance(rc, str):
-        errs.append('reference_class must be a string or null')
+    if rc is not None:
+        if not isinstance(rc, str):
+            errs.append('reference_class must be a string or null')
+        elif rc and not _is_safe_id(rc):
+            errs.append(
+                "reference_class must contain only letters, digits, "
+                "'_', '-', '.' (Redis SCAN pattern safety)")
 
     return errs
 
@@ -228,7 +251,15 @@ def register_outcome(record, ttl=None):
 def list_outcomes(reference_class=None, limit=_MAX_REPORT_OUTCOMES):
     """Yield outcome records.  When reference_class is set, only that
     class's records are returned.  Limit caps the total to avoid
-    pathological responses."""
+    pathological responses.
+
+    Defense-in-depth: reject unsafe reference_class values (glob
+    metacharacters) so a caller that bypasses the route validator
+    can't widen the SCAN pattern to other classes.
+    """
+    if reference_class is not None and not _is_safe_id(reference_class):
+        return  # yield nothing; caller sees an empty report
+
     redis_cli, fallback = _store()
     rc_key = reference_class or '*'
     pattern = f'outcomes:{rc_key}:*' if reference_class else 'outcomes:*'

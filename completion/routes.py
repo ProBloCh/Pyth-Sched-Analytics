@@ -501,6 +501,15 @@ def calibration_report_route():
     if request.method == 'OPTIONS':
         return jsonify({'status': 'ok'})
     rc = request.args.get('reference_class')
+    # Reject Redis SCAN glob metacharacters in the query param before
+    # forwarding to calibration_report.  Prevents a caller from
+    # widening the scan to other classes via `*`/`?`/`[`.
+    if rc is not None:
+        from .outcomes import _is_safe_id
+        if rc and not _is_safe_id(rc):
+            return jsonify({
+                'error': "reference_class must contain only letters, "
+                         "digits, '_', '-', '.'"}), 400
     from .outcomes import calibration_report
     try:
         return jsonify(calibration_report(reference_class=rc))

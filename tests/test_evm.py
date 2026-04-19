@@ -1172,6 +1172,55 @@ class TestDurationToWorkHoursCalendar:
         assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
 
 
+class TestOutcomeKeySafety:
+    """Locks Copilot fix: project_id and reference_class in outcomes
+    are interpolated into Redis key names / SCAN match patterns and
+    must be restricted to a safe charset so glob metacharacters can't
+    widen the scan and leak aggregate stats across classes/tenants."""
+
+    def test_register_rejects_glob_in_reference_class(self):
+        from completion.outcomes import validate_outcome
+        errs = validate_outcome({
+            'project_id': 'P1',
+            'reference_class': 'oil_gas_*',  # glob metachar
+            'predicted': {'p80_finish': '2026-12-31T00:00:00Z'},
+            'actual': {'finish': '2027-01-15T00:00:00Z'},
+        })
+        assert any('reference_class' in e for e in errs), errs
+
+    def test_register_rejects_glob_in_project_id(self):
+        from completion.outcomes import validate_outcome
+        errs = validate_outcome({
+            'project_id': 'PRJ-?[1-9]',  # glob metachar
+            'reference_class': 'oil_gas_offshore',
+            'predicted': {'p80_finish': '2026-12-31T00:00:00Z'},
+            'actual': {'finish': '2027-01-15T00:00:00Z'},
+        })
+        assert any('project_id' in e for e in errs), errs
+
+    def test_register_accepts_safe_ids(self):
+        from completion.outcomes import validate_outcome
+        errs = validate_outcome({
+            'project_id': 'PRJ-2026.01_test',  # letters/digits/_-.
+            'reference_class': 'oil_gas-offshore.v2',
+            'predicted': {'p80_finish': '2026-12-31T00:00:00Z'},
+            'actual': {'finish': '2027-01-15T00:00:00Z'},
+        })
+        assert errs == []
+
+    def test_calibration_report_rejects_glob_query_param(self, client):
+        resp = client.get(
+            '/completion/calibration-report?reference_class=oil_gas_*')
+        assert resp.status_code == 400
+
+    def test_list_outcomes_bypass_attempt_yields_nothing(self):
+        import completion.outcomes as oc
+        # Even if something bypasses the route validator, list_outcomes
+        # yields nothing rather than running the glob SCAN.
+        records = list(oc.list_outcomes(reference_class='foo_*'))
+        assert records == []
+
+
 class TestMalformedDurationWarns:
     """Locks Copilot fix: solver/dag and solver/models log a warning
     (with node ID) for non-sentinel malformed Duration values instead
