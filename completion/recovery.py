@@ -421,8 +421,11 @@ def _build_lag_candidates(links, id_to_idx, node_by_id, critical_set,
             'id': f'{src}->{tgt}',
             'source': src,
             'target': tgt,
-            'source_name': node_by_id.get(src, {}).get('Name', src),
-            'target_name': node_by_id.get(tgt, {}).get('Name', tgt),
+            # Use _node_name for case-insensitive name lookup (Name /
+            # name / ID fallback) so lag options display consistent
+            # labels with crash options elsewhere in this module.
+            'source_name': _node_name(node_by_id.get(src, {'ID': src})),
+            'target_name': _node_name(node_by_id.get(tgt, {'ID': tgt})),
             'relation_type': str(link.get('type', 'FS')).upper(),
             'lag_hrs': round(lag_hrs, 2),
             'lag_days': round(lag_days, 2),

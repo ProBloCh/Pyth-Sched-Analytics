@@ -1172,6 +1172,32 @@ class TestDurationToWorkHoursCalendar:
         assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
 
 
+class TestLagCandidateNameCasing:
+    """Locks Copilot fix: lag candidates use _node_name so both
+    capitalized Name and lowercase name work, matching crash options.
+    """
+
+    def test_lowercase_name_used(self, client):
+        resp = client.post('/completion/recovery-options', json={
+            'nodes': [
+                {'ID': 'A', 'name': 'Design Phase',
+                 'Duration': 5, 'TimeUnits': 'days'},
+                {'ID': 'B', 'name': 'Procurement',
+                 'Duration': 10, 'TimeUnits': 'days'},
+            ],
+            'links': [{'source': 'A', 'target': 'B', 'type': 'FS',
+                       'lag': 5, 'lagUnits': 'd'}],
+            'status_date': '2025-01-01T00:00:00Z',
+        })
+        assert resp.status_code == 200
+        data = resp.get_json()
+        if data.get('lag_candidates'):
+            c = data['lag_candidates'][0]
+            # Should show names, not IDs.
+            assert c['source_name'] == 'Design Phase'
+            assert c['target_name'] == 'Procurement'
+
+
 class TestMCConfigTypeGuards:
     """Locks Copilot fix: _validate_mc_config rejects non-dict
     thresholds / caps / custom_reference_classes with 400 rather than
