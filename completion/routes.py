@@ -513,12 +513,17 @@ def reference_classes():
         list_reference_classes, REFERENCE_CLASS_TIERS,
         EXTERNAL_CLASS_TIERS, ALIASES, effective_registry,
     )
+    # Don't leak the server filesystem path -- expose only whether an
+    # external registry is configured.  The actual location is an
+    # operator-side concern; the frontend only needs to know whether
+    # additional classes might be present beyond the built-ins.
     return jsonify({
-        'classes':       list_reference_classes(effective_registry()),
-        'aliases':       ALIASES,
-        'builtin_count': len(REFERENCE_CLASS_TIERS),
-        'external_count': len(EXTERNAL_CLASS_TIERS),
-        'external_path': os.environ.get('PYTH_REFERENCE_CLASSES_PATH', ''),
+        'classes':            list_reference_classes(effective_registry()),
+        'aliases':            ALIASES,
+        'builtin_count':      len(REFERENCE_CLASS_TIERS),
+        'external_count':     len(EXTERNAL_CLASS_TIERS),
+        'external_configured': bool(
+            os.environ.get('PYTH_REFERENCE_CLASSES_PATH')),
     })
 
 

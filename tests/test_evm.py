@@ -1172,6 +1172,33 @@ class TestDurationToWorkHoursCalendar:
         assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
 
 
+class TestReferenceClassesDiscoveryNoPathLeak:
+    """Locks Copilot fix: /completion/reference-classes does not leak
+    the server's PYTH_REFERENCE_CLASSES_PATH filesystem location.
+    Returns a boolean external_configured flag instead.
+    """
+
+    def test_no_external_path_in_response(self, client, monkeypatch):
+        monkeypatch.setenv('PYTH_REFERENCE_CLASSES_PATH',
+                           '/etc/secret/path/to/classes.json')
+        resp = client.get('/completion/reference-classes')
+        assert resp.status_code == 200
+        data = resp.get_json()
+        # No filesystem path leaked.
+        assert 'external_path' not in data
+        # The boolean flag is set.
+        assert data.get('external_configured') is True
+        # The response body doesn't contain the path string anywhere.
+        body = resp.get_data(as_text=True)
+        assert '/etc/secret/path' not in body
+
+    def test_external_configured_false_when_unset(self, client, monkeypatch):
+        monkeypatch.delenv('PYTH_REFERENCE_CLASSES_PATH', raising=False)
+        resp = client.get('/completion/reference-classes')
+        assert resp.status_code == 200
+        assert resp.get_json().get('external_configured') is False
+
+
 class TestEmptyJSONObjectFallsThrough:
     """Locks Copilot fix: `{}` is a valid JSON root and should fall
     through to validation rather than 400'ing as 'missing JSON body'.

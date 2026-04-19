@@ -2476,6 +2476,15 @@ async function getCumulativeDistributionAsync(nodes, links) {
                     f.evDistribution, f.allDates);
             } catch (e) { console.warn('[EVM] populateForecastedEVMTable:', e); }
         }
+        // Render the chart -- the sync getCumulativeDistribution path
+        // calls createEVMCharts('forecasted','Cumulative') after metrics
+        // are populated; without this the backend-success path leaves
+        // the forecasted chart blank/stale.
+        if (typeof createEVMCharts === 'function') {
+            try {
+                createEVMCharts(window.evmMetrics, 'forecasted', 'Cumulative');
+            } catch (e) { console.warn('[EVM] createEVMCharts forecasted:', e); }
+        }
         console.log('[EVM] Backend forecasted branch applied:', {
             SPI: f?.SPI_model, CPI: f?.CPIcum_model, EAC: f?.EAC,
             computation_ms: result.computation_ms,
@@ -2533,6 +2542,16 @@ async function createActualEVMChartAsync(nodes, links) {
                     a.allDates, a.transitionPointIndex,
                     result.currency);
             } catch (e) { console.warn('[EVM] populateActualEVMTable:', e); }
+        }
+        // Render the chart -- the sync createActualEVMChart path calls
+        // createActualSingleEVMChart('actual','Cumulative') after
+        // metrics are populated; without this the backend-success path
+        // leaves the actual chart blank/stale.
+        if (typeof createActualSingleEVMChart === 'function') {
+            try {
+                createActualSingleEVMChart(
+                    window.evmMetrics, 'actual', 'Cumulative');
+            } catch (e) { console.warn('[EVM] createActualSingleEVMChart:', e); }
         }
         console.log('[EVM] Backend actual branch applied:', {
             SPI: a?.SPI_model, CPI: a?.CPIcum_model, EAC: a?.EAC,
