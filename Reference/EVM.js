@@ -2370,7 +2370,17 @@ function _evmBuildRequestBody(nodes, links) {
         : ((cfg && cfg.WORKING_DAYS_PER_WEEK) || 5);
     const holidaysList = (teamCal && Array.isArray(teamCal.holidays))
         ? teamCal.holidays.slice() : [];
-    const startNode = (nodes || []).find(n => String(n.ID) === '0') || (nodes || [])[0] || {};
+    // Require a proper start milestone (ID === '0').  The sync paths
+    // (getCumulativeDistribution / createActualEVMChart) treat a missing
+    // start node as an error and return early; picking an arbitrary
+    // first node here would silently send the wrong costRate / currency
+    // to the backend and break transparent-fallback parity.  Return
+    // null so the async wrappers can detect this and fall through to
+    // the sync path, which will surface the same error the user would
+    // have seen without the backend wrapper.
+    const startNode = (nodes || []).find(n => String(n.ID) === '0');
+    if (!startNode) return null;
+
     const statusDate = (window.cybereumState && window.cybereumState.dataDate)
         ? new Date(window.cybereumState.dataDate).toISOString()
         : new Date().toISOString();
@@ -2418,6 +2428,16 @@ async function _ensureEvmAnalysis(nodes, links) {
         _evmRecordTelemetry('call');
         try {
             const body = _evmBuildRequestBody(nodes, links);
+            if (body === null) {
+                // _evmBuildRequestBody returned null -- missing
+                // ID==='0' start milestone.  Raise a distinguishable
+                // error so the outer wrapper falls through to the
+                // sync path, which treats this as an error condition
+                // and returns early (transparent-fallback parity).
+                const e = new Error('missing_start_milestone');
+                e.__evmReason = 'prereqs_missing';
+                throw e;
+            }
             const resp = await fetch(evmBackendConfig.evmEndpoint, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -2520,9 +2540,10 @@ async function getCumulativeDistributionAsync(nodes, links) {
         });
     } catch (err) {
         _evmRecordTelemetry('fallback', {
-            reason: err?.__evmStatus != null
-                    ? 'non_ok_status'
-                    : (err?.name === 'AbortError' ? 'timeout' : 'network_error'),
+            reason: err?.__evmReason
+                    || (err?.__evmStatus != null
+                        ? 'non_ok_status'
+                        : (err?.name === 'AbortError' ? 'timeout' : 'network_error')),
             status: err?.__evmStatus,
             message: err?.message || String(err),
         });
@@ -2591,9 +2612,10 @@ async function createActualEVMChartAsync(nodes, links) {
         });
     } catch (err) {
         _evmRecordTelemetry('fallback', {
-            reason: err?.__evmStatus != null
-                    ? 'non_ok_status'
-                    : (err?.name === 'AbortError' ? 'timeout' : 'network_error'),
+            reason: err?.__evmReason
+                    || (err?.__evmStatus != null
+                        ? 'non_ok_status'
+                        : (err?.name === 'AbortError' ? 'timeout' : 'network_error')),
             status: err?.__evmStatus,
             message: err?.message || String(err),
         });
