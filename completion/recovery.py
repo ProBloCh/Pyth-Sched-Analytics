@@ -453,7 +453,10 @@ def _normalise_link_lags(links, hours_per_day=8.0, working_days_per_week=5.0):
     out = []
     for link in links or []:
         if not isinstance(link, dict):
-            out.append(link)
+            # solver.dag.build_dag calls link.get(...) unconditionally,
+            # so passing a non-dict through here would crash any
+            # internal caller that bypasses the route-layer validators.
+            # Skip rather than propagate garbage.
             continue
         raw = link.get('lag', 0) or 0
         units = link.get('lagUnits') or link.get('TimeUnits') or 'h'

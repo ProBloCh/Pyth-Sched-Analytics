@@ -57,6 +57,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -81,30 +82,46 @@ _MAX_REPORT_OUTCOMES = int(
 class _InProcStore:
     """Fallback when Redis isn't available.  TTL-honouring in-process
     dict.  Lost on process restart; never use as the only store in
-    production."""
+    production.
+
+    Thread-safe via an RLock: the project runs under gunicorn with
+    threads=2 and concurrent register/calibration requests can race
+    on ``self._data``.  Without the lock, dict iteration inside
+    ``keys()`` can raise RuntimeError and ``set``/``get`` can observe
+    inconsistent expiry tuples.  RLock is used so the existing pattern
+    of calling ``keys()`` then ``get(k)`` on each result doesn't
+    deadlock.
+    """
 
     def __init__(self):
         self._data = {}  # key -> (expiry_ts, value)
+        self._lock = threading.RLock()
 
     def set(self, key, value, ttl=None):
         expiry = time.time() + (ttl or _DEFAULT_TTL_SECONDS)
-        self._data[key] = (expiry, value)
+        with self._lock:
+            self._data[key] = (expiry, value)
 
     def get(self, key):
-        rec = self._data.get(key)
-        if rec is None:
-            return None
-        expiry, value = rec
-        if time.time() > expiry:
-            self._data.pop(key, None)
-            return None
-        return value
+        with self._lock:
+            rec = self._data.get(key)
+            if rec is None:
+                return None
+            expiry, value = rec
+            if time.time() > expiry:
+                self._data.pop(key, None)
+                return None
+            return value
 
     def keys(self, pattern):
         # Pattern is glob-style 'outcome:CLASS:*'; we match by prefix.
         prefix = pattern.rstrip('*')
         now = time.time()
-        return [k for k, (exp, _) in list(self._data.items())
+        with self._lock:
+            # Snapshot the items list inside the lock so concurrent
+            # set() calls can't mutate the dict mid-iteration.
+            items = list(self._data.items())
+        return [k for k, (exp, _) in items
                 if k.startswith(prefix) and exp > now]
 
 

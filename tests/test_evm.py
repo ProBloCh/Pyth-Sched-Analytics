@@ -1172,6 +1172,62 @@ class TestDurationToWorkHoursCalendar:
         assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
 
 
+class TestInProcStoreThreadSafety:
+    """Locks Copilot fix: _InProcStore protects concurrent set / get /
+    keys() from dict-mutation races under gunicorn threads.
+    """
+
+    def test_concurrent_set_and_keys_no_crash(self):
+        import threading
+        import completion.outcomes as oc
+        store = oc._InProcStore()
+        errors = []
+
+        def writer(start, count):
+            try:
+                for i in range(count):
+                    store.set(f'outcomes:x:key{start + i}', f'v{i}')
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+        def reader():
+            try:
+                for _ in range(200):
+                    store.keys('outcomes:x:*')
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+        threads = [threading.Thread(target=writer, args=(i * 100, 100))
+                   for i in range(4)]
+        threads += [threading.Thread(target=reader) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert not errors, errors
+        # Sanity: all 400 writes landed.
+        assert len(store.keys('outcomes:x:*')) == 400
+
+
+class TestNormaliseLinkLagsSkipsNonDict:
+    """Locks Copilot fix: _normalise_link_lags skips non-dict entries
+    rather than passing them through to build_dag (which does
+    link.get(...) and would crash)."""
+
+    def test_non_dict_link_dropped(self):
+        from completion.recovery import _normalise_link_lags
+        out = _normalise_link_lags([
+            {'source': 'A', 'target': 'B', 'type': 'FS'},
+            'garbage',
+            None,
+            {'source': 'B', 'target': 'C', 'type': 'FS', 'lag': 2,
+             'lagUnits': 'd'},
+        ])
+        # Only the two well-formed dicts survive.
+        assert len(out) == 2
+        assert all(isinstance(x, dict) for x in out)
+
+
 class TestOutcomeKeySafety:
     """Locks Copilot fix: project_id and reference_class in outcomes
     are interpolated into Redis key names / SCAN match patterns and
