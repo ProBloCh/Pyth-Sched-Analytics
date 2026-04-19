@@ -103,16 +103,29 @@ class CompletionMCConfig:
 # ---------------------------------------------------------------------------
 
 def _parse_iso_to_ms(s):
-    """ISO-8601 string -> epoch milliseconds.  Returns None on failure."""
+    """ISO-8601 string -> epoch milliseconds.  Returns None on failure.
+
+    Naive inputs (no tz suffix -- e.g. '2025-01-01' or
+    '2025-01-01T00:00:00') are treated as UTC, matching the repo-wide
+    convention (evm.helpers.safe_date, completion.outcomes._parse_iso,
+    completion.calendar._parse_holiday).  Without this, the same
+    status_date string produced timezone-dependent epoch ms across
+    deployments -- making /completion/monte-carlo and /recovery-options
+    non-deterministic on otherwise-identical requests.
+    """
     if s is None:
         return None
     if isinstance(s, (int, float)):
         return float(s)
     try:
-        from datetime import datetime
-        # Accept trailing Z
+        from datetime import datetime, timezone
         clean = str(s).replace('Z', '+00:00')
+        # Bare YYYY-MM-DD -> UTC midnight
+        if 'T' not in clean and len(clean) == 10:
+            clean = clean + 'T00:00:00+00:00'
         dt = datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         return dt.timestamp() * 1000.0
     except Exception:
         return None

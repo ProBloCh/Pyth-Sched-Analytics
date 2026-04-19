@@ -1172,6 +1172,29 @@ class TestDurationToWorkHoursCalendar:
         assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
 
 
+class TestParseIsoToMsUTC:
+    """Locks Copilot fix: completion _parse_iso_to_ms treats naive
+    ISO inputs as UTC so status_date parsing stays deterministic
+    across deployments in different local timezones."""
+
+    def test_bare_date_is_utc_midnight(self):
+        from completion.monte_carlo import _parse_iso_to_ms
+        # 2025-01-01 at UTC midnight = 1735689600000 ms
+        assert _parse_iso_to_ms('2025-01-01') == 1735689600000.0
+
+    def test_naive_datetime_is_utc(self):
+        from completion.monte_carlo import _parse_iso_to_ms
+        # 2025-01-01T00:00:00 (no tz) treated as UTC
+        assert _parse_iso_to_ms('2025-01-01T00:00:00') == 1735689600000.0
+
+    def test_aware_offset_normalised_to_epoch(self):
+        from completion.monte_carlo import _parse_iso_to_ms
+        # +05:00 input -- 00:00 local is 19:00 UTC the previous day
+        ms = _parse_iso_to_ms('2025-01-01T00:00:00+05:00')
+        # 1735689600000 - 5*3600*1000 = 1735671600000
+        assert ms == 1735671600000.0
+
+
 class TestBuildDagDefaultDuration:
     """Locks Copilot fix: build_dag(default_duration=...) lets the
     completion blueprint treat missing Duration as 0 (milestone) to
