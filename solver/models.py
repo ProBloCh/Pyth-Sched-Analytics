@@ -11,13 +11,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Rate-limited warning flag for malformed non-sentinel Duration values
-# in build_activity_params.  Same rationale as solver/dag.py:_dur --
-# route-layer validators catch this in the normal flow; this is
-# defense-in-depth + observability for any internal caller that
-# bypasses validation.
-_DUR_WARNED = {'emitted': False}
-
 # Phase-dependent default weights (from design doc)
 PHASE_WEIGHTS = {
     'planning':      {'schedule': 0.20, 'cost': 0.30, 'risk': 0.25, 'resources': 0.15, 'quality': 0.10},
@@ -147,6 +140,12 @@ def build_activity_params(nodes, activity_metadata):
     if not activity_metadata:
         activity_metadata = {}
 
+    # Rate-limited per-call so the "suppressed for this build" message
+    # below is accurate.  A module-global flag would silence diagnostics
+    # for every subsequent build in the process after the first
+    # malformed input, which is both misleading and unhelpful.
+    dur_warned = {'emitted': False}
+
     ids, durs, rcs, bcosts, rates, crash, risk, atypes = (
         [], [], [], [], [], [], [], [])
     for node in nodes:
@@ -161,15 +160,16 @@ def build_activity_params(nodes, activity_metadata):
                 dur = float(dur_raw)
             except (TypeError, ValueError):
                 # Malformed (non-numeric, non-sentinel) Duration:
-                # log once with the node ID so field diagnostics can
-                # find "Duration = 'abc'" rather than the silently-
-                # zero activity it would otherwise become.
-                if not _DUR_WARNED['emitted']:
+                # log once per build with the node ID so field
+                # diagnostics can find "Duration = 'abc'" rather than
+                # the silently-zero activity it would otherwise
+                # become.
+                if not dur_warned['emitted']:
                     logger.warning(
                         "build_activity_params: node id=%s has non-numeric "
                         "Duration=%r; treating as zero (further warnings "
                         "suppressed for this build).", aid, dur_raw)
-                    _DUR_WARNED['emitted'] = True
+                    dur_warned['emitted'] = True
                 dur = 0.0
         durs.append(dur)
 

@@ -30,7 +30,6 @@ import numpy as np
 
 from solver.dag import build_dag
 
-from .calendar import advance_working_ms, WorkingCalendar
 from evm.helpers import convert_to_hours
 
 from .monte_carlo import (

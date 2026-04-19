@@ -1205,13 +1205,38 @@ class TestMalformedDurationWarns:
     def test_models_non_numeric_duration_warns(self, caplog):
         import logging
         import solver.models as sm
-        sm._DUR_WARNED = {'emitted': False}
+        # The rate-limit flag is function-local (reset per call), so no
+        # module-level reset is needed.
         with caplog.at_level(logging.WARNING, logger='solver.models'):
             sm.build_activity_params(
                 nodes=[{'ID': 'Y', 'Duration': 'bogus'}],
                 activity_metadata={})
         assert any("non-numeric Duration" in r.message
                    and "'bogus'" in r.message for r in caplog.records)
+
+    def test_models_warning_resets_across_builds(self, caplog):
+        """Each build_activity_params call gets its own warn counter so
+        the 'suppressed for this build' message is accurate."""
+        import logging
+        import solver.models as sm
+        with caplog.at_level(logging.WARNING, logger='solver.models'):
+            # First build -- should warn
+            sm.build_activity_params(
+                nodes=[{'ID': 'Z', 'Duration': 'first'}],
+                activity_metadata={})
+        first_warns = [r for r in caplog.records
+                       if 'non-numeric Duration' in r.message]
+        assert len(first_warns) == 1
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger='solver.models'):
+            # Second build -- should ALSO warn (module-global flag
+            # would have silenced it).
+            sm.build_activity_params(
+                nodes=[{'ID': 'W', 'Duration': 'second'}],
+                activity_metadata={})
+        second_warns = [r for r in caplog.records
+                        if 'non-numeric Duration' in r.message]
+        assert len(second_warns) == 1
 
 
 class TestCompletionSerialiseNonFinite:
