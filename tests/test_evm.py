@@ -1172,6 +1172,41 @@ class TestDurationToWorkHoursCalendar:
         assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
 
 
+class TestMCConfigTypeGuards:
+    """Locks Copilot fix: _validate_mc_config rejects non-dict
+    thresholds / caps / custom_reference_classes with 400 rather than
+    raising AttributeError and turning a client error into a 500."""
+
+    def test_thresholds_not_object_400(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': 'A', 'Duration': 5, 'TimeUnits': 'days'}],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {'thresholds': ['not', 'an', 'object']},
+        })
+        assert resp.status_code == 400
+        assert 'thresholds' in resp.get_json()['error']
+
+    def test_caps_not_object_400(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': 'A', 'Duration': 5, 'TimeUnits': 'days'}],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {'caps': 'oops'},
+        })
+        assert resp.status_code == 400
+        assert 'caps' in resp.get_json()['error']
+
+    def test_valid_dict_still_accepted(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': 'A', 'Duration': 5, 'TimeUnits': 'days'}],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {
+                'thresholds': {'no_risk_below': 0.05, 'normal_from': 0.2},
+                'caps': {'min_mult': 0.5, 'max_mult_base': 5.0},
+            },
+        })
+        assert resp.status_code == 200
+
+
 class TestParseIsoToMsUTC:
     """Locks Copilot fix: completion _parse_iso_to_ms treats naive
     ISO inputs as UTC so status_date parsing stays deterministic

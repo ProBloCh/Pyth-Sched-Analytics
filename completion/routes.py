@@ -150,6 +150,11 @@ def _validate_mc_config(data):
             return f'config.iterations must be 1-{MAX_ITERATIONS}'
 
     thresholds = cfg.get('thresholds') or {}
+    # A non-dict thresholds value (e.g. `[...]` or `"abc"`) would
+    # previously AttributeError on `.get(...)` and surface as a 500;
+    # reject up-front with a clear 400.
+    if not isinstance(thresholds, dict):
+        return 'config.thresholds must be an object'
     thresh_vals = {}
     for key in ('no_risk_below', 'normal_from', 'fat_tail_from'):
         v = thresholds.get(key)
@@ -173,6 +178,8 @@ def _validate_mc_config(data):
         return ('config.thresholds.normal_from must be <= fat_tail_from')
 
     caps = cfg.get('caps') or {}
+    if not isinstance(caps, dict):
+        return 'config.caps must be an object'
     cap_checks = [
         ('min_mult',      0.0,  10.0),
         ('max_mult_base', 1.0,  100.0),
