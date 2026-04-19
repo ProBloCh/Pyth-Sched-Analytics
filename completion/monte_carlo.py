@@ -885,7 +885,9 @@ def run_completion_mc(nodes, links, status_date,
     if status_ms is None:
         raise ValueError("status_date must be a valid ISO-8601 date string")
 
-    dag_state, id_to_idx = build_dag(nodes, links)
+    # default_duration=0.0 so a missing Duration field is treated as a
+    # milestone (matches the route validator), not a 1-unit activity.
+    dag_state, id_to_idx = build_dag(nodes, links, default_duration=0.0)
     n = dag_state.n
 
     if n == 0:

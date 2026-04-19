@@ -620,7 +620,9 @@ def run_recovery_options(nodes, links, status_date,
     links = _normalise_link_lags(links, hours_per_day, working_days_per_week)
 
     # Calendar reuse: same construction as the MC endpoint
-    dag_state, id_to_idx = build_dag(nodes, links)
+    # default_duration=0.0 so a missing Duration field is treated as a
+    # milestone (matches _validate_common), not a 1-unit activity.
+    dag_state, id_to_idx = build_dag(nodes, links, default_duration=0.0)
     n = dag_state.n
     if n == 0:
         return _empty_result(status_date, config, t0)

@@ -52,11 +52,20 @@ class DAGState:
         self.makespan = 0.0
 
 
-def build_dag(nodes, links):
+def build_dag(nodes, links, default_duration=1.0):
     """
     Build a DAG from nodes/links and run CPM.
 
     Returns (DAGState, id_to_idx dict).
+
+    ``default_duration`` is used when a node has no Duration field at
+    all.  The solver endpoints (/solver/*) pass the default 1.0 --
+    their fixtures always carry a Duration, and a missing one
+    historically meant "unknown, assume 1 unit".  The completion
+    endpoints (/completion/*) pass 0.0 because their validators
+    treat a missing Duration as a milestone (no remaining work); a
+    1.0 default here would otherwise diverge from the engine's
+    scope-building logic and skew CPM / critical-path detection.
     Cycles are broken by Kahn's algorithm (back-edges silently dropped).
     """
     ids = [str(n.get('ID', n.get('id', i))) for i, n in enumerate(nodes)]
@@ -146,7 +155,7 @@ def build_dag(nodes, links):
     _DUR_WARNED = {'emitted': False}
 
     def _dur(node):
-        v = node.get('Duration', node.get('duration', 1.0))
+        v = node.get('Duration', node.get('duration', default_duration))
         # Explicit milestone sentinels -> 0.0 silently.
         if v in ('', None, 0, 0.0, '0'):
             return 0.0
