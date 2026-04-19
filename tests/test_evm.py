@@ -1281,6 +1281,28 @@ class TestFalseyCoerceGuard:
         })
         assert any('project_id must be a non-empty string' in e for e in errs)
 
+    def test_outcome_missing_predicted_single_error(self):
+        """Missing predicted should surface ONE 'missing required field'
+        error, not additionally emit 'predicted.X is required' noise.
+        """
+        from completion.outcomes import validate_outcome
+        errs = validate_outcome({
+            'project_id': 'p1',
+            'actual': {'finish': '2025-05-01T00:00:00Z'},
+        })
+        assert any("missing required field 'predicted'" in e for e in errs)
+        assert not any('predicted.' in e and 'required' in e for e in errs)
+
+    def test_outcome_missing_actual_single_error(self):
+        """Same short-circuit for missing `actual`."""
+        from completion.outcomes import validate_outcome
+        errs = validate_outcome({
+            'project_id': 'p1',
+            'predicted': {'p80_finish': '2025-05-01T00:00:00Z'},
+        })
+        assert any("missing required field 'actual'" in e for e in errs)
+        assert not any('actual.' in e and 'required' in e for e in errs)
+
 
 class TestOutcomesEnvIntFallback:
     """Locks Copilot fix: malformed PYTH_OUTCOMES_TTL_SECONDS /

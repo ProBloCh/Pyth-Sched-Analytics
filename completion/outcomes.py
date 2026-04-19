@@ -203,14 +203,17 @@ def validate_outcome(record):
                 "project_id must contain only letters, digits, "
                 "'_', '-', '.' (Redis key safety)")
 
-    # Type-check raw `predicted` value before defaulting, rather than
-    # `or {}` which would coerce falsey non-dicts ([], "", 0) into a
-    # misleading "missing field" error.
+    # Three-branch predicted validation so the caller gets a single
+    # clear error rather than a missing-field message paired with
+    # nested "predicted.X is required" noise:
+    #   (a) key absent          -> already emitted 'missing required field'
+    #   (b) key present non-dict -> 'predicted must be an object' only
+    #   (c) key present dict     -> nested field validation
     pred_raw = record.get('predicted')
     pred = pred_raw if isinstance(pred_raw, dict) else {}
-    if pred_raw is not None and not isinstance(pred_raw, dict):
+    if 'predicted' in record and not isinstance(pred_raw, dict):
         errs.append('predicted must be an object')
-    else:
+    elif isinstance(pred_raw, dict):
         for k in _REQUIRED_PREDICTED:
             if k not in pred:
                 errs.append(f'predicted.{k} is required')
@@ -224,11 +227,12 @@ def validate_outcome(record):
                 errs.append(f'predicted.{k} is not a parseable ISO-8601 '
                             f'timestamp: {v!r}')
 
+    # Same three-branch validation as `predicted` above.
     actual_raw = record.get('actual')
     actual = actual_raw if isinstance(actual_raw, dict) else {}
-    if actual_raw is not None and not isinstance(actual_raw, dict):
+    if 'actual' in record and not isinstance(actual_raw, dict):
         errs.append('actual must be an object')
-    else:
+    elif isinstance(actual_raw, dict):
         for k in _REQUIRED_ACTUAL:
             if k not in actual:
                 errs.append(f'actual.{k} is required')
