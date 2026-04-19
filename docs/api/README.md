@@ -13,8 +13,16 @@ consumers).
 | `/solver/sensitivity` | POST | [solver.md](solver.md#post-solversensitivity) | Single-pass CADJ-P sensitivity analysis |
 | `/solver/optimize` | POST | [solver.md](solver.md#post-solveroptimize) | L-BFGS-B gradient-descent optimization |
 | `/solver/pareto` | POST | [solver.md](solver.md#post-solverpareto) | Pareto frontier sweep (Tchebycheff scalarization) |
+| `/completion/monte-carlo` | POST | [completion.md](completion.md#post-completionmonte-carlo) | Remaining-work MC finish-date forecast (P20/P50/P80) |
+| `/completion/recovery-options` | POST | [completion.md](completion.md#post-completionrecovery-options) | Ranked crash + lag-compression options |
+| `/completion/reference-classes` | GET | [completion.md](completion.md#discovery-endpoint) | List built-in + env-loaded reference classes for sector dropdowns |
+| `/completion/register-outcome` | POST | [completion.md](completion.md#post-completionregister-outcome) | Register a closed-project predicted-vs-actual outcome for calibration |
+| `/completion/calibration-report` | GET | [completion.md](completion.md#get-completioncalibration-report) | Aggregate accumulated outcomes into per-class calibration ratios + advisories |
+| `/evm/analyze` | POST | [evm.md](evm.md#post-evmanalyze) | EVM analysis: CPI/SPI/EAC + time-phased distributions |
 | `/health` | GET | [health.md](health.md#get-health) | Main app health check |
 | `/solver/health` | GET | [health.md](health.md#get-solverhealth) | Solver module health check |
+| `/completion/health` | GET | [completion.md](completion.md#get-completionhealth) | Completion module health check |
+| `/evm/health` | GET | [evm.md](evm.md#get-evmhealth) | EVM module health check |
 
 ## API Stability Rules
 

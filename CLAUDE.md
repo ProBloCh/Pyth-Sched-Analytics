@@ -27,7 +27,26 @@ NumPy, Pandas, scikit-learn, SciPy, Redis (optional caching).
 `multi_resolution_pipeline.py` (~335 LOC) handles hierarchical community
 detection.  `solver/` (10 modules, ~2,400 LOC) is a Flask Blueprint
 registered in `app.py` that provides three prescriptive endpoints plus a
-health check.  157 tests across 4 test files.
+health check.  `completion/` (5 modules: `__init__`, `routes`,
+`monte_carlo`, `calendar`, `recovery`) is a second Flask Blueprint
+serving `/completion/monte-carlo` (remaining-work finish-date forecast
+wrapping `solver/stochastic.py`'s five-tier distribution) and
+`/completion/recovery-options` (ranked crash + lag-compression options
+composing with the MC P80).  `evm/` (6 modules: `__init__`, `routes`,
+`engine`, `metrics`, `forecast`, `distributions`, `helpers`) serves
+`/evm/analyze` -- a full Earned Value Management analysis (CPI, SPI,
+EAC, duration-weighted progress, schedule-delay prediction, and
+time-phased cumulative + period distributions) ported from the JS
+`Reference/EVM.js`; output shape mirrors `window.evmMetrics` so
+downstream consumers (notably `Completionprediction.js` reading
+`.actual.CPIcum`) work unchanged.  Tests: 343 across 7 test files,
+including a JS-vs-Python diff harness
+(`tests/test_evm_diff.py` + `tests/diff_harness/run_js_evm.js`) that
+runs the JS reference implementation under Node.js on shared fixtures
+(basic / complete / overrun / complex / with_holidays) and asserts
+every scalar metric agrees within `1e-6` relative tolerance and
+predicted dates within 24 h, including holiday-skipping via the full
+working-calendar path.
 
 ## Four Principles
 
@@ -224,6 +243,45 @@ prevents integration drift.
   al., PMJ 2022, KS p=.89).  The Pareto tier uses α=2.0+1.5*(1-risk),
   calibrated to Flyvbjerg's IT project α≈2.35.  Supply-chain activities
   (equipment/material/services) hit fat-tail thresholds earlier.
+- **Reference-class calibration** (`solver/reference_classes.py`):
+  per-sector tier-4 distribution choice (`birnbaum_saunders` /
+  `lognormal` / `skip`), Pareto α range, max multiplier cap, and
+  per-percentile inflation factors for 19 named classes (oil & gas,
+  nuclear, rail, tunnels, defense MDAP, IT, Olympics, mining, solar,
+  wind, batteries, data centres, etc.).  **Five extension mechanisms**:
+  (1) built-in source-code edit, (2) env var
+  `PYTH_REFERENCE_CLASSES_PATH=/path/to.json` for ops-managed
+  customer calibrations bundled with deploy, (3) per-request
+  `config.custom_reference_classes` for one-off custom classes,
+  (4) per-request `config.reference_class_overrides = {base, overrides}`
+  for tweaking a built-in without registering a full custom class,
+  (5) `GET /completion/reference-classes` discovery endpoint for
+  frontend dropdowns.  Each class definition is schema-validated
+  (`validate_class_definition`) at module load (built-ins, fail-fast on
+  dev errors) and per-request (custom classes, return 400 with the
+  specific field that broke).  Unknown class names return 400 with
+  fuzzy-matched suggestion ("did you mean oil_gas_offshore?") via
+  `difflib`.  Driven by `config.reference_class` on
+  `/completion/monte-carlo`; emits a `reference_class_calibrated`
+  companion in the response with empirically-corrected percentiles
+  and citations.  When unset, the
+  response carries a `no_reference_class` info warning and the
+  historic global tier model applies (byte-equivalent to pre-2026-04).
+  Sources: Flyvbjerg & Bester 2021; Aaen, Flyvbjerg et al. PMJ 2025;
+  Cantarelli RCF review 2025; Sovacool & Gilbert 2014; HM Treasury
+  Green Book; TII RCF guidelines.  Empty `tier_4_distribution =
+  'skip'` semantics: for IT (α ≤ 1) and Olympics, BS cannot represent
+  infinite mean; normal tier extends directly to Pareto.  Thin-tailed
+  sectors (roads, solar, batteries) use `lognormal` instead of BS per
+  Flyvbjerg & Gardner 2023 classification.
+- **Calibration warnings** (`completion/monte_carlo._build_calibration_warnings`):
+  surfaces input-quality concerns in every response
+  (`zero_variance_risk`, `judgment_based_risk_default`,
+  `no_supply_chain_classification`, `small_scope_mc`,
+  `infinite_mean_reference_class`, `reference_class_judgement`,
+  `no_reference_class`).  Each carries `code`, `severity`, and a
+  human-readable `message`.  Mirrors the LinkedIn-discussion critique
+  that judgment-derived MC inputs get laundered into misleading P80s.
 - **Numerical correctness in adjoints:** The resource adjoint uses finite
   differences (review section 1.5) because the smoothed trapezoidal profile
   has non-differentiable step boundaries.  The risk adjoint is a first-order
@@ -286,10 +344,13 @@ Pushes to `main` trigger automatic deployment to Azure production. Treat
 
 ### High priority (use data already flowing in)
 
-- **Calendar-aware scheduling:** `hours_per_day` and `working_days` are
-  parsed into `ProjectContext` but never applied.  Durations are treated
-  as abstract time units.  Implementing calendar conversion would make
-  the CPM output match real-world dates.
+- **Calendar-aware scheduling in the solver:** `/completion/monte-carlo`
+  now supports a full working-calendar (`completion/calendar.py`,
+  `hours_per_day` / `working_days` / `holidays`) via vectorised
+  cumulative-sum + searchsorted advancement.  The solver CPM
+  (`solver/dag.py`) still treats durations as abstract time units.
+  Extending `solver/dag.run_cpm` to accept the same `WorkingCalendar`
+  would make `/solver/*` output match real-world dates.
 - **Hard constraint enforcement:** `max_end_date` and `max_budget` are
   parsed but never enforced in the optimizer.  These could be added as
   penalty terms or hard bounds in L-BFGS-B.

@@ -1,0 +1,37 @@
+{
+    "nodes": [
+        {"ID": "0", "Duration": 0, "Milestone": 1,
+         "Start": "2025-01-06T00:00:00Z", "Finish": "2025-01-06T00:00:00Z"},
+        {"ID": "1", "Duration": 8, "TimeUnits": "days", "Name": "Survey",
+         "Start": "2025-01-06T00:00:00Z", "Finish": "2025-01-16T00:00:00Z",
+         "ActualStart": "2025-01-06T00:00:00Z", "PercentComplete": 75,
+         "CostRate": 90, "ActualCost": 4200},
+        {"ID": "2", "Duration": 12, "TimeUnits": "days", "Name": "Excavation",
+         "Start": "2025-01-16T00:00:00Z", "Finish": "2025-02-03T00:00:00Z",
+         "ActualStart": "2025-01-20T00:00:00Z", "PercentComplete": 40,
+         "CostRate": 110, "ActualCost": 4500,
+         "riskAdjustedStart": "2025-01-20T00:00:00Z",
+         "riskAdjustedEnd": "2025-02-10T00:00:00Z",
+         "riskAdjustedDuration": 14},
+        {"ID": "3", "Duration": 6, "TimeUnits": "days", "Name": "Foundation Pour",
+         "Start": "2025-02-03T00:00:00Z", "Finish": "2025-02-11T00:00:00Z",
+         "PercentComplete": 0, "CostRate": 130},
+        {"ID": "4", "Duration": 10, "TimeUnits": "days", "Name": "Steel Erection",
+         "Start": "2025-02-11T00:00:00Z", "Finish": "2025-02-25T00:00:00Z",
+         "PercentComplete": 0, "CostRate": 140}
+    ],
+    "links": [
+        {"source": "0", "target": "1", "type": "FS", "lag": 0},
+        {"source": "1", "target": "2", "type": "FS", "lag": 0},
+        {"source": "2", "target": "3", "type": "FS", "lag": 0},
+        {"source": "3", "target": "4", "type": "FS", "lag": 0}
+    ],
+    "options": {
+        "statusDate": "2025-01-30T00:00:00Z",
+        "costRate": 100,
+        "currency": "USD",
+        "project": {"sector": "construction"},
+        "hoursPerDay": 8,
+        "workingDaysPerWeek": 5
+    }
+}

@@ -6,7 +6,10 @@ No external dependencies beyond numpy.
 """
 
 from dataclasses import dataclass, field
+import logging
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # Phase-dependent default weights (from design doc)
 PHASE_WEIGHTS = {
@@ -137,12 +140,37 @@ def build_activity_params(nodes, activity_metadata):
     if not activity_metadata:
         activity_metadata = {}
 
+    # Rate-limited per-call so the "suppressed for this build" message
+    # below is accurate.  A module-global flag would silence diagnostics
+    # for every subsequent build in the process after the first
+    # malformed input, which is both misleading and unhelpful.
+    dur_warned = {'emitted': False}
+
     ids, durs, rcs, bcosts, rates, crash, risk, atypes = (
         [], [], [], [], [], [], [], [])
     for node in nodes:
         aid = str(node.get('ID', node.get('id', '')))
         ids.append(aid)
-        dur = float(node.get('Duration', node.get('duration', 1.0)))
+        dur_raw = node.get('Duration', node.get('duration', 1.0))
+        # Explicit milestone sentinels -> 0 silently.
+        if dur_raw in ('', None, 0, 0.0, '0'):
+            dur = 0.0
+        else:
+            try:
+                dur = float(dur_raw)
+            except (TypeError, ValueError):
+                # Malformed (non-numeric, non-sentinel) Duration:
+                # log once per build with the node ID so field
+                # diagnostics can find "Duration = 'abc'" rather than
+                # the silently-zero activity it would otherwise
+                # become.
+                if not dur_warned['emitted']:
+                    logger.warning(
+                        "build_activity_params: node id=%s has non-numeric "
+                        "Duration=%r; treating as zero (further warnings "
+                        "suppressed for this build).", aid, dur_raw)
+                    dur_warned['emitted'] = True
+                dur = 0.0
         durs.append(dur)
 
         meta = activity_metadata.get(aid, {})

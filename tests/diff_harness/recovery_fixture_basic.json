@@ -1,0 +1,34 @@
+{
+    "nodes": [
+        {"ID": "0", "Duration": 0, "Milestone": 1, "Name": "Project Start"},
+        {"ID": "1", "Duration": 30, "TimeUnits": "days",
+         "Name": "Engineering Drawings", "PercentComplete": 25,
+         "ActualStart": "2025-01-06T00:00:00Z"},
+        {"ID": "2", "Duration": 60, "TimeUnits": "days",
+         "Name": "Procure Long-Lead Equipment", "PercentComplete": 0,
+         "SupplierType": "external_equipment"},
+        {"ID": "3", "Duration": 45, "TimeUnits": "days",
+         "Name": "Construct Foundation", "PercentComplete": 0},
+        {"ID": "4", "Duration": 20, "TimeUnits": "days",
+         "Name": "Install Mechanical", "PercentComplete": 0},
+        {"ID": "5", "Duration": 15, "TimeUnits": "days",
+         "Name": "Commission Test", "PercentComplete": 0},
+        {"ID": "6", "Duration": 8, "TimeUnits": "days",
+         "Name": "Environmental Permit Review", "PercentComplete": 50,
+         "ActualStart": "2025-01-06T00:00:00Z"},
+        {"ID": "7", "Duration": 12, "TimeUnits": "days",
+         "Name": "Shop Fabrication", "PercentComplete": 0},
+        {"ID": "8", "Duration": 5, "TimeUnits": "days",
+         "Name": "Generic Activity", "PercentComplete": 10}
+    ],
+    "links": [
+        {"source": "0", "target": "1", "lag": 0},
+        {"source": "1", "target": "2", "lag": 5, "lagUnits": "days"},
+        {"source": "2", "target": "3", "lag": 0},
+        {"source": "3", "target": "4", "lag": 16, "lagUnits": "h"},
+        {"source": "4", "target": "5", "lag": 0},
+        {"source": "1", "target": "6", "lag": 0},
+        {"source": "2", "target": "7", "lag": 24, "lagUnits": "h"},
+        {"source": "7", "target": "4", "lag": 0}
+    ]
+}

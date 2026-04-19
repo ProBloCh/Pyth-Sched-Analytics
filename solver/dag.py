@@ -52,11 +52,20 @@ class DAGState:
         self.makespan = 0.0
 
 
-def build_dag(nodes, links):
+def build_dag(nodes, links, default_duration=1.0):
     """
     Build a DAG from nodes/links and run CPM.
 
     Returns (DAGState, id_to_idx dict).
+
+    ``default_duration`` is used when a node has no Duration field at
+    all.  The solver endpoints (/solver/*) pass the default 1.0 --
+    their fixtures always carry a Duration, and a missing one
+    historically meant "unknown, assume 1 unit".  The completion
+    endpoints (/completion/*) pass 0.0 because their validators
+    treat a missing Duration as a milestone (no remaining work); a
+    1.0 default here would otherwise diverge from the engine's
+    scope-building logic and skew CPM / critical-path detection.
     Cycles are broken by Kahn's algorithm (back-edges silently dropped).
     """
     ids = [str(n.get('ID', n.get('id', i))) for i, n in enumerate(nodes)]
@@ -137,11 +146,32 @@ def build_dag(nodes, links):
 
     topo_arr = np.array(topo, dtype=np.int64)
 
-    durations = np.array(
-        [float(nodes[i].get('Duration', nodes[i].get('duration', 1.0)))
-         for i in range(n)],
-        dtype=np.float64,
-    )
+    # Rate-limited warning for malformed non-sentinel Duration values
+    # so field diagnostics surface "Duration = 'abc'" rather than
+    # silently turning a real activity into a zero-duration milestone.
+    # The route-layer validators catch this before we get here in the
+    # normal flow; this is defense-in-depth + observability for any
+    # internal caller that bypasses the route validator.
+    _DUR_WARNED = {'emitted': False}
+
+    def _dur(node):
+        v = node.get('Duration', node.get('duration', default_duration))
+        # Explicit milestone sentinels -> 0.0 silently.
+        if v in ('', None, 0, 0.0, '0'):
+            return 0.0
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            if not _DUR_WARNED['emitted']:
+                logger.warning(
+                    "build_dag: node id=%s has non-numeric Duration=%r; "
+                    "treating as zero (further warnings suppressed for "
+                    "this build).",
+                    node.get('ID', node.get('id', '<unknown>')), v)
+                _DUR_WARNED['emitted'] = True
+            return 0.0
+    durations = np.array([_dur(nodes[i]) for i in range(n)],
+                         dtype=np.float64)
 
     state = DAGState(n, topo_arr, pred, succ, durations,
                      pred_edges, succ_edges)

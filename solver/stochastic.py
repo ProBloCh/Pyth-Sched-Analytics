@@ -154,13 +154,49 @@ def _pareto_ppf(u, alpha):
     return (1.0 - u) ** (-1.0 / alpha)
 
 
+def _lognormal_ppf(u, sigma=0.25, mu=0.0):
+    """Vectorised lognormal inverse CDF.
+
+    Used as the tier-4 distribution for thin-tailed reference classes
+    (roads, standard buildings, solar, onshore wind, battery storage)
+    where Birnbaum-Saunders is empirically inappropriate -- those
+    sectors don't fit a fatigue-life model and have lighter upper
+    tails than BS would imply.
+
+    Parameterisation: lognormal(μ, σ) on the log scale, returning
+    multipliers centred near 1.0 with σ controlling the spread.
+    Defaults give a moderate right-skewed bump matching Cantarelli /
+    Flyvbjerg's observation that thin-tailed sectors still have a
+    lognormal-like shape on the upper side.
+    """
+    from scipy.special import ndtri
+    z = ndtri(u)
+    return np.exp(mu + sigma * z)
+
+
+def _lognormal_ppf_z(z, sigma=0.25, mu=0.0):
+    """Lognormal PPF taking precomputed z = ndtri(u).
+
+    Avoids redundant ndtri() calls in the MC hot path: the caller
+    (_compute_raw_multipliers) already has z for the entire sample
+    matrix, so the tier-4 lognormal branch can reuse it directly
+    instead of re-inverting the CDF per invocation.
+    """
+    return np.exp(mu + sigma * z)
+
+
 # ---------------------------------------------------------------------------
 # Risk-tiered perturbation
 # ---------------------------------------------------------------------------
 
-def _fat_tail_thresholds(activity_types, n):
-    """Per-activity fat-tail threshold (supply-chain adjusted)."""
-    thresh = np.full(n, _DEFAULT_FAT_TAIL)
+def _fat_tail_thresholds(activity_types, n, default_fat_tail=_DEFAULT_FAT_TAIL):
+    """Per-activity fat-tail threshold (supply-chain adjusted).
+
+    Supply-chain activities (equipment/material/services) hit the
+    fat-tail threshold earlier than the configurable ``default_fat_tail``
+    for all other activity types.
+    """
+    thresh = np.full(n, default_fat_tail)
     if activity_types and len(activity_types) == n:
         for i, atype in enumerate(activity_types):
             if atype in _FAT_TAIL_THRESHOLDS:
@@ -168,7 +204,11 @@ def _fat_tail_thresholds(activity_types, n):
     return thresh
 
 
-def _compute_raw_multipliers(u, z, risk, fat_thresh):
+def _compute_raw_multipliers(u, z, risk, fat_thresh,
+                             noise_floor=0.06, normal_from=0.18,
+                             pareto_offset=None,
+                             tier_4_distribution='birnbaum_saunders',
+                             pareto_alpha_range=None):
     """
     Per-activity raw duration multipliers from the five-tier model.
 
@@ -176,21 +216,65 @@ def _compute_raw_multipliers(u, z, risk, fat_thresh):
     scipy.special.ndtri), passed in to avoid recomputing it inside
     the MC loop.
 
-    Tiers (risk as fraction 0–1):
-      < 6%:             noise floor → multiplier = 1.0
-      6–18%:            triangular (right-skewed, bounded)
-      18–fat_t:         normal (σ = risk)
-      fat_t–pareto_t:   Birnbaum-Saunders (α=0.25+0.65r, β=1.0+0.1r)
-      ≥ pareto_t:       Pareto power-law (α=2.0+1.5*(1-r))
+    Tiers (risk as fraction 0-1):
+      < noise_floor:                no perturbation, multiplier = 1
+      noise_floor .. normal_from:   triangular (right-skewed, bounded)
+      normal_from .. fat_thresh:    normal (sigma proportional to risk)
+      fat_thresh .. pareto_thresh:  TIER 4 distribution (per below)
+      >= pareto_thresh:             Pareto power-law
+
+    Tier 4 selection:
+      'birnbaum_saunders' (default): historic Natarajan-validated fit
+                                     for offshore O&G; α=0.25+0.65r,
+                                     β=1.0+0.1r.  Use for fat-tailed
+                                     sectors with finite mean.
+      'lognormal':                   Thin-tailed sectors (roads, solar,
+                                     standard buildings, batteries)
+                                     where Flyvbjerg & Gardner 2023
+                                     classify the sector as
+                                     non-fat-tailed.  σ scales with
+                                     risk: σ = 0.05 + 0.5*r.
+      'direct_normal_to_pareto'      Reference classes with α <= 1 (IT,
+                  (or 'skip'):       Olympics) where Birnbaum-Saunders
+                                     cannot represent infinite mean.
+                                     The normal tier extends to
+                                     ``pareto_thresh`` and Pareto takes
+                                     over directly; no separate tier-4
+                                     window.  ``'skip'`` is preserved
+                                     as a back-compat alias.
+
+    Pareto α:
+      pareto_alpha_range=(lo, hi) clamps α per reference class.  When
+      None, falls back to the global formula α = 2.0 + 1.5*(1-r).
+      Lower α = fatter tail.
+
+    pareto_offset: distance between fat-tail threshold and Pareto
+      threshold.  When None, falls back to module default _PARETO_OFFSET
+      (0.25).  IT / Olympics use 0.05 to put almost everything in
+      the Pareto tail.
+
+    All defaults preserve historic behaviour for callers (solver
+    sensitivity / optimize / pareto endpoints) that don't pass class
+    overrides.
     """
     n = len(risk)
     mult = np.ones(n, dtype=np.float64)
-    pareto_thresh = fat_thresh + _PARETO_OFFSET
+    if pareto_offset is None:
+        pareto_offset = _PARETO_OFFSET
+    pareto_thresh = fat_thresh + pareto_offset
 
     # Tier masks
-    tri_mask    = (risk >= 0.06) & (risk < 0.18)
-    norm_mask   = (risk >= 0.18) & (risk < fat_thresh)
-    bs_mask     = (risk >= fat_thresh) & (risk < pareto_thresh)
+    tri_mask    = (risk >= noise_floor) & (risk < normal_from)
+    # 'skip' is the back-compat alias for 'direct_normal_to_pareto'.
+    if tier_4_distribution in ('direct_normal_to_pareto', 'skip'):
+        # No tier 4 -- normal tier extends all the way to the Pareto
+        # threshold, then Pareto takes over.  Used for IT / Olympics
+        # where BS is empirically wrong (alpha <= 1 regimes).
+        norm_mask = (risk >= normal_from) & (risk < pareto_thresh)
+        bs_mask   = np.zeros(n, dtype=bool)
+    else:
+        norm_mask = (risk >= normal_from) & (risk < fat_thresh)
+        bs_mask   = (risk >= fat_thresh) & (risk < pareto_thresh)
     pareto_mask = risk >= pareto_thresh
 
     # Tier 2: triangular (right-skewed)
@@ -201,48 +285,103 @@ def _compute_raw_multipliers(u, z, risk, fat_thresh):
         high = 1.0 + 2.0 * r
         mult[tri_mask] = _triangular_ppf(u[tri_mask], low, mode, high)
 
-    # Tier 3: normal (σ proportional to risk)
+    # Tier 3: normal (sigma proportional to risk)
     if np.any(norm_mask):
         r = risk[norm_mask]
         mult[norm_mask] = np.maximum(0.5, 1.0 + z[norm_mask] * r)
 
-    # Tier 4: Birnbaum-Saunders (fat tail — best fit for O&G overruns)
+    # Tier 4: per-class fat-tail distribution
     if np.any(bs_mask):
         r = risk[bs_mask]
-        alpha = 0.25 + 0.65 * r
-        beta  = 1.00 + 0.10 * r
-        mult[bs_mask] = _bs_ppf_z(z[bs_mask], alpha, beta)
+        if tier_4_distribution == 'birnbaum_saunders':
+            alpha = 0.25 + 0.65 * r
+            beta  = 1.00 + 0.10 * r
+            mult[bs_mask] = _bs_ppf_z(z[bs_mask], alpha, beta)
+        elif tier_4_distribution == 'lognormal':
+            # σ scales gently with risk; mu=0 keeps the median at 1.0
+            # and the right tail is naturally bounded vs BS.  Reuse the
+            # precomputed z to avoid a second ndtri() call per scenario.
+            sigma = 0.05 + 0.50 * r
+            mult[bs_mask] = _lognormal_ppf_z(z[bs_mask], sigma=sigma, mu=0.0)
+        else:
+            # Unknown tier 4 type -> safe fallback to BS so existing
+            # behaviour is preserved (defensive; configs are validated
+            # at the routes layer).
+            alpha = 0.25 + 0.65 * r
+            beta  = 1.00 + 0.10 * r
+            mult[bs_mask] = _bs_ppf_z(z[bs_mask], alpha, beta)
 
-    # Tier 5: Pareto power-law (polynomial tail — Flyvbjerg α≈2.35 regime)
+    # Tier 5: Pareto power-law
     if np.any(pareto_mask):
         r = risk[pareto_mask]
-        alpha = 2.0 + 1.5 * (1.0 - r)
+        if pareto_alpha_range is not None:
+            alpha_lo, alpha_hi = pareto_alpha_range
+            # Linearly interpolate alpha within the class's range as
+            # risk goes from pareto_thresh -> 1.0.  Higher risk -> lower
+            # alpha -> fatter tail.  Mask pareto_thresh to match r's
+            # shape so the broadcast works on tiled inputs.
+            pthresh_r = pareto_thresh[pareto_mask]
+            t = np.clip((r - pthresh_r) / np.maximum(1.0 - pthresh_r, 1e-9),
+                        0.0, 1.0)
+            alpha = alpha_hi - (alpha_hi - alpha_lo) * t
+            alpha = np.maximum(alpha, 0.5)  # numerical safety
+        else:
+            alpha = 2.0 + 1.5 * (1.0 - r)
         mult[pareto_mask] = _pareto_ppf(u[pareto_mask], alpha)
 
     return np.maximum(mult, 0.1)  # absolute floor
 
 
-def _compute_caps(risk, durations, fat_thresh):
+def _compute_caps(risk, durations, fat_thresh,
+                  pareto_offset=None, max_multiplier_cap=None):
     """Duration-sensitive caps with elevated range for Pareto-tier activities.
 
-    Standard:  lerp(2.0, 6.0, risk × dur_fraction)
-    Pareto:    lerp(4.0, 10.0, risk × dur_fraction)
+    Defaults (no reference class):
+      Standard:  lerp(2.0, 6.0, risk × dur_fraction)   -- short low-risk ~2x,
+                                                          long high-risk up to 6x
+      Pareto:    lerp(4.0, 10.0, risk × dur_fraction)  -- up to 10x for
+                                                          Thunderhorse-class
+                                                          cascading failures
+                                                          (Natarajan PMJ 2022)
 
-    Short low-risk: capped at ~2×.  Long high-risk: up to 6×.
-    Extreme coupling (Pareto tier): up to 10× — captures Thunderhorse-class
-    cascading failures (Natarajan et al., PMJ 2022).
+    Per-reference-class:
+      max_multiplier_cap replaces the Pareto-tier 10x ceiling.  Olympics
+      and IT can run 50x; nuclear new build 20x; thin-tailed sectors
+      (roads, solar) 3-5x.  See solver/reference_classes.py.
+      The standard-tier ceiling scales proportionally so the cap
+      hierarchy stays consistent.
     """
     max_dur = np.max(durations) if len(durations) > 0 else 1.0
     dur_frac = durations / max(max_dur, 1e-9)
     blend = np.minimum(1.0, risk * dur_frac)
 
-    pareto_thresh = fat_thresh + _PARETO_OFFSET
+    if pareto_offset is None:
+        pareto_offset = _PARETO_OFFSET
+    pareto_thresh = fat_thresh + pareto_offset
     is_pareto = risk >= pareto_thresh
+
+    if max_multiplier_cap is None:
+        pareto_ceiling = 10.0
+        std_ceiling = 6.0
+    else:
+        pareto_ceiling = float(max_multiplier_cap)
+        # Scale standard-tier ceiling proportionally to keep the
+        # 6:10 ratio used in the historic cap design.
+        std_ceiling = pareto_ceiling * (6.0 / 10.0)
+
+    # Clamp lerp bases so caps stay monotone (non-decreasing) in blend
+    # when a thin-tailed sector sets max_multiplier_cap below the
+    # default bases.  Without clamping, pareto_ceiling=3 gave
+    # caps = 4.0 at blend=0 -> 3.0 at blend=1 (decreasing), and the
+    # standard tier went 2.0 -> 1.8.  With clamping, a cap below the
+    # default base flattens the lerp to a constant = ceiling.
+    pareto_base = min(4.0, pareto_ceiling)
+    std_base    = min(2.0, std_ceiling)
 
     caps = np.where(
         is_pareto,
-        4.0 + 6.0 * blend,   # Pareto tier: 4×–10×
-        2.0 + 4.0 * blend,   # Standard: 2×–6×
+        pareto_base + (pareto_ceiling - pareto_base) * blend,
+        std_base    + (std_ceiling    - std_base)    * blend,
     )
     return caps
 

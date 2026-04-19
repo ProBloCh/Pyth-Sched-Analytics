@@ -84,6 +84,20 @@ except Exception as _solver_err:
     logging.warning("Solver package failed to load: %s. "
                     "Solver endpoints will be unavailable.", _solver_err)
 
+try:
+    from completion import completion_bp
+    app.register_blueprint(completion_bp)
+except Exception as _completion_err:
+    logging.warning("Completion package failed to load: %s. "
+                    "Completion endpoints will be unavailable.", _completion_err)
+
+try:
+    from evm import evm_bp
+    app.register_blueprint(evm_bp)
+except Exception as _evm_err:
+    logging.warning("EVM package failed to load: %s. "
+                    "EVM endpoints will be unavailable.", _evm_err)
+
 ###############################################################################
 # Redis Cache Setup                                                           #
 ###############################################################################

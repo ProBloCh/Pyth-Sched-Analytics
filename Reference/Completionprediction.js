@@ -53,6 +53,21 @@
         monteCarloIterations: 1500,
         monteCarloSeed: 42,
         monteCarloMaxActivities: 12000,
+        // Backend Monte Carlo offload (Pyth-Sched-Analytics /completion/monte-carlo).
+        // When true and the endpoint responds, the backend runs the five-tier
+        // risk-distribution MC and the JS version is used only as a fallback.
+        // Set to false to force the legacy in-browser MC.
+        useBackendCompletion: true,
+        completionEndpoint: '/completion/monte-carlo',
+        completionRequestTimeoutMs: 15000,
+        // Backend recovery-option offload
+        // (Pyth-Sched-Analytics /completion/recovery-options).
+        // Same backend-first pattern: buildCrashOptions falls through to the
+        // in-browser implementation on any failure.  AI enrichment still runs
+        // on the returned crash_candidates if aiEnrichmentEnabled is true.
+        useBackendRecovery: true,
+        recoveryEndpoint: '/completion/recovery-options',
+        recoveryRequestTimeoutMs: 10000,
         // Add to CONFIG object:
         mcNoRiskBelow: 0.06,    // Below this risk score, no inflation
         mcNormalFrom: 0.18,     // Above this, use normal distribution
@@ -1654,6 +1669,738 @@
 
         return results;
 
+    }
+
+    // =========================================================================
+    // BACKEND-FIRST MONTE CARLO WRAPPER
+    // =========================================================================
+    //
+    // Offloads the remaining-work MC to Pyth-Sched-Analytics'
+    // /completion/monte-carlo endpoint when available.  The backend uses
+    // the same five-tier risk-distribution model (triangular -> normal ->
+    // Birnbaum-Saunders -> Pareto; Natarajan et al. PMJ 2022, Flyvbjerg
+    // et al. JMIS 2022) but with Sobol QMC instead of Murmur3/FNV-1a
+    // hashing, and full working-calendar support.
+    //
+    // Returns the same shape as runMonteCarloRemaining() -- Date objects,
+    // camelCase keys -- so downstream code (buildRiskSchedules, etc.) is
+    // unchanged.  On any failure (disabled, endpoint missing, non-200,
+    // network error, timeout) the JS MC runs as a transparent fallback.
+    //
+    // finishSamples is intentionally omitted from the backend response
+    // (raw samples can balloon payloads into the MB range).  Callers that
+    // rely on finishSamples already guard with ``mc.finishSamples?.length``.
+
+    // Telemetry: silent counters + last_error so the main app can detect
+    // a degrading backend (e.g. 30% 5xx rate).  Never throws.
+    function _recordTelemetry(service, kind, detail) {
+        try {
+            const root = (typeof window !== 'undefined') ? window : null;
+            if (!root) return;
+            root.cybereumState = root.cybereumState || {};
+            const t = root.cybereumState.completionPredictionTelemetry =
+                root.cybereumState.completionPredictionTelemetry || {
+                    backend_calls: 0, backend_successes: 0,
+                    fallback_count: 0, last_error: null,
+                    by_service: {},
+                };
+            const per = t.by_service[service] =
+                t.by_service[service] || { calls: 0, successes: 0, fallbacks: 0 };
+            if (kind === 'call')        { t.backend_calls++;     per.calls++; }
+            else if (kind === 'success'){ t.backend_successes++; per.successes++; }
+            else if (kind === 'fallback') {
+                t.fallback_count++; per.fallbacks++;
+                if (detail) t.last_error = {
+                    service,
+                    reason: detail.reason || null,
+                    status: (detail.status != null) ? detail.status : null,
+                    message: detail.message || null,
+                    ts: Date.now(),
+                };
+            }
+        } catch (_) { /* never break the calling path */ }
+    }
+
+    async function runMonteCarloRemainingAsync(nodes, links, maps, expected,
+                                               reachability, drivingChain, opts = {}) {
+        const disabled = !CONFIG.useBackendCompletion
+            || typeof fetch !== 'function'
+            || !CONFIG.completionEndpoint;
+        if (disabled) {
+            _recordTelemetry('monte_carlo', 'fallback',
+                             { reason: 'backend_disabled' });
+            return runMonteCarloRemaining(nodes, links, maps, expected,
+                                          reachability, drivingChain, opts);
+        }
+
+        // If prerequisites that the sync path also requires are missing, the
+        // sync path returns null -- mirror that without ever hitting the network.
+        const scope = reachability?.scopeToEnd;
+        if (!maps?.statusDate || !maps?.endNode || !scope || scope.size === 0
+            || scope.size > CONFIG.monteCarloMaxActivities) {
+            _recordTelemetry('monte_carlo', 'fallback',
+                             { reason: 'prereqs_missing' });
+            return runMonteCarloRemaining(nodes, links, maps, expected,
+                                          reachability, drivingChain, opts);
+        }
+
+        _recordTelemetry('monte_carlo', 'call');
+        try {
+            const body = _buildCompletionRequestBody(
+                nodes, links, maps, reachability, opts);
+
+            const controller = (typeof AbortController === 'function')
+                ? new AbortController() : null;
+            const timer = controller ? setTimeout(
+                () => controller.abort(),
+                +CONFIG.completionRequestTimeoutMs || 15000) : null;
+
+            const resp = await fetch(CONFIG.completionEndpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                signal: controller ? controller.signal : undefined,
+            });
+
+            if (timer) clearTimeout(timer);
+
+            if (!resp.ok) {
+                _recordTelemetry('monte_carlo', 'fallback',
+                                 { reason: 'non_ok_status', status: resp.status });
+                console.warn('[CompletionPrediction] Backend MC returned',
+                             resp.status, '-- falling back to JS MC');
+                return runMonteCarloRemaining(nodes, links, maps, expected,
+                                              reachability, drivingChain, opts);
+            }
+
+            const payload = await resp.json();
+            const mapped = _mapCompletionResponse(payload);
+            _recordTelemetry('monte_carlo', 'success');
+
+            console.log('[CompletionPrediction] Backend MC results:', {
+                p20: mapped.p20Finish?.toISOString?.().split?.('T')?.[0],
+                p50: mapped.p50Finish?.toISOString?.().split?.('T')?.[0],
+                p80: mapped.p80Finish?.toISOString?.().split?.('T')?.[0],
+                iterations: mapped.iterations,
+                spreadDays: mapped.spreadDays,
+                scopeSize: payload.scope_size,
+                computationMs: payload.computation_ms,
+                cacheHit: payload.cache_hit,
+            });
+            return mapped;
+
+        } catch (err) {
+            _recordTelemetry('monte_carlo', 'fallback', {
+                reason: err?.name === 'AbortError' ? 'timeout' : 'network_error',
+                message: err?.message || String(err),
+            });
+            console.warn('[CompletionPrediction] Backend MC failed (',
+                         err?.name || 'error', err?.message || err,
+                         ') -- falling back to JS MC');
+            return runMonteCarloRemaining(nodes, links, maps, expected,
+                                          reachability, drivingChain, opts);
+        }
+    }
+
+    function _buildCompletionRequestBody(nodes, links, maps, reachability, opts) {
+        const scope = reachability?.scopeToEnd;
+        const statusDate = maps?.statusDate;
+
+        // Send only nodes in the MC scope -- plus any predecessor to preserve
+        // DAG integrity when the scope is a subset of the full graph.
+        const includeIds = new Set();
+        if (scope && scope.size > 0) {
+            for (const id of scope) includeIds.add(String(id));
+            // Pull in direct predecessors so lag propagation has something to
+            // chain off.  Backend will treat ActualFinish-bearing nodes as
+            // out-of-scope anchors.
+            for (const id of Array.from(includeIds)) {
+                const preds = maps?.predMap?.get(id);
+                if (preds) for (const p of preds) includeIds.add(String(p.source));
+            }
+        } else {
+            for (const n of nodes || EMPTY_ARRAY) includeIds.add(String(n.ID));
+        }
+
+        const sentNodes = [];
+        for (const n of nodes || EMPTY_ARRAY) {
+            const nid = String(n.ID);
+            if (!includeIds.has(nid)) continue;
+            sentNodes.push({
+                ID: nid,
+                Duration: n.Duration,
+                TimeUnits: n.TimeUnits,
+                PercentComplete: n.PercentComplete ?? n.percentComplete,
+                ExpectedStart: _isoOrNull(n.ExpectedStart),
+                ActualFinish: _isoOrNull(n.ActualFinish),
+                riskScore: n.riskScore ?? n.ComputedRiskScore,
+                SupplierType: n.SupplierType || n.supplierType,
+                ActivityPhase: n.ActivityPhase || n.activityPhase,
+            });
+        }
+
+        const sentLinks = [];
+        for (const l of links || EMPTY_ARRAY) {
+            const src = String(typeof l.source === 'object' ? l.source.ID : l.source);
+            const tgt = String(typeof l.target === 'object' ? l.target.ID : l.target);
+            if (!includeIds.has(src) || !includeIds.has(tgt)) continue;
+            sentLinks.push({
+                source: src,
+                target: tgt,
+                type: (l.type || 'FS').toUpperCase(),
+                lag: getLagInHours(l),
+            });
+        }
+
+        const teamCal = (typeof window !== 'undefined'
+                         && window.cybereumState?.teamCalendar) || null;
+        const holidays = Array.isArray(teamCal?.holidays)
+            ? teamCal.holidays.map(h => (h && h.date) ? h.date : h).filter(Boolean)
+            : [];
+
+        // Reference class for empirical-distribution calibration.  When
+        // set, the backend overrides tier-4 distribution / Pareto alpha /
+        // max multiplier per published sector data and emits a
+        // reference_class_calibrated companion alongside the model
+        // percentiles (Flyvbjerg / Cantarelli / Sovacool sources).
+        // Looks for explicit opt-in first, then maps cybereumState
+        // sector tags to canonical class names.
+        const project = (typeof window !== 'undefined'
+                         && window.cybereumState?.project) || null;
+        const referenceClass = opts.referenceClass
+            ?? project?.referenceClass
+            ?? project?.sector
+            ?? project?.projectType
+            ?? null;
+
+        // Per-request extension of the registry.  Customers with their
+        // own historical calibration can set
+        // window.cybereumState.customReferenceClasses = {name: {...}, ...}
+        // and reference one by name on the project.  Validated server
+        // side so a malformed entry returns 400 with a specific field.
+        const customClasses = opts.customReferenceClasses
+            ?? (typeof window !== 'undefined'
+                && window.cybereumState?.customReferenceClasses)
+            ?? null;
+
+        // {base, overrides} for one-off tweaks of a built-in class
+        // without registering a full custom class.  Useful when a
+        // single project deviates from the sector default for a
+        // known reason (e.g. unusually long permitting cycle).
+        const referenceClassOverrides = opts.referenceClassOverrides
+            ?? (typeof window !== 'undefined'
+                && window.cybereumState?.referenceClassOverrides)
+            ?? null;
+
+        const body = {
+            nodes: sentNodes,
+            links: sentLinks,
+            status_date: _isoOrNull(statusDate) || new Date(statusDate).toISOString(),
+            project_context: {
+                calendar: {
+                    hours_per_day: CONFIG.workingHoursPerDay || 8,
+                    working_days: Array.isArray(teamCal?.workingDays) && teamCal.workingDays.length
+                        ? teamCal.workingDays
+                        : [1, 2, 3, 4, 5],
+                    holidays: holidays,
+                },
+            },
+            config: {
+                iterations: opts.iterations ?? CONFIG.monteCarloIterations,
+                seed: (opts.seed ?? CONFIG.monteCarloSeed) >>> 0,
+                enable_risk: !!CONFIG.riskEnabled,
+                thresholds: {
+                    no_risk_below: opts.noRiskBelow ?? CONFIG.mcNoRiskBelow,
+                    normal_from: opts.normalFrom ?? CONFIG.mcNormalFrom,
+                    fat_tail_from: opts.fatTailFrom ?? CONFIG.mcFatTailFrom,
+                },
+                caps: {
+                    min_mult: opts.minMult ?? CONFIG.mcMinMult,
+                    max_mult_base: opts.maxMultBase ?? CONFIG.mcMaxMultBase,
+                    max_mult_high: opts.maxMultHigh ?? CONFIG.mcMaxMultHigh,
+                },
+                reference_class: referenceClass,
+                custom_reference_classes: customClasses,
+                reference_class_overrides: referenceClassOverrides,
+            },
+        };
+        return body;
+    }
+
+    function _mapCompletionResponse(payload) {
+        const toDate = (iso) => {
+            if (!iso) return null;
+            const d = new Date(iso);
+            return Number.isFinite(d.getTime()) ? clampDate(d) : null;
+        };
+        // Reference-class calibration: when the backend resolved a
+        // class via config.reference_class (set from
+        // cybereumState.project.referenceClass / sector / projectType),
+        // it returns a `reference_class_calibrated` companion with
+        // empirically-corrected percentiles + citations.  Mapped here
+        // to camelCase so UI code can show "Model P80: X | Calibrated
+        // P80: Y" alongside each other.
+        const cal = payload.reference_class_calibrated || null;
+        const calibrated = cal ? {
+            p50Finish:           toDate(cal.p50_finish),
+            p80Finish:           toDate(cal.p80_finish),
+            p95Finish:           toDate(cal.p95_finish),
+            p99Finish:           toDate(cal.p99_finish),
+            referenceClass:      cal.reference_class,
+            percentileFactors:   cal.percentile_factors,
+            meanOverrunPublished: cal.mean_overrun_published,
+            isFatTailed:         cal.is_fat_tailed,
+            hasFiniteMean:       cal.has_finite_mean,
+            tier4Distribution:   cal.tier_4_distribution,
+            paretoAlphaRange:    cal.pareto_alpha_range,
+            maxMultiplierCap:    cal.max_multiplier_cap,
+            citations:           cal.citations,
+        } : null;
+
+        return {
+            p20Finish: toDate(payload.p20_finish),
+            p50Finish: toDate(payload.p50_finish),
+            p80Finish: toDate(payload.p80_finish),
+            spreadDays: Number.isFinite(payload.spread_days)
+                ? Math.round(payload.spread_days) : 0,
+            iterations: payload.iterations ?? 0,
+            seed: payload.seed ?? 0,
+            finishSamples: [],
+            expectedFinish: toDate(payload.expected_finish),
+            p20ImpactDays: payload.p20_impact_days,
+            p50ImpactDays: payload.p50_impact_days,
+            p80ImpactDays: payload.p80_impact_days,
+            activityPercentiles: payload.activity_percentiles,
+            referenceClassCalibrated: calibrated,
+            calibrationWarnings: payload.calibration_warnings || [],
+            source: 'backend',
+        };
+    }
+
+    function _isoOrNull(value) {
+        if (!value) return null;
+        if (value instanceof Date) {
+            return Number.isFinite(value.getTime()) ? value.toISOString() : null;
+        }
+        const d = safeDate(value);
+        return d ? d.toISOString() : null;
+    }
+
+    // -------------------------------------------------------------------------
+    // Reference-class discovery: fetch the list of available sectors from the
+    // backend so a sector dropdown can populate dynamically (rather than
+    // hardcoding the 19 built-ins in the frontend).  Cached on window after
+    // the first call; memoised per page load.  Returns null on backend
+    // failure so the caller can fall back to a static list.
+    // -------------------------------------------------------------------------
+    let _referenceClassesCache = null;
+    async function fetchReferenceClasses() {
+        if (_referenceClassesCache) return _referenceClassesCache;
+        const disabled = !CONFIG.useBackendCompletion
+            || typeof fetch !== 'function'
+            || !CONFIG.completionEndpoint;
+        if (disabled) {
+            _recordTelemetry('reference_classes', 'fallback',
+                             { reason: 'backend_disabled' });
+            return null;
+        }
+        // Derive the discovery URL from the configured MC endpoint base
+        // so callers don't need a second config knob.
+        const base = CONFIG.completionEndpoint.replace(/\/monte-carlo\/?$/, '');
+        const url = base + '/reference-classes';
+        _recordTelemetry('reference_classes', 'call');
+        try {
+            const resp = await fetch(url, { method: 'GET' });
+            if (!resp.ok) {
+                _recordTelemetry('reference_classes', 'fallback',
+                                 { reason: 'non_ok_status', status: resp.status });
+                return null;
+            }
+            const data = await resp.json();
+            _referenceClassesCache = data;
+            _recordTelemetry('reference_classes', 'success');
+            return data;
+        } catch (err) {
+            _recordTelemetry('reference_classes', 'fallback',
+                             { reason: 'network_error', message: err?.message });
+            console.warn('[CompletionPrediction] reference-class discovery failed:', err);
+            return null;
+        }
+    }
+    if (typeof window !== 'undefined') {
+        window.fetchReferenceClasses = fetchReferenceClasses;
+    }
+
+    // -------------------------------------------------------------------------
+    // Outcome registration: customers can submit project actuals so the
+    // backend accumulates real predicted-vs-actual data.  Without this,
+    // the reference-class table is "trust the literature"; with it, the
+    // customer can validate their own portfolio over time.
+    //
+    // Call when a project closes out (or at any milestone with reliable
+    // actuals).  Backend storage is best-effort -- backend failures
+    // log a warning but don't block the calling UI.
+    // -------------------------------------------------------------------------
+    async function registerProjectOutcome(record) {
+        const disabled = !CONFIG.useBackendCompletion
+            || typeof fetch !== 'function'
+            || !CONFIG.completionEndpoint;
+        if (disabled) {
+            _recordTelemetry('outcome', 'fallback',
+                             { reason: 'backend_disabled' });
+            console.warn('[CompletionPrediction] Backend disabled; outcome not registered');
+            return null;
+        }
+        const base = CONFIG.completionEndpoint.replace(/\/monte-carlo\/?$/, '');
+        _recordTelemetry('outcome', 'call');
+        try {
+            const resp = await fetch(base + '/register-outcome', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(record),
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+                _recordTelemetry('outcome', 'fallback',
+                                 { reason: 'non_ok_status', status: resp.status,
+                                   message: data && data.error });
+                console.warn('[CompletionPrediction] register-outcome rejected:',
+                             data && data.error);
+                return null;
+            }
+            _recordTelemetry('outcome', 'success');
+            return data;
+        } catch (err) {
+            _recordTelemetry('outcome', 'fallback',
+                             { reason: 'network_error', message: err?.message });
+            console.warn('[CompletionPrediction] register-outcome failed:', err);
+            return null;
+        }
+    }
+
+    async function fetchCalibrationReport(referenceClass) {
+        const disabled = !CONFIG.useBackendCompletion
+            || typeof fetch !== 'function'
+            || !CONFIG.completionEndpoint;
+        if (disabled) {
+            _recordTelemetry('calibration', 'fallback',
+                             { reason: 'backend_disabled' });
+            return null;
+        }
+        const base = CONFIG.completionEndpoint.replace(/\/monte-carlo\/?$/, '');
+        const url = referenceClass
+            ? `${base}/calibration-report?reference_class=${encodeURIComponent(referenceClass)}`
+            : `${base}/calibration-report`;
+        _recordTelemetry('calibration', 'call');
+        try {
+            const resp = await fetch(url, { method: 'GET' });
+            if (!resp.ok) {
+                _recordTelemetry('calibration', 'fallback',
+                                 { reason: 'non_ok_status', status: resp.status });
+                return null;
+            }
+            const data = await resp.json();
+            _recordTelemetry('calibration', 'success');
+            return data;
+        } catch (err) {
+            _recordTelemetry('calibration', 'fallback',
+                             { reason: 'network_error', message: err?.message });
+            console.warn('[CompletionPrediction] calibration-report failed:', err);
+            return null;
+        }
+    }
+
+    if (typeof window !== 'undefined') {
+        window.registerProjectOutcome = registerProjectOutcome;
+        window.fetchCalibrationReport = fetchCalibrationReport;
+    }
+
+    // =========================================================================
+    // BACKEND-FIRST RECOVERY OPTIONS WRAPPER
+    // =========================================================================
+    //
+    // Offloads crash/lag candidate ranking to the Pyth-Sched-Analytics
+    // /completion/recovery-options endpoint when available.  The backend
+    // ports classifyCrashProfile + buildCrashOptions lines ~2062-2300;
+    // on any failure (disabled, missing endpoint, non-200, network,
+    // timeout) the original sync buildCrashOptions runs as a fallback.
+    //
+    // Shape parity: returns the same camelCase keys downstream consumers
+    // expect (targetDays, recoveryOptions, lagOptions, _crashCandidates,
+    // _enrichmentPending, etc.) so wireRiskMitigationClicks and the UI
+    // renderers are unchanged.  AI enrichment is still kicked off on the
+    // returned crash candidates when CONFIG.aiEnrichmentEnabled is true.
+
+    async function buildCrashOptionsAsync(nodes, maps, expected, risk,
+                                          reachability, drivingChain) {
+        const disabled = !CONFIG.useBackendRecovery
+            || typeof fetch !== 'function'
+            || !CONFIG.recoveryEndpoint;
+        if (disabled) {
+            _recordTelemetry('recovery', 'fallback',
+                             { reason: 'backend_disabled' });
+            return buildCrashOptions(nodes, maps, expected, risk,
+                                     reachability, drivingChain);
+        }
+
+        const scope = reachability?.scopeToEnd;
+        if (!maps?.statusDate || !scope || scope.size === 0
+            || scope.size > CONFIG.monteCarloMaxActivities) {
+            _recordTelemetry('recovery', 'fallback',
+                             { reason: 'prereqs_missing' });
+            return buildCrashOptions(nodes, maps, expected, risk,
+                                     reachability, drivingChain);
+        }
+
+        _recordTelemetry('recovery', 'call');
+        try {
+            const body = _buildRecoveryRequestBody(
+                nodes, maps, expected, risk, reachability);
+
+            const controller = (typeof AbortController === 'function')
+                ? new AbortController() : null;
+            const timer = controller ? setTimeout(
+                () => controller.abort(),
+                +CONFIG.recoveryRequestTimeoutMs || 10000) : null;
+
+            const resp = await fetch(CONFIG.recoveryEndpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                signal: controller ? controller.signal : undefined,
+            });
+
+            if (timer) clearTimeout(timer);
+
+            if (!resp.ok) {
+                _recordTelemetry('recovery', 'fallback',
+                                 { reason: 'non_ok_status', status: resp.status });
+                console.warn('[CompletionPrediction] Backend recovery returned',
+                             resp.status, '-- falling back to JS buildCrashOptions');
+                return buildCrashOptions(nodes, maps, expected, risk,
+                                         reachability, drivingChain);
+            }
+
+            const payload = await resp.json();
+            const mapped = _mapRecoveryResponse(payload, nodes, maps, expected,
+                                                scope, risk, drivingChain);
+            _recordTelemetry('recovery', 'success');
+
+            // AI enrichment: reuse the existing sync helpers so the UI flow
+            // (spinner + final replacement of recoveryOptions) continues to
+            // work regardless of backend mode.
+            if (CONFIG.aiEnrichmentEnabled && mapped._crashCandidates.length > 0) {
+                mapped._enrichmentPromise = (async () => {
+                    try {
+                        const projectContext = {
+                            sector: typeof inferProjectSector === 'function'
+                                ? inferProjectSector(mapped._crashCandidates) : null,
+                            overrunDays: Math.round(
+                                (expected.expectedProjectFinish - expected.plannedProjectFinish)
+                                / MS_PER_DAY),
+                            spreadDays: risk?.spreadDays || 0
+                        };
+                        const assessments = await requestCrashEnrichment(
+                            mapped._crashCandidates, projectContext);
+                        if (assessments && assessments.size > 0) {
+                            mapped.recoveryOptions = applyAIEnrichment(
+                                mapped.recoveryOptions, assessments);
+                            mapped._enrichmentComplete = true;
+                            const newAchievedHrs = mapped.recoveryOptions.reduce(
+                                (sum, o) => sum + (o.crashHours || 0), 0);
+                            mapped.achievedDays = Math.round(
+                                newAchievedHrs / CONFIG.workingHoursPerDay);
+                        }
+                    } catch (e) {
+                        console.warn('[CompletionPrediction] Enrichment failed '
+                                     + '(backend-recovery path):', e);
+                    }
+                })();
+            }
+
+            console.log('[CompletionPrediction] Backend recovery results:', {
+                targetDays: mapped.targetDays,
+                achievedDays: mapped.achievedDays,
+                overrunDays: payload.overrun_days,
+                recoveryOptions: mapped.recoveryOptions.length,
+                lagOptions: mapped.lagOptions.length,
+                scenarioMode: payload.is_scenario_mode,
+                computationMs: payload.computation_ms,
+                cacheHit: payload.cache_hit,
+            });
+            return mapped;
+
+        } catch (err) {
+            _recordTelemetry('recovery', 'fallback', {
+                reason: err?.name === 'AbortError' ? 'timeout' : 'network_error',
+                message: err?.message || String(err),
+            });
+            console.warn('[CompletionPrediction] Backend recovery failed (',
+                         err?.name || 'error', err?.message || err,
+                         ') -- falling back to JS buildCrashOptions');
+            return buildCrashOptions(nodes, maps, expected, risk,
+                                     reachability, drivingChain);
+        }
+    }
+
+    function _buildRecoveryRequestBody(nodes, maps, expected, risk, reachability) {
+        const scope = reachability?.scopeToEnd;
+        const statusDate = maps?.statusDate;
+
+        const includeIds = new Set();
+        if (scope && scope.size > 0) {
+            for (const id of scope) includeIds.add(String(id));
+            for (const id of Array.from(includeIds)) {
+                const preds = maps?.predMap?.get(id);
+                if (preds) for (const p of preds) includeIds.add(String(p.source));
+            }
+        } else {
+            for (const n of nodes || EMPTY_ARRAY) includeIds.add(String(n.ID));
+        }
+
+        const sentNodes = [];
+        for (const n of nodes || EMPTY_ARRAY) {
+            const nid = String(n.ID);
+            if (!includeIds.has(nid)) continue;
+            sentNodes.push({
+                ID: nid,
+                Name: n.Name || nid,
+                Duration: n.Duration,
+                TimeUnits: n.TimeUnits,
+                PercentComplete: n.PercentComplete ?? n.percentComplete,
+                ActualFinish: _isoOrNull(n.ActualFinish),
+                SupplierType: n.SupplierType || n.supplierType,
+                Milestone: n.Milestone === true || n.Milestone === 1 || n.Milestone === '1',
+                ComputedImportanceScore: n.ComputedImportanceScore
+                    ?? n.importanceScore ?? n.importance,
+            });
+        }
+
+        const sentLinks = [];
+        for (const l of (maps?.linkIndex ? null : null) || EMPTY_ARRAY) { /* placeholder */ }
+        // Re-derive links from maps.predMap (frontend doesn't keep the
+        // raw links list around in all code paths).
+        if (maps?.predMap) {
+            for (const [targetId, preds] of maps.predMap) {
+                if (!includeIds.has(String(targetId))) continue;
+                for (const p of preds) {
+                    const srcId = String(p.source);
+                    if (!includeIds.has(srcId)) continue;
+                    sentLinks.push({
+                        source: srcId,
+                        target: String(targetId),
+                        type: (p.type || 'FS').toUpperCase(),
+                        lag: +p.lagHrs || 0,
+                        lagUnits: 'h',
+                    });
+                }
+            }
+        }
+
+        const teamCal = (typeof window !== 'undefined'
+                         && window.cybereumState?.teamCalendar) || null;
+        const holidays = Array.isArray(teamCal?.holidays)
+            ? teamCal.holidays.map(h => (h && h.date) ? h.date : h).filter(Boolean)
+            : [];
+
+        return {
+            nodes: sentNodes,
+            links: sentLinks,
+            status_date: _isoOrNull(statusDate) || new Date(statusDate).toISOString(),
+            planned_finish:   _isoOrNull(expected?.plannedProjectFinish),
+            expected_finish:  _isoOrNull(expected?.expectedProjectFinish),
+            p80_finish:       _isoOrNull(risk?.p80Finish),
+            project_context: {
+                calendar: {
+                    hours_per_day: CONFIG.workingHoursPerDay || 8,
+                    working_days: Array.isArray(teamCal?.workingDays) && teamCal.workingDays.length
+                        ? teamCal.workingDays
+                        : [1, 2, 3, 4, 5],
+                    holidays: holidays,
+                },
+            },
+            config: {
+                max_risk_buffer_days:         CONFIG.maxRiskBufferDaysForRecovery,
+                max_recovery_options:         CONFIG.maxRecoveryOptions,
+                max_lag_options:              CONFIG.maxLagOptions,
+                min_crashable_hours:          CONFIG.minCrashableHours,
+                min_lag_days_for_compression: CONFIG.minLagDaysForCompression,
+                lag_compression_factor:       CONFIG.lagCompressionFactor,
+            },
+        };
+    }
+
+    function _mapRecoveryResponse(payload, nodes, maps, expected, scope, risk,
+                                  drivingChain) {
+        // Map snake_case backend fields to the camelCase JS contract.
+        const recoveryOptions = (payload.recovery_options || []).map(o => ({
+            id:                    o.id,
+            type:                  o.type,
+            title:                 o.title,
+            targetActivityId:      o.target_activity_id,
+            activityName:          o.activity_name,
+            kind:                  o.kind,
+            crashHours:            o.crash_hours,
+            potentialSavingsDays:  o.potential_savings_days,
+            leverage:              o.leverage,
+            isOnDrivingChain:      o.is_on_critical_path,
+            floatDays:             o.float_days,
+            effort:                o.effort,
+            risk:                  o.risk,
+            rationale:             o.rationale,
+        }));
+
+        const lagOptions = (payload.lag_options || []).map(o => ({
+            id:                    o.id,
+            type:                  o.type,
+            title:                 o.title,
+            edgeId:                o.edge_id,
+            sourceId:              o.source_id,
+            targetId:              o.target_id,
+            sourceName:            o.source_name,
+            targetName:            o.target_name,
+            relationType:          o.relation_type,
+            currentLagHours:       o.current_lag_hours,
+            currentLagDays:        o.current_lag_days,
+            potentialSavingsDays:  o.potential_savings_days,
+            isOnDrivingChain:      o.is_on_critical_path,
+            effort:                o.effort,
+            risk:                  o.risk,
+        }));
+
+        // Remap raw crash_candidates to the camelCase shape the AI
+        // enrichment helper expects (requestCrashEnrichment).
+        const crashCandidates = (payload.crash_candidates || []).map(c => ({
+            id:           c.id,
+            name:         c.name,
+            kind:         c.kind,
+            remainingHrs: c.remaining_hrs,
+            maxCrashHrs:  c.max_crash_hrs,
+            leverage:     c.leverage,
+            isChain:      c.is_on_critical_path,
+            floatDays:    c.float_days,
+            score:        c.score,
+            importance:   c.importance,
+        }));
+
+        return {
+            recoveryOptions,
+            lagOptions,
+            // riskMitigationOptions stays empty in backend mode; the
+            // risk-register path is JS-only (see CLAUDE.md).
+            riskMitigationOptions: [],
+            targetDays:     payload.target_days,
+            achievedDays:   payload.achieved_days,
+            notes:          payload.notes || '',
+            _enrichmentPending:
+                !!CONFIG.aiEnrichmentEnabled && crashCandidates.length > 0,
+            _enrichmentComplete: false,
+            _crashCandidates: crashCandidates,
+            _scope:    scope,
+            _maps:     maps,
+            _expected: expected,
+            source:    'backend',
+        };
     }
 
     // =========================================================================
@@ -4765,7 +5512,7 @@
         const selectedMitigations = new Set();
 
         container.querySelectorAll('.cp7-risk-card').forEach(card => {
-            card.addEventListener('click', (e) => {
+            card.addEventListener('click', async (e) => {
                 // Toggle selection
                 const id = card.dataset.id;
                 if (!id) return;
@@ -4778,10 +5525,18 @@
                     card.classList.add('cp7-risk-selected');
                 }
 
-                // Recalculate Monte Carlo with mitigations
+                // Recalculate Monte Carlo with mitigations -- backend-first
+                // with JS fallback (see recalculateWithMitigationsAsync).
                 if (selectedMitigations.size > 0) {
-                    const newRisk = recalculateWithMitigations(analysis, selectedMitigations);
-                    updateRiskDisplay(containerId, newRisk, selectedMitigations.size);
+                    try {
+                        const newRisk = await recalculateWithMitigationsAsync(
+                            analysis, selectedMitigations);
+                        updateRiskDisplay(containerId, newRisk, selectedMitigations.size);
+                    } catch (err) {
+                        console.warn('[CompletionPrediction] Async mitigation recalc failed; using sync path:', err);
+                        const newRisk = recalculateWithMitigations(analysis, selectedMitigations);
+                        updateRiskDisplay(containerId, newRisk, selectedMitigations.size);
+                    }
                 } else {
                     // Restore original
                     updateRiskDisplay(containerId, analysis.risk, 0);
@@ -4837,6 +5592,50 @@
 
         return newRisk;
     }
+
+    // -------------------------------------------------------------------------
+    // Backend-aware mitigation recalculation.  Identical shape to
+    // recalculateWithMitigations() but awaits the /completion/monte-carlo
+    // endpoint (with JS fallback) so mitigated-risk P20/P50/P80s stay
+    // consistent with the initial analysis.
+    // -------------------------------------------------------------------------
+    async function recalculateWithMitigationsAsync(analysis, selectedMitigationIds) {
+        if (!selectedMitigationIds || selectedMitigationIds.size === 0) {
+            return analysis.risk;
+        }
+
+        const { nodes, links, maps, expected, reachability, drivingChain } = analysis;
+
+        // The backend reads risk from node.riskScore / node.ComputedRiskScore
+        // directly, so we build a modified *nodes list* (parallel to the
+        // modifiedNodeMap) rather than trying to serialise a Map.  Nodes not
+        // in the mitigation set pass through unchanged by reference.
+        const modifiedNodeMap = new Map(maps.nodeMap);
+        const modifiedNodes = (nodes || []).map((n) => {
+            const mitigationId = 'risk_' + String(n.ID);
+            if (!selectedMitigationIds.has(mitigationId)) return n;
+            const originalInternal = +(n.riskScore ?? n.ComputedRiskScore ?? 0);
+            const originalExternal = +(n.externalScheduleRisk ?? n.ExternalScheduleRisk ?? 0);
+            const mitigated = {
+                ...n,
+                riskScore: originalInternal * 0.4,
+                ComputedRiskScore: originalInternal * 0.4,
+                externalScheduleRisk: originalExternal * 0.4,
+                ExternalScheduleRisk: originalExternal * 0.4,
+                _mitigated: true
+            };
+            modifiedNodeMap.set(String(n.ID), mitigated);
+            return mitigated;
+        });
+
+        const modifiedMaps = { ...maps, nodeMap: modifiedNodeMap };
+
+        return await runMonteCarloRemainingAsync(
+            modifiedNodes, links, modifiedMaps, expected, reachability, drivingChain,
+            { seed: CONFIG.monteCarloSeed + selectedMitigationIds.size }
+        );
+    }
+
     function updateRiskDisplay(containerId, risk, mitigationCount) {
         const container = document.getElementById(containerId);
         if (!container) return;
@@ -5365,6 +6164,154 @@
         return analysis;
     }
 
+    // -------------------------------------------------------------------------
+    // analyzeAsync: identical to analyze() except the Monte Carlo call is
+    // awaited against the Pyth-Sched-Analytics /completion/monte-carlo
+    // backend (with the in-browser MC as a transparent fallback).  Exposed
+    // as a separate function so the sync entry point (initSync) and any
+    // other sync callers continue to work unchanged.
+    // -------------------------------------------------------------------------
+    async function analyzeAsync(nodes, links, opts = {}) {
+        _cachedWeights = null;
+        _holidaySet = null;
+
+        const teamCal = window.cybereumState?.teamCalendar;
+        if (teamCal) {
+            CONFIG.workingHoursPerDay = teamCal.hoursPerDay || 8;
+            CONFIG.workingDaysPerWeek = teamCal.workingDays?.length || 5;
+        }
+
+        if (typeof convertToHours !== 'function') {
+            console.error('[CompletionPrediction] convertToHours not available — PathScripts.js may not be loaded');
+            return null;
+        }
+
+        const maps = getStateMaps(nodes, links || []);
+        if (!maps) {
+            console.error('[CompletionPrediction] Analysis failed: could not build state maps.');
+            return null;
+        }
+        console.log('[CompletionPrediction] Maps Initialized:', {
+            nodeCount: maps.nodeMap.size,
+            statusDate: maps.statusDate,
+            hasCycle: maps.hasCycle
+        });
+
+        const expected = computeExpectedSchedule(nodes, links || [], maps, null);
+        console.log('[CompletionPrediction] Expected Schedule:', {
+            plannedFinish: expected.plannedProjectFinish,
+            expectedFinish: expected.expectedProjectFinish,
+            varianceDays: expected.projectVariance
+        });
+
+        const drivingChain = getExpectedDrivingChain(maps.endNode, maps.nodeMap);
+        console.log('[CompletionPrediction] Driving Chain length:', drivingChain.length, drivingChain);
+
+        if (drivingChain.length > 0) {
+            console.log('[CompletionPrediction] Driving Chain Details:');
+            const chainTable = drivingChain.map((n, idx) => {
+                const expF = safeDate(n.ExpectedFinish);
+                const plnF = safeDate(n.Finish);
+                const pct = effectivePercentComplete(n, maps);
+                const durH = convertToHours(n.Duration, n.TimeUnits);
+                return {
+                    seq: idx + 1,
+                    id: n.ID,
+                    name: (n.Name || '').substring(0, 30),
+                    pct: Math.round(pct * 100) + '%',
+                    durDays: Math.round(durH / CONFIG.workingHoursPerDay),
+                    plannedFinish: plnF ? formatDate(plnF) : '—',
+                    expectedFinish: expF ? formatDate(expF) : '—',
+                    slipDays: (plnF && expF) ? daysBetween(plnF, expF) : 0
+                };
+            });
+            console.table(chainTable);
+        }
+
+        const activeActivities = identifyActiveActivities(nodes, maps);
+        const reachability = buildReachabilitySets(maps, nodes, drivingChain);
+        console.log('[CompletionPrediction] Scope identified:', {
+            activeCount: activeActivities.length,
+            nodesInScope: reachability.scopeToEnd.size
+        });
+
+        const mc = await runMonteCarloRemainingAsync(
+            nodes, links, maps, expected, reachability, drivingChain, opts);
+        if (mc) {
+            console.log('[CompletionPrediction] Monte Carlo Results:', {
+                p50: mc.p50Finish,
+                p80: mc.p80Finish,
+                iterations: mc.iterations,
+                source: mc.source || 'js'
+            });
+        }
+
+        const risk = buildRiskSchedules(nodes, links || [], maps, expected, reachability, mc);
+        console.log('[CompletionPrediction] Risk Schedules built:', {
+            p50Impact: risk.p50ImpactDays,
+            p80Impact: risk.p80ImpactDays
+        });
+
+        // Backend-first recovery options; falls back to JS buildCrashOptions
+        // on any backend failure (see buildCrashOptionsAsync).
+        const crashPlan = await buildCrashOptionsAsync(
+            nodes, maps, expected, risk, reachability, drivingChain);
+        console.log('[CompletionPrediction] Recovery Optimizer:', {
+            targetDays: crashPlan.targetDays,
+            achievableDays: crashPlan.achievedDays,
+            optionsFound: crashPlan.recoveryOptions.length + crashPlan.lagOptions.length,
+            source: crashPlan.source || 'js'
+        });
+
+        const curves = buildCurves(nodes, maps, expected, risk);
+        console.log('[CompletionPrediction] Curve Diagnostics:', {
+            totalBudgetHours: Math.round(curves.totalBudgetHours),
+            completedHours: Math.round(curves.completedHours),
+            inProgressEarned: Math.round(curves.inProgressEarnedHours),
+            actualEarnedHours: Math.round(curves.actualEarnedHours),
+            statusPct: curves.statusPct.toFixed(1) + '%',
+            plannedCurvePoints: curves.plannedCurve.length,
+            expectedCurvePoints: curves.expectedCurve.length
+        });
+
+        const summary = buildSummary(expected, risk, crashPlan, drivingChain, maps);
+        console.log('[CompletionPrediction] Final Summary:', summary.headline);
+
+        const analysis = {
+            maps,
+            nodes,
+            links: links || [],
+            expected,
+            risk,
+            mc,
+            crashPlan,
+            curves,
+            summary,
+            activeActivities,
+            reachability,
+            drivingChain
+        };
+
+        analysis.recoveryActionCardPayload = buildRecoveryActionCardPayload(analysis);
+        _lastAnalysis = analysis;
+
+        try {
+            const globalState = (typeof window !== 'undefined' ? window.cybereumState : global.cybereumState) || {};
+            globalState.completionPrediction = {
+                statusDate: maps.statusDate,
+                plannedFinish: summary.plannedFinish,
+                expectedFinish: summary.expectedFinish,
+                p50Finish: summary.p50Finish,
+                p80Finish: summary.p80Finish
+            };
+            console.log('[CompletionPrediction] Global state updated.');
+        } catch (e) {
+            console.warn('[CompletionPrediction] Could not update global state:', e);
+        }
+
+        return analysis;
+    }
+
     /** @private Paint yield — lets the loader animate before blocking computation */
     function _yield() { return new Promise(function (r) { requestAnimationFrame(function () { setTimeout(r, 0); }); }); }
 
@@ -5416,7 +6363,10 @@
             if (_loaderReady && useLoader) { try { loader.markStep(0, 'working'); loader.markSource('schedule', true); } catch (_) { } }
             else if (_loaderReady && useInline && el) _advanceInlineStep(el, 0);
 
-            const analysis = analyze(nodes, links);
+            // Async analyze -- Monte Carlo is offloaded to /completion/monte-carlo
+            // when CONFIG.useBackendCompletion is true.  Falls back to in-browser
+            // MC automatically on any backend failure.
+            const analysis = await analyzeAsync(nodes, links);
 
             if (!analysis) {
                 if (_loaderReady && useLoader) { try { loader.status('ERROR'); setTimeout(() => loader.hide(), 1500); } catch (_) { } }
@@ -5511,7 +6461,17 @@
         analyze,
         destroy,
         CONFIG,
-        getLastAnalysis: () => _lastAnalysis
+        getLastAnalysis: () => _lastAnalysis,
+        // Internal helpers exposed for the JS<->Python diff harness only.
+        // Not part of the production API; using these from app code is
+        // unsupported and may break across versions.
+        _internals: {
+            classifyCrashProfile,
+            getLagInHours,
+            normalizePercentComplete,
+            convertToHours,
+            _recordTelemetry,
+        },
     };
 
 })(typeof window !== 'undefined' ? window : this);

@@ -1,0 +1,22 @@
+{
+    "nodes": [
+        {"ID": "0", "Duration": 0, "Milestone": 1,
+         "Start": "2025-01-01T00:00:00Z", "Finish": "2025-01-01T00:00:00Z"},
+        {"ID": "1", "Duration": 5, "TimeUnits": "days", "Name": "Done Activity",
+         "Start": "2025-01-01T00:00:00Z", "Finish": "2025-01-08T00:00:00Z",
+         "ActualStart": "2025-01-01T00:00:00Z",
+         "ActualFinish": "2025-01-09T00:00:00Z",
+         "ActualDuration": 48,
+         "PercentComplete": 100, "CostRate": 100, "ActualCost": 4800}
+    ],
+    "links": [
+        {"source": "0", "target": "1", "type": "FS", "lag": 0}
+    ],
+    "options": {
+        "statusDate": "2025-01-15T00:00:00Z",
+        "costRate": 100,
+        "project": {"sector": "construction"},
+        "hoursPerDay": 8,
+        "workingDaysPerWeek": 5
+    }
+}

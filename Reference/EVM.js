@@ -695,6 +695,18 @@ function findValueAtDate(distribution, date, key) {
     return point ? (point[key] || point.value || 0) : null;
 }
 
+// Backend EVM service configuration (Pyth-Sched-Analytics /evm/analyze).
+// When true and the endpoint responds successfully, metrics and
+// distributions are computed backend-side; the in-browser EVM functions
+// (getCumulativeDistribution, createActualEVMChart) are used as
+// transparent fallback on any failure (network, non-200, timeout).
+// Set useBackendEVM = false to force the legacy in-browser path.
+const evmBackendConfig = {
+    useBackendEVM: true,
+    evmEndpoint: '/evm/analyze',
+    evmRequestTimeoutMs: 15000,
+};
+
 // Configuration object for customization
 const evmConfig = {
     bounds: {
@@ -1061,12 +1073,46 @@ function calculateBCWP_Hours(nodes) {
     return sum;
 }
 
-// Calculate ACWP with simplified logic
-function calculateACWP(nodes, CostRate = 1) {
+// Calculate ACWP with simplified logic.
+//
+// BUG FIX (2026-04): historic versions returned ACWP in cost units
+// (dollars) and were fed into calculateEVMetrics(BCWP_hours,
+// ACWP_dollars, BCWS_hours), making CPI = hours/dollars -- off by a
+// factor of CostRate.  We now expose two siblings:
+//   calculateACWP        -- legacy behaviour (cost units; for cost-side
+//                           display and for the dollars-consistent
+//                           metric call, kept as-is for callers that
+//                           depend on it (including external consumers).
+//   calculateACWP_Hours  -- hours (no cost rate applied); sibling for
+//                           callers that prefer hours-consistent CPI.
+//
+// UNIT CHOICE: after the forecasted-ACWP double-multiply fix, the
+// sync entry points (getCumulativeDistribution, createActualEVMChart)
+// feed *dollars*-valued BCWS / BCWP / ACWP into calculateEVMetrics so
+// CPI = EV/AC is dimensionally consistent in cost.  The async backend
+// wrappers receive the same-shaped dollars values from /evm/analyze.
+// calculateACWP_Hours is retained as a public helper for downstream
+// code that needs the hours equivalent (e.g. computing a purely
+// effort-based CPI); it is NOT used on the main metric path.
+function calculateACWP(nodes, CostRate = 1, applyCostRate = true,
+                       statusDate = null) {
     if (!Array.isArray(nodes)) return 0;
 
     let totalACWP = 0;
-    const today = new Date();
+    // BUG FIX (2026-04): originally `new Date()` -- the current wall
+    // clock -- which made the analysis non-idempotent (running the
+    // same fixture two days apart produced different ACWP).  The
+    // correct anchor for "expected progress" is the project's status
+    // date / data date.  Caller now passes statusDate explicitly;
+    // existing callers fall back to window.cybereumState.dataDate so
+    // the bug fix doesn't require changing every call site.
+    let today = safeDate(statusDate);
+    if (!today) {
+        today = (typeof window !== 'undefined'
+                 && window.cybereumState && window.cybereumState.dataDate)
+                ? safeDate(window.cybereumState.dataDate) : null;
+    }
+    if (!today) today = new Date();
 
     nodes.forEach(node => {
         try {
@@ -1077,7 +1123,13 @@ function calculateACWP(nodes, CostRate = 1) {
 
             const actualCost = parseFloat(node.ActualCost);
             if (actualCost && isFinite(actualCost) && actualCost > 0) {
-                totalACWP += actualCost;
+                if (applyCostRate) {
+                    totalACWP += actualCost;
+                } else {
+                    // Convert dollars back to hours via node CostRate
+                    const rate = parseFloat(node.CostRate) || CostRate || 1;
+                    totalACWP += actualCost / Math.max(rate, 1e-9);
+                }
             } else {
                 const nodeStart = safeDate(node.ActualStart || node.Start);
                 if (!nodeStart) return;
@@ -1105,7 +1157,8 @@ function calculateACWP(nodes, CostRate = 1) {
                         }
                     }
 
-                    totalACWP += plannedHours * pct * plannedCostRate * costMultiplier;
+                    const base = plannedHours * pct * costMultiplier;
+                    totalACWP += base * (applyCostRate ? plannedCostRate : 1.0);
                 }
             }
         } catch (error) {
@@ -1114,6 +1167,19 @@ function calculateACWP(nodes, CostRate = 1) {
     });
 
     return totalACWP;
+}
+
+// Sibling: ACWP in HOURS (no cost rate applied).  Use this for the
+// calculateEVMetrics call when hours-consistent CPI is preferred over
+// cost-consistent CPI.
+//
+// FIX (2026-04): forwards statusDate so the idempotency fix in the
+// cost-multiplier branch (no more new Date() drift) also applies when
+// callers use this sibling.  Falls back to the same
+// cybereumState.dataDate lookup as calculateACWP does.
+function calculateACWP_Hours(nodes, CostRate = 1, statusDate = null) {
+    return calculateACWP(nodes, CostRate, /*applyCostRate=*/false,
+                         statusDate);
 }
 
 // Calculate Budget at Completion (BAC) - in HOURS
@@ -1228,8 +1294,11 @@ function calculateForecastedBCWP(nodes, statusDate) {
     return bcwp;
 }
 
-// Forecasted ACWP using risk-adjusted durations
-function calculateForecastedACWP(nodes, statusDate) {
+// Forecasted ACWP using risk-adjusted durations.
+// `applyCostRate` (default true): legacy behaviour, returns dollars.
+//                  Set false to return hours for the unit-consistent
+//                  CPI calculation (see calculateACWP_Hours).
+function calculateForecastedACWP(nodes, statusDate, applyCostRate = true) {
     if (!Array.isArray(nodes) || !statusDate) return 0;
 
     const statusTime = safeDate(statusDate)?.getTime();
@@ -1247,20 +1316,27 @@ function calculateForecastedACWP(nodes, statusDate) {
             node.TimeUnits || "Hours"
         );
         const costRate = parseFloat(node.CostRate) || 1;
+        const rateFactor = applyCostRate ? costRate : 1;
 
         if (!riskStart || !riskEnd || !riskDuration) return;
 
         if (statusTime >= riskEnd) {
-            acwp += riskDuration * costRate;
+            acwp += riskDuration * rateFactor;
         } else if (statusTime > riskStart && statusTime < riskEnd) {
             const totalDuration = riskEnd - riskStart;
             const elapsed = statusTime - riskStart;
             const progress = elapsed / totalDuration;
-            acwp += riskDuration * costRate * progress;
+            acwp += riskDuration * rateFactor * progress;
         }
     });
 
     return acwp;
+}
+
+// Sibling: forecasted ACWP in HOURS.  Use this for the
+// calculateEVMetrics call so CPI = EV/AC is dimensionally consistent.
+function calculateForecastedACWP_Hours(nodes, statusDate) {
+    return calculateForecastedACWP(nodes, statusDate, /*applyCostRate=*/false);
 }
 
 /********************
@@ -1669,7 +1745,12 @@ function getCumulativeDistribution(nodes, links) {
         const BAC = totalPlanned * CostRate;
         const BCWS = calculateBCWS_Hours(workingNodes, statusDate) * CostRate;
         const BCWP = calculateForecastedBCWP(workingNodes, statusDate) * CostRate;
-        const ACWP = calculateForecastedACWP(workingNodes, statusDate) * CostRate;
+        // BUG FIX (2026-04): originally `calculateForecastedACWP() * CostRate`,
+        // which double-multiplied by the project rate when nodes carried an
+        // explicit `node.CostRate` (the function already applied the per-node
+        // rate internally).  Mirrors createActualEVMChart's pattern (line
+        // 1840 below): function output is already in dollars.
+        const ACWP = calculateForecastedACWP(workingNodes, statusDate);
 
         const { SV, CV, SPI, SPI_model, CPIcum, CPIcum_model, flags: evmFlags } = calculateEVMetrics(BCWP, ACWP, BCWS);
         const percentComplete = BAC > 0 ? (BCWP / BAC) * 100 : 0;
@@ -1786,7 +1867,9 @@ function createActualEVMChart(nodes, links) {
         // Calculate actual EVM metrics
         const BCWS_h = calculateBCWS_Hours(workingNodes, statusDate);
         const BCWP_h = calculateBCWP_Hours(workingNodes);
-        const ACWP_c = calculateACWP(workingNodes, CostRate);
+        // Pass statusDate so the cost-multiplier "expected progress"
+        // check anchors on the data date, not wall-clock now() (FIX 2026-04).
+        const ACWP_c = calculateACWP(workingNodes, CostRate, true, statusDate);
 
         const BCWP = BCWP_h * CostRate;
         const BCWS = BCWS_h * CostRate;
@@ -2126,6 +2209,431 @@ function createActualEVMChart(nodes, links) {
 }
 
 /********************
+ * BACKEND-FIRST EVM WRAPPERS (Pyth-Sched-Analytics /evm/analyze)
+ *
+ * Transparent offload of metric + distribution computation to the
+ * backend service.  Both entry points (getCumulativeDistribution,
+ * createActualEVMChart) have async siblings (...Async) that:
+ *   1. Short-circuit to the sync JS path when disabled / unavailable.
+ *   2. Otherwise POST to /evm/analyze and populate window.evmMetrics
+ *      with BOTH branches (forecasted + actual) in a single round trip.
+ *   3. Fall through to the original sync implementation on ANY error
+ *      (network, non-200, timeout, parse failure).
+ *
+ * Shape parity: the response maps directly onto the existing
+ * window.evmMetrics contract (camelCase keys, same nested layout,
+ * same top-level distributionPlanned / allDates / currency).  This
+ * means Completionprediction.js:4871 (which reads
+ * window.evmMetrics.actual.CPIcum) works unchanged.
+ *
+ * Fetch dedup: both async wrappers share a single in-flight Promise
+ * keyed on a cheap fingerprint.  When the user clicks between the
+ * "Forecasted" and "Actual" tabs in rapid succession, only one HTTP
+ * request goes out; the second wrapper awaits the same promise.
+ ********************/
+
+// Module-scoped dedup cache: { fingerprint: string, promise: Promise }
+let _evmInFlight = null;
+
+// Telemetry: shares window.cybereumState.completionPredictionTelemetry
+// with Completionprediction.js so the main app surfaces a single banner
+// when the backend is degrading.  Never throws.
+function _evmRecordTelemetry(kind, detail) {
+    try {
+        if (typeof window === 'undefined') return;
+        window.cybereumState = window.cybereumState || {};
+        const t = window.cybereumState.completionPredictionTelemetry =
+            window.cybereumState.completionPredictionTelemetry || {
+                backend_calls: 0, backend_successes: 0,
+                fallback_count: 0, last_error: null,
+                by_service: {},
+            };
+        const per = t.by_service.evm =
+            t.by_service.evm || { calls: 0, successes: 0, fallbacks: 0 };
+        if (kind === 'call')        { t.backend_calls++;     per.calls++; }
+        else if (kind === 'success'){ t.backend_successes++; per.successes++; }
+        else if (kind === 'fallback') {
+            t.fallback_count++; per.fallbacks++;
+            if (detail) t.last_error = {
+                service: 'evm',
+                reason: detail.reason || null,
+                status: (detail.status != null) ? detail.status : null,
+                message: detail.message || null,
+                ts: Date.now(),
+            };
+        }
+    } catch (_) { /* never break the calling path */ }
+}
+
+// Reference-identity cache for the FNV-1a content hash.  The expensive
+// loop (O(N+L) on the UI thread) is the per-node mix() chain; if the
+// caller passes the same nodes / links arrays as last time AND the
+// invalidation key + relevant cybereumState fields haven't changed, we
+// short-circuit to the previous fingerprint.  This keeps tab switches
+// jank-free on large schedules where the user isn't editing -- the
+// reviewer's main concern -- while still refreshing the moment the
+// data model produces new arrays or bumps evmInvalidationKey.
+let _evmFingerprintCache = {
+    nodes: null, links: null, key: null, fp: null,
+};
+
+function _evmFingerprint(nodes, links) {
+    // Fingerprint that changes when the project data changes but not
+    // when the user just switches tabs.  Two projects with the same
+    // node/link counts, statusDate, and sector would previously collide
+    // here -- so we also fold in a cheap FNV-1a-style content hash of
+    // node IDs + key schedule fields and link endpoints + types, plus a
+    // monotonic version flag callers can bump to force-refresh.
+    const statusDate = (window.cybereumState && window.cybereumState.dataDate)
+        ? String(window.cybereumState.dataDate) : 'now';
+    const sector = (window.cybereumState && window.cybereumState.project
+                    && window.cybereumState.project.sector) || '';
+    const projectId = (window.cybereumState && window.cybereumState.project
+                       && (window.cybereumState.project.id
+                           || window.cybereumState.project.projectId)) || '';
+
+    // Reference-identity short-circuit: if the caller passed the same
+    // arrays as last time AND nothing in the cache key changed, skip
+    // the O(N+L) loop entirely.  Tab switches (the common case) reuse
+    // the cached fingerprint and avoid janking the UI thread on large
+    // schedules.
+    const cacheKey = statusDate + '|' + sector + '|' + projectId
+        + '|' + (window.evmInvalidationKey || 0);
+    if (_evmFingerprintCache.nodes === nodes
+            && _evmFingerprintCache.links === links
+            && _evmFingerprintCache.key === cacheKey
+            && _evmFingerprintCache.fp !== null) {
+        return _evmFingerprintCache.fp;
+    }
+
+    // Cheap 32-bit FNV-1a over the minimal content string.  Fast (no
+    // crypto allocations), stable across tab switches, and collision
+    // rate is low enough for a request-dedup cache.
+    let h = 0x811c9dc5;
+    function mix(s) {
+        const str = String(s);
+        for (let i = 0; i < str.length; i++) {
+            h ^= str.charCodeAt(i);
+            h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+        }
+        h ^= 0x7c; // field separator (| char) so field-boundary collisions are rare
+        h >>>= 0;
+    }
+    const ns = nodes || [];
+    for (const n of ns) {
+        mix(n.ID);
+        mix(n.Start); mix(n.Finish);
+        mix(n.ActualStart); mix(n.ActualFinish);
+        mix(n.Duration); mix(n.TimeUnits);
+        mix(n.PercentComplete);
+        mix(n.CostRate); mix(n.ActualCost);
+        // Risk-adjusted dates feed BCWP (forecasted earned value) and
+        // distribution windows -- changing them changes the response.
+        mix(n.riskAdjustedStart); mix(n.riskAdjustedEnd);
+        mix(n.riskAdjustedDuration);
+        // Predicted dates feed the actual-branch case-4 EV path.
+        mix(n.predictedStart); mix(n.predictedEnd);
+    }
+    const ls = links || [];
+    for (const l of ls) {
+        mix(l.source); mix(l.target); mix(l.type);
+        mix(l.lag); mix(l.lagUnits);
+    }
+
+    const fp = JSON.stringify({
+        n: ns.length,
+        l: ls.length,
+        sd: statusDate,
+        sc: sector,
+        p: projectId,
+        h: h.toString(16),
+        v: window.evmInvalidationKey || 0,
+    });
+    _evmFingerprintCache = { nodes, links, key: cacheKey, fp };
+    return fp;
+}
+
+function _evmBuildRequestBody(nodes, links) {
+    const teamCal = (window.cybereumState && window.cybereumState.teamCalendar) || null;
+    // `window.CONFIG?.X` is safe here; plain `CONFIG?.X` would still
+    // throw ReferenceError if CONFIG is an undeclared identifier
+    // (optional chaining only handles null/undefined *values*, not
+    // undeclared names).  evmConfig is always declared in this file.
+    const cfg = (typeof window !== 'undefined' && window.CONFIG) || null;
+    const hpd = (teamCal && teamCal.hoursPerDay)
+        || (cfg && cfg.WORKING_HOURS_PER_DAY) || 8;
+    const workingDaysList = (teamCal && Array.isArray(teamCal.workingDays) && teamCal.workingDays.length)
+        ? teamCal.workingDays.slice()
+        : null;
+    const dpw = workingDaysList
+        ? workingDaysList.length
+        : ((cfg && cfg.WORKING_DAYS_PER_WEEK) || 5);
+    const holidaysList = (teamCal && Array.isArray(teamCal.holidays))
+        ? teamCal.holidays.slice() : [];
+    // Require a proper start milestone (ID === '0').  The sync paths
+    // (getCumulativeDistribution / createActualEVMChart) treat a missing
+    // start node as an error and return early; picking an arbitrary
+    // first node here would silently send the wrong costRate / currency
+    // to the backend and break transparent-fallback parity.  Return
+    // null so the async wrappers can detect this and fall through to
+    // the sync path, which will surface the same error the user would
+    // have seen without the backend wrapper.
+    const startNode = (nodes || []).find(n => String(n.ID) === '0');
+    if (!startNode) return null;
+
+    const statusDate = (window.cybereumState && window.cybereumState.dataDate)
+        ? new Date(window.cybereumState.dataDate).toISOString()
+        : new Date().toISOString();
+
+    // Calendar block carries the full workingDays list + holidays so the
+    // backend's holiday-aware predicted-date propagation matches what
+    // the JS fallback would compute.  Omitting either would make the
+    // backend diverge on any project with non-default weekdays or
+    // holiday gaps.
+    const calendar = {
+        hoursPerDay: hpd,
+        workingDays: workingDaysList || [1, 2, 3, 4, 5],
+        holidays: holidaysList,
+    };
+
+    return {
+        nodes: nodes || [],
+        links: links || [],
+        options: {
+            statusDate,
+            costRate: parseFloat(startNode.CostRate) || 1,
+            currency: startNode.Currency || 'USD',
+            project: (window.cybereumState && window.cybereumState.project) || null,
+            hoursPerDay: hpd,
+            workingDaysPerWeek: dpw,
+            workingDays: calendar.workingDays,
+            calendar,
+        },
+    };
+}
+
+async function _ensureEvmAnalysis(nodes, links) {
+    // De-duplicate concurrent calls; single round-trip populates both branches.
+    const fp = _evmFingerprint(nodes, links);
+    if (_evmInFlight && _evmInFlight.fingerprint === fp) {
+        return _evmInFlight.promise;
+    }
+
+    const controller = (typeof AbortController === 'function') ? new AbortController() : null;
+    const timer = controller ? setTimeout(
+        () => controller.abort(),
+        +evmBackendConfig.evmRequestTimeoutMs || 15000) : null;
+
+    const promise = (async () => {
+        _evmRecordTelemetry('call');
+        try {
+            const body = _evmBuildRequestBody(nodes, links);
+            if (body === null) {
+                // _evmBuildRequestBody returned null -- missing
+                // ID==='0' start milestone.  Raise a distinguishable
+                // error so the outer wrapper falls through to the
+                // sync path, which treats this as an error condition
+                // and returns early (transparent-fallback parity).
+                const e = new Error('missing_start_milestone');
+                e.__evmReason = 'prereqs_missing';
+                throw e;
+            }
+            const resp = await fetch(evmBackendConfig.evmEndpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                signal: controller ? controller.signal : undefined,
+            });
+            if (timer) clearTimeout(timer);
+            if (!resp.ok) {
+                const err = new Error('backend returned ' + resp.status);
+                err.__evmStatus = resp.status;
+                throw err;
+            }
+            const data = await resp.json();
+            _evmRecordTelemetry('success');
+            return data;
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
+    })();
+
+    _evmInFlight = { fingerprint: fp, promise };
+    // Clear cache after settle so subsequent unrelated calls re-fetch
+    promise.finally(() => {
+        if (_evmInFlight && _evmInFlight.fingerprint === fp) _evmInFlight = null;
+    });
+    return promise;
+}
+
+function _applyBackendEvmToWindow(result) {
+    // Merge backend result into the SAME shape window.evmMetrics has
+    // always had, so every downstream consumer (charts, tables,
+    // Completionprediction.js .actual.CPIcum read, etc.) keeps working.
+    const evmMetrics = window.evmMetrics || {};
+    evmMetrics.forecasted = result.forecasted || evmMetrics.forecasted;
+    evmMetrics.actual = result.actual || evmMetrics.actual;
+    // Top-level (legacy) fields that downstream code also reads
+    if (result.forecasted) {
+        evmMetrics.distributionPlanned = result.forecasted.distributionPlanned || [];
+        evmMetrics.distributionPlannedCost = result.forecasted.distributionPlannedCost || [];
+        evmMetrics.allDates = result.forecasted.allDates || [];
+    }
+    evmMetrics.currency = result.currency || evmMetrics.currency || 'USD';
+    evmMetrics.source = 'backend';
+    evmMetrics.computation_ms = result.computation_ms;
+
+    window.cybereumState = window.cybereumState || {};
+    window.cybereumState.evmMetrics = evmMetrics;
+    window.evmMetrics = evmMetrics;
+    return evmMetrics;
+}
+
+async function getCumulativeDistributionAsync(nodes, links) {
+    const disabled = !evmBackendConfig.useBackendEVM
+        || typeof fetch !== 'function'
+        || !evmBackendConfig.evmEndpoint;
+    if (disabled) {
+        _evmRecordTelemetry('fallback', { reason: 'backend_disabled' });
+        return getCumulativeDistribution(nodes, links);
+    }
+    try {
+        const result = await _ensureEvmAnalysis(nodes, links);
+        _applyBackendEvmToWindow(result);
+
+        const f = result.forecasted;
+        if (f && typeof displayForecastedEVMetrics === 'function') {
+            try {
+                // Match the sync path: display raw SPI/CPIcum so the
+                // frontend's Infinity-is-data-quality-signal rendering
+                // works identically whether the backend or the JS
+                // fallback produced the numbers.  Fall back to *_model
+                // when raw is null (backend serialises non-finite to
+                // null; sync preserves Infinity literal).
+                const spiDisp = (f.SPI != null) ? f.SPI : f.SPI_model;
+                const cpiDisp = (f.CPIcum != null) ? f.CPIcum : f.CPIcum_model;
+                displayForecastedEVMetrics(
+                    f.BCWP, f.ACWP, f.BCWS, spiDisp, f.SV, f.CV,
+                    cpiDisp, f.EAC);
+            } catch (e) { console.warn('[EVM] displayForecastedEVMetrics:', e); }
+        }
+        if (f && typeof populateForecastedEVMTable === 'function') {
+            try {
+                populateForecastedEVMTable(
+                    f.distributionPlanned, f.distributionWithOverrun,
+                    f.evDistribution, f.allDates);
+            } catch (e) { console.warn('[EVM] populateForecastedEVMTable:', e); }
+        }
+        // Render the chart -- the sync getCumulativeDistribution path
+        // calls createEVMCharts('forecasted','Cumulative') after metrics
+        // are populated; without this the backend-success path leaves
+        // the forecasted chart blank/stale.
+        if (typeof createEVMCharts === 'function') {
+            try {
+                createEVMCharts(window.evmMetrics, 'forecasted', 'Cumulative');
+            } catch (e) { console.warn('[EVM] createEVMCharts forecasted:', e); }
+        }
+        console.log('[EVM] Backend forecasted branch applied:', {
+            SPI: f?.SPI_model, CPI: f?.CPIcum_model, EAC: f?.EAC,
+            computation_ms: result.computation_ms,
+            cache_hit: result.cache_hit,
+        });
+    } catch (err) {
+        _evmRecordTelemetry('fallback', {
+            reason: err?.__evmReason
+                    || (err?.__evmStatus != null
+                        ? 'non_ok_status'
+                        : (err?.name === 'AbortError' ? 'timeout' : 'network_error')),
+            status: err?.__evmStatus,
+            message: err?.message || String(err),
+        });
+        console.warn('[EVM] Backend failed (',
+                     err?.name || 'error', err?.message || err,
+                     ') -- falling back to JS getCumulativeDistribution');
+        return getCumulativeDistribution(nodes, links);
+    }
+}
+
+async function createActualEVMChartAsync(nodes, links) {
+    const disabled = !evmBackendConfig.useBackendEVM
+        || typeof fetch !== 'function'
+        || !evmBackendConfig.evmEndpoint;
+    if (disabled) {
+        _evmRecordTelemetry('fallback', { reason: 'backend_disabled' });
+        return createActualEVMChart(nodes, links);
+    }
+    try {
+        const result = await _ensureEvmAnalysis(nodes, links);
+        _applyBackendEvmToWindow(result);
+
+        const a = result.actual;
+        if (a && typeof displayActualEVMetrics === 'function') {
+            try {
+                // Display raw SPI/CPIcum with _model fallback when raw
+                // is null -- matches sync path so Infinity-as-signal
+                // rendering is consistent with the JS fallback.
+                const spiDisp = (a.SPI != null) ? a.SPI : a.SPI_model;
+                const cpiDisp = (a.CPIcum != null) ? a.CPIcum : a.CPIcum_model;
+                displayActualEVMetrics(
+                    a.BCWP, a.ACWP, a.BCWS, spiDisp, a.SV, a.CV,
+                    cpiDisp, a.EAC);
+            } catch (e) { console.warn('[EVM] displayActualEVMetrics:', e); }
+        }
+        if (a && typeof populateActualEVMTable === 'function') {
+            try {
+                populateActualEVMTable(
+                    (window.evmMetrics && window.evmMetrics.distributionPlanned) || [],
+                    a.distributionActual, a.distributionEarned,
+                    a.distributionPredicted,
+                    (window.evmMetrics && window.evmMetrics.distributionPlannedCost) || [],
+                    a.distributionActualCost, a.distributionEarnedCost,
+                    a.distributionPredictedCost,
+                    a.allDates, a.transitionPointIndex,
+                    result.currency);
+            } catch (e) { console.warn('[EVM] populateActualEVMTable:', e); }
+        }
+        // Render the chart -- the sync createActualEVMChart path calls
+        // createActualSingleEVMChart('actual','Cumulative') after
+        // metrics are populated; without this the backend-success path
+        // leaves the actual chart blank/stale.
+        if (typeof createActualSingleEVMChart === 'function') {
+            try {
+                createActualSingleEVMChart(
+                    window.evmMetrics, 'actual', 'Cumulative');
+            } catch (e) { console.warn('[EVM] createActualSingleEVMChart:', e); }
+        }
+        console.log('[EVM] Backend actual branch applied:', {
+            SPI: a?.SPI_model, CPI: a?.CPIcum_model, EAC: a?.EAC,
+            dwSPI: a?.durationWeightedProgress?.durationWeightedSPI,
+            slipDays: a?.slipDays,
+            frontierCount: (a?.frontierNodes || []).length,
+            computation_ms: result.computation_ms,
+            cache_hit: result.cache_hit,
+        });
+    } catch (err) {
+        _evmRecordTelemetry('fallback', {
+            reason: err?.__evmReason
+                    || (err?.__evmStatus != null
+                        ? 'non_ok_status'
+                        : (err?.name === 'AbortError' ? 'timeout' : 'network_error')),
+            status: err?.__evmStatus,
+            message: err?.message || String(err),
+        });
+        console.warn('[EVM] Backend failed (',
+                     err?.name || 'error', err?.message || err,
+                     ') -- falling back to JS createActualEVMChart');
+        return createActualEVMChart(nodes, links);
+    }
+}
+
+// Expose async wrappers on window so the main app's tab-click handlers
+// can switch over gradually (preserve the sync globals for existing code).
+if (typeof window !== 'undefined') {
+    window.getCumulativeDistributionAsync = getCumulativeDistributionAsync;
+    window.createActualEVMChartAsync = createActualEVMChartAsync;
+}
+
+/********************
  * PREDICTION LOGIC - IMPROVED
  * FIX #8, #10, #11: Properly compare actual vs forecasted performance
  * FIX #18: Duration-weighted progress comparison
@@ -2395,8 +2903,23 @@ function updatePredictedValues_Improved(nodes, statusDate, scheduleMultiplier, s
     const daysPerWeek = _evmDaysPerWeek(); // FIX: was hardcoded 5
     const sd = safeDate(statusDate) || window.cybereumState?.dataDate || new Date();
 
-    // Get pre-computed data structures from PathScripts
-    const succMap = window.cybereumState?.succMap || window.cybereumState?.cpm?.succMap; // FIX: cpm fallback
+    // Get pre-computed data structures from PathScripts.
+    // BUG FIX (2026-04): when neither precomputed map is present we now
+    // build the succMap inline from links, so distance decay always
+    // fires.  Originally the function silently skipped Step 2 when
+    // succMap was absent, making the decay dependent on the caller
+    // having pre-populated cybereumState -- and producing different
+    // predicted durations in environments where it wasn't (the diff
+    // harness, isolated unit tests, etc.).
+    let succMap = window.cybereumState?.succMap || window.cybereumState?.cpm?.succMap;
+    if (!succMap && Array.isArray(links)) {
+        succMap = new Map();
+        for (const link of links) {
+            const src = String(link.source);
+            if (!succMap.has(src)) succMap.set(src, []);
+            succMap.get(src).push(link);
+        }
+    }
     const predMap = window.cybereumState?.predMap || window.cybereumState?.cpm?.predMap; // FIX: cpm fallback
 
     // Ensure nodeMap exists

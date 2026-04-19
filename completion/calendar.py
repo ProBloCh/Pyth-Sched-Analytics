@@ -1,0 +1,353 @@
+"""
+completion/calendar.py - Vectorised working-hour calendar.
+
+Replaces the frontend addWorkingHours() helper (Completionprediction.js
+line 381) with a NumPy-vectorised equivalent.  Advancing a start time
+by W working hours skips weekends and holidays and clamps partial days
+to the configured working-hours-per-day window.
+
+Algorithm:
+    1. Precompute two arrays over the project horizon [day 0 .. day K-1]:
+         day_epoch_ms[k]      : epoch ms of UTC 00:00 on day k
+         work_hours_before[k] : cumulative working hours accrued before
+                                the start of day k (monotone nondecreasing)
+    2. Advancing (start_ms, work_hours) becomes:
+         target = work_hours_before[k_start] + intraday_hours + work_hours
+         k_end  = searchsorted(work_hours_before, target, side='right') - 1
+         frac   = (target - work_hours_before[k_end]) * ms_per_hour
+         finish = day_epoch_ms[k_end] + frac
+    3. This is O(log K) per advance, vectorises trivially over M samples.
+
+Weekday convention: ISO (Mon=1..Sun=7), matching solver.models.ProjectContext.
+"""
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
+import logging
+import numpy as np
+
+
+logger = logging.getLogger(__name__)
+
+
+_MS_PER_HOUR = 3_600_000.0
+_MS_PER_DAY = 86_400_000.0
+
+# Rate-limit the horizon-clip warnings so a single MC run with thousands
+# of out-of-horizon advances doesn't spam the log.  One warning per
+# process is plenty; the caller is usually the same bug each time.
+_HORIZON_WARNING_EMITTED = {'start': False, 'target': False}
+
+
+def _parse_holiday(value):
+    """Accept 'YYYY-MM-DD' strings or objects with a .date field.
+
+    Returns UTC midnight epoch ms of the holiday day, or None on failure.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        value = value.get('date') or value.get('Date')
+        if value is None:
+            return None
+    try:
+        s = str(value).replace('Z', '+00:00')
+        # Accept bare YYYY-MM-DD too
+        if 'T' not in s and len(s) == 10:
+            s = s + 'T00:00:00+00:00'
+        dt = datetime.fromisoformat(s)
+        # astimezone(timezone.utc) raises on naive datetimes and would
+        # silently drop the holiday; treat naive input as UTC to match
+        # the repo-wide "naive => UTC" convention (see evm.helpers.safe_date).
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        return midnight.timestamp() * 1000.0
+    except Exception:
+        return None
+
+
+def _utc_midnight_ms(epoch_ms):
+    """Floor an epoch-ms timestamp to the start of its UTC day."""
+    return (int(epoch_ms) // int(_MS_PER_DAY)) * _MS_PER_DAY
+
+
+@dataclass
+class WorkingCalendar:
+    """Precomputed working-hour calendar.
+
+    Construct via ``WorkingCalendar.build(...)``; the initialiser fields
+    hold already-computed NumPy arrays.
+    """
+    hours_per_day: float
+    working_days: frozenset           # ISO weekdays: {1..7}
+    epoch_start_ms: float             # UTC midnight of day 0
+    day_epoch_ms: np.ndarray          # (K,)  start-of-day ms
+    is_working: np.ndarray            # (K,)  bool
+    work_hours_before: np.ndarray     # (K+1,) cumulative working hours
+
+    @classmethod
+    def build(cls, hours_per_day, working_days, holidays,
+              start_ms, horizon_days):
+        """
+        Build a calendar covering [start_ms, start_ms + horizon_days).
+
+        start_ms is floored to its UTC midnight so day boundaries align.
+        """
+        if hours_per_day is None or hours_per_day <= 0:
+            hours_per_day = 8.0
+        if not working_days:
+            working_days = frozenset({1, 2, 3, 4, 5})
+        else:
+            # Clamp to ISO range, drop duplicates
+            working_days = frozenset(
+                int(d) for d in working_days
+                if isinstance(d, (int, float)) and 1 <= int(d) <= 7
+            )
+            if not working_days:
+                working_days = frozenset({1, 2, 3, 4, 5})
+
+        K = max(int(horizon_days), 1)
+        epoch0 = float(_utc_midnight_ms(start_ms))
+        day_epoch = epoch0 + np.arange(K, dtype=np.float64) * _MS_PER_DAY
+
+        # ISO weekday for each day
+        # Python: datetime(epoch0).isoweekday() -> Mon=1..Sun=7
+        base_dt = datetime.fromtimestamp(epoch0 / 1000.0, tz=timezone.utc)
+        base_iso = base_dt.isoweekday()
+        iso = ((np.arange(K) + (base_iso - 1)) % 7) + 1  # (K,) in {1..7}
+
+        is_working = np.isin(iso, np.fromiter(working_days, dtype=np.int64))
+
+        # Subtract holidays (UTC midnights)
+        if holidays:
+            holiday_ms = set()
+            for h in holidays:
+                hms = _parse_holiday(h)
+                if hms is not None:
+                    holiday_ms.add(hms)
+            if holiday_ms:
+                h_arr = np.fromiter(sorted(holiday_ms), dtype=np.float64)
+                idx = np.searchsorted(day_epoch, h_arr)
+                in_range = (idx >= 0) & (idx < K) & (day_epoch[np.clip(idx, 0, K - 1)] == h_arr)
+                if np.any(in_range):
+                    is_working[idx[in_range]] = False
+
+        # Cumulative working hours: work_hours_before[k] is sum over days 0..k-1
+        per_day = np.where(is_working, hours_per_day, 0.0)
+        work_hours_before = np.empty(K + 1, dtype=np.float64)
+        work_hours_before[0] = 0.0
+        np.cumsum(per_day, out=work_hours_before[1:])
+
+        return cls(
+            hours_per_day=float(hours_per_day),
+            working_days=working_days,
+            epoch_start_ms=epoch0,
+            day_epoch_ms=day_epoch,
+            is_working=is_working,
+            work_hours_before=work_hours_before,
+        )
+
+    @property
+    def K(self):
+        return len(self.day_epoch_ms)
+
+    @property
+    def end_ms(self):
+        return self.epoch_start_ms + self.K * _MS_PER_DAY
+
+
+# ---------------------------------------------------------------------------
+# Vectorised advance
+# ---------------------------------------------------------------------------
+
+def _intraday_working_hours(start_ms, day_epoch_ms, is_working, hours_per_day):
+    """
+    Hours already consumed within the starting day, before start_ms.
+
+    For non-working days this is 0.  For working days, it is the
+    wall-clock hours from UTC midnight, clipped to [0, hours_per_day].
+
+    This is approximate -- a real working calendar would have defined
+    shift start/end times (e.g., 9am-5pm).  We treat the working-hour
+    window as beginning at UTC midnight, which matches the JS
+    addWorkingHours convention of day-boundary arithmetic.
+    """
+    intraday_ms = start_ms - day_epoch_ms
+    intraday_hrs = np.clip(intraday_ms / _MS_PER_HOUR, 0.0, hours_per_day)
+    return np.where(is_working, intraday_hrs, 0.0)
+
+
+def advance_working_ms(start_ms, work_hours, cal):
+    """
+    Advance start_ms by work_hours using the working calendar.
+
+    Args:
+        start_ms:    scalar float or (M,) array of epoch ms
+        work_hours:  scalar float or (M,) array of working hours to add
+        cal:         WorkingCalendar
+
+    Returns:
+        finish_ms: same shape as inputs, epoch ms.
+
+    Semantics:
+        - If start_ms falls on a non-working day, those hours are not
+          counted against work_hours (equivalent to JS
+          _normalizeWeekendForward).
+        - If work_hours == 0, finish_ms = start_ms (pass-through), even
+          if start is on a weekend -- matches JS addWorkingHours() line
+          384 short-circuit.
+        - If the horizon is exhausted, the result is clipped to the
+          last day of the calendar and a warning is logged (once per
+          process per clip type, to avoid flooding during vectorised
+          Monte Carlo batches).
+
+    Known limitation vs JS addWorkingHours
+    --------------------------------------
+    The JS reference (``Reference/Completionprediction.js`` lines 396-
+    423) preserves the input's time-of-day when advancing, then adds
+    the remainder hours as wall-clock time on top.  This implementation
+    uses a cumulative work-hours array + ``searchsorted``, which treats
+    the intraday portion as "working hours since midnight" clipped to
+    ``[0, hours_per_day]``.
+
+    The two agree whenever ``start_ms`` is at UTC midnight -- which is
+    the path the MC pipeline takes (statusDate is typically parsed from
+    an ISO date string representing 00:00 UTC).  They CAN disagree
+    when callers pass non-midnight start times to lag-shift helpers
+    downstream; the divergence is at most one working-day boundary.
+
+    Full JS-parity (time-of-day preservation) requires restructuring
+    away from the cumulative array + vectorised searchsorted, which
+    has cost implications for the MC hot path.  Tracked in
+    REMAINING_WORK.md section 4 as a follow-up.
+    """
+    start_arr = np.asarray(start_ms, dtype=np.float64)
+    work_arr = np.asarray(work_hours, dtype=np.float64)
+
+    scalar_in = (start_arr.ndim == 0 and work_arr.ndim == 0)
+    if scalar_in:
+        start_arr = start_arr.reshape(1)
+        work_arr = work_arr.reshape(1)
+
+    start_arr, work_arr = np.broadcast_arrays(start_arr, work_arr)
+
+    # Zero-work passthrough: match JS short-circuit exactly.
+    zero_work = work_arr <= 0.0
+
+    # Clip start into calendar range; rate-limited warning when any
+    # start falls outside the horizon (indicates stale calendar or
+    # activities with dates past the planning window).
+    out_of_range = ((start_arr < cal.epoch_start_ms)
+                    | (start_arr >= cal.end_ms))
+    if (np.any(out_of_range)
+            and not _HORIZON_WARNING_EMITTED['start']):
+        n_oor = int(np.count_nonzero(out_of_range))
+        logger.warning(
+            "advance_working_ms: %d start_ms values clipped into "
+            "calendar [%s .. %s); consider extending the horizon. "
+            "Suppressing further warnings.",
+            n_oor,
+            datetime.fromtimestamp(cal.epoch_start_ms / 1000.0,
+                                   tz=timezone.utc).isoformat(),
+            datetime.fromtimestamp(cal.end_ms / 1000.0,
+                                   tz=timezone.utc).isoformat())
+        _HORIZON_WARNING_EMITTED['start'] = True
+    start_clipped = np.clip(start_arr,
+                            cal.epoch_start_ms,
+                            cal.end_ms - 1.0)
+
+    day_idx = np.floor(
+        (start_clipped - cal.epoch_start_ms) / _MS_PER_DAY
+    ).astype(np.int64)
+    day_idx = np.clip(day_idx, 0, cal.K - 1)
+
+    intraday_hrs = _intraday_working_hours(
+        start_clipped,
+        cal.day_epoch_ms[day_idx],
+        cal.is_working[day_idx],
+        cal.hours_per_day,
+    )
+
+    target_hrs = cal.work_hours_before[day_idx] + intraday_hrs + work_arr
+
+    # If target exceeds the calendar's cumulative hours, the advance
+    # would run off the end of the horizon.  Warn once, then clamp.
+    max_work = cal.work_hours_before[-1]
+    if (np.any(target_hrs > max_work)
+            and not _HORIZON_WARNING_EMITTED['target']):
+        n_oor = int(np.count_nonzero(target_hrs > max_work))
+        logger.warning(
+            "advance_working_ms: %d advances exceed calendar horizon "
+            "(max cumulative %.0fh); finish clipped to last day. "
+            "Suppressing further warnings.",
+            n_oor, max_work)
+        _HORIZON_WARNING_EMITTED['target'] = True
+
+    # side='right' gives first index strictly greater than target, so
+    # -1 gives the last day whose cumulative hours <= target.  For a
+    # target landing exactly on a day boundary, this puts the finish at
+    # the next working day's start (frac = 0).
+    #
+    # NB: a Copilot review suggested side='left' here on the grounds
+    # that an exact-boundary advance should map to "end of previous
+    # working window".  We deliberately keep side='right' to match the
+    # JS addWorkingHours semantic (Reference/Completionprediction.js
+    # 396-423): N*hpd hours from a midnight start advances by N
+    # whole working days and returns the next working day at midnight,
+    # not the same-day end-of-work.  Test suite locks the JS-parity
+    # behaviour (see tests/test_completion.py
+    # TestWorkingCalendar.test_advance_weekdays_no_holidays).
+    end_idx = np.searchsorted(cal.work_hours_before, target_hrs, side='right') - 1
+    end_idx = np.clip(end_idx, 0, cal.K - 1)
+
+    frac_hrs = target_hrs - cal.work_hours_before[end_idx]
+    # Non-working days have zero per-day hours, so frac_hrs should be 0
+    # when end_idx lands on one.  Clamp defensively to [0, hours_per_day].
+    frac_hrs = np.clip(frac_hrs, 0.0, cal.hours_per_day)
+
+    finish_ms = cal.day_epoch_ms[end_idx] + frac_hrs * _MS_PER_HOUR
+
+    # Preserve zero-work passthrough
+    finish_ms = np.where(zero_work, start_arr, finish_ms)
+
+    if scalar_in:
+        return float(finish_ms[0])
+    return finish_ms
+
+
+# ---------------------------------------------------------------------------
+# Horizon sizing
+# ---------------------------------------------------------------------------
+
+def estimate_horizon_days(remaining_hours_total, hours_per_day,
+                          safety_factor=None, min_days=30, max_days=3650,
+                          max_multiplier_cap=None):
+    """
+    Days of calendar to precompute.
+
+    Heuristic: deterministic_remaining_working_days * safety_factor.
+    The safety factor is derived from the configured Pareto-tier cap
+    (``max_multiplier_cap``) so thin-tailed sectors get a smaller
+    horizon and fat-tailed classes (Olympics/IT with 50x caps, nuclear
+    new build with 20x caps) get enough to avoid ``advance_working_ms``
+    clipping.  Formula: max(6, ceil(cap * 1.5)) -- covers cap x blend=1
+    plus 50% weekend/holiday padding.  Fallback is 6 (the historic
+    default, sized for a 10x Pareto cap).
+
+    Explicit ``safety_factor`` overrides the derivation; pass None
+    (default) to let the cap drive it.
+
+    Capped at 10 years to bound memory (3650 days = ~29 KB of arrays).
+    """
+    if hours_per_day <= 0 or remaining_hours_total <= 0:
+        return min_days
+    if safety_factor is None:
+        if max_multiplier_cap is not None and max_multiplier_cap > 0:
+            safety_factor = max(6.0, float(max_multiplier_cap) * 1.5)
+        else:
+            safety_factor = 6.0
+    det_days = remaining_hours_total / hours_per_day
+    return int(np.clip(np.ceil(det_days * safety_factor), min_days, max_days))
