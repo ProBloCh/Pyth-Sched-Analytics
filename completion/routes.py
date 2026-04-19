@@ -92,8 +92,19 @@ def _validate_common(data):
     if len(links) > MAX_LINKS:
         return None, f'Too many links ({len(links)}); limit is {MAX_LINKS}'
 
-    if not data.get('status_date'):
+    sd_raw = data.get('status_date')
+    if not sd_raw:
         return None, 'status_date is required (ISO-8601)'
+    # Validate parseability up-front so downstream monte_carlo /
+    # recovery modules don't raise ValueError on a client typo and
+    # surface it as a 500.  _parse_iso_to_ms treats naive inputs as
+    # UTC, matching evm.helpers.safe_date, so results are stable
+    # regardless of server timezone.
+    if not isinstance(sd_raw, str):
+        return None, 'status_date must be an ISO-8601 string'
+    from .monte_carlo import _parse_iso_to_ms
+    if _parse_iso_to_ms(sd_raw) is None:
+        return None, f'status_date is not parseable ISO-8601: {sd_raw!r}'
 
     # Type-guard project_context.calendar numeric fields so the engine's
     # bare float(...) coercion can't turn client-side typos (null,

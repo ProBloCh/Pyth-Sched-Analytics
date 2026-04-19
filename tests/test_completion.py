@@ -279,6 +279,22 @@ class TestValidation:
         assert resp.status_code == 400
         assert 'status_date' in resp.get_json()['error']
 
+    def test_unparseable_status_date(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': 'A', 'Duration': 1}], 'links': [],
+            'status_date': 'not-a-date',
+        })
+        assert resp.status_code == 400
+        assert 'parseable' in resp.get_json()['error']
+
+    def test_non_string_status_date(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': 'A', 'Duration': 1}], 'links': [],
+            'status_date': 12345,
+        })
+        assert resp.status_code == 400
+        assert 'ISO-8601 string' in resp.get_json()['error']
+
     def test_empty_nodes(self, client):
         resp = client.post('/completion/monte-carlo', json={
             'nodes': [], 'status_date': '2025-01-01T00:00:00Z',
