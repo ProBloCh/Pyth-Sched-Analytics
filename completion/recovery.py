@@ -611,9 +611,12 @@ def run_recovery_options(nodes, links, status_date,
     # hours_per_day / working_days_per_week.
     cal_cfg = ((project_context or {}).get('calendar') or {}) if isinstance(
         project_context, dict) else {}
-    hours_per_day = float(cal_cfg.get('hours_per_day',
-                                      config.hours_per_day))
-    working_days_per_week = float(cal_cfg.get('working_days_per_week', 5.0))
+    # `.get() or default` so null values from the client fall back to
+    # the default rather than crashing float(None).  Validator at the
+    # route layer already rejects non-numeric non-null values.
+    hours_per_day = float(cal_cfg.get('hours_per_day')
+                          or config.hours_per_day)
+    working_days_per_week = float(cal_cfg.get('working_days_per_week') or 5.0)
 
     # Normalise link lag units BEFORE build_dag, so the CPM slack /
     # critical-path calculation uses the same lag interpretation as

@@ -36,6 +36,22 @@ from .distributions import (
 
 logger = logging.getLogger(__name__)
 
+def _opt_float(options, key, default, alt_key=None):
+    """Coerce options[key] (or options[alt_key]) to float, falling
+    back to default when the value is missing or None.  Client-side
+    null values are treated as "use default" rather than crashing
+    in the engine (validation at the route layer rejects non-numeric
+    non-null values before we get here).
+    """
+    v = options.get(key)
+    if v is None and alt_key is not None:
+        v = options.get(alt_key)
+    if v is None:
+        return float(default)
+    return float(v)
+
+
+
 
 # ---------------------------------------------------------------------------
 # Auto-complete start milestone (EVM.js FIX #9, lines 1279-1319)
@@ -129,11 +145,11 @@ def build_forecasted_branch(nodes, links, options):
     branch lines 1838-1846).
     """
     status_date = options.get('statusDate') or options.get('status_date')
-    cost_rate = float(options.get('costRate', options.get('cost_rate', 1.0)))
+    cost_rate = _opt_float(options, 'costRate', 1.0, alt_key='cost_rate')
     currency = options.get('currency', 'USD')
-    hpd = float(options.get('hoursPerDay', options.get('hours_per_day', 8.0)))
-    dpw = float(options.get('workingDaysPerWeek',
-                            options.get('working_days_per_week', 5.0)))
+    hpd = _opt_float(options, 'hoursPerDay', 8.0, alt_key='hours_per_day')
+    dpw = _opt_float(options, 'workingDaysPerWeek', 5.0,
+                     alt_key='working_days_per_week')
 
     # Mirror JS getCumulativeDistribution (EVM.js line 1746-1747):
     #   BCWS = calculateBCWS_Hours(workingNodes, statusDate)
@@ -222,11 +238,11 @@ def build_actual_branch(nodes, links, options):
     (BCWS_hours / BCWP_hours / BAC_hours fields in the response).
     """
     status_date = options.get('statusDate') or options.get('status_date')
-    cost_rate = float(options.get('costRate', options.get('cost_rate', 1.0)))
+    cost_rate = _opt_float(options, 'costRate', 1.0, alt_key='cost_rate')
     currency = options.get('currency', 'USD')
-    hpd = float(options.get('hoursPerDay', options.get('hours_per_day', 8.0)))
-    dpw = float(options.get('workingDaysPerWeek',
-                            options.get('working_days_per_week', 5.0)))
+    hpd = _opt_float(options, 'hoursPerDay', 8.0, alt_key='hours_per_day')
+    dpw = _opt_float(options, 'workingDaysPerWeek', 5.0,
+                     alt_key='working_days_per_week')
     project = options.get('project') or {}
     working_days = options.get('workingDays') or options.get('working_days')
     # Calendar may carry working_days and holidays; prefer nested values

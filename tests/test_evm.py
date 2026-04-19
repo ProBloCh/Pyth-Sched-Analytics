@@ -1172,6 +1172,56 @@ class TestDurationToWorkHoursCalendar:
         assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
 
 
+class TestNumericOptionsValidation:
+    """Locks Copilot fix: client-side non-numeric options (costRate,
+    hoursPerDay, workingDaysPerWeek, project_context.calendar.*) now
+    return 400 rather than 500'ing on bare float(...).
+    """
+
+    def test_evm_null_costrate_400(self, client):
+        resp = client.post('/evm/analyze', json={
+            'nodes': [{'ID': '1', 'Duration': 5, 'TimeUnits': 'days'}],
+            'options': {'statusDate': '2025-01-06T00:00:00Z',
+                        'costRate': None},
+        })
+        # null is ignored (continue path), so 200.
+        assert resp.status_code == 200
+
+    def test_evm_non_numeric_costrate_400(self, client):
+        resp = client.post('/evm/analyze', json={
+            'nodes': [{'ID': '1', 'Duration': 5, 'TimeUnits': 'days'}],
+            'options': {'statusDate': '2025-01-06T00:00:00Z',
+                        'costRate': 'oops'},
+        })
+        assert resp.status_code == 400
+        assert 'costRate' in resp.get_json()['error']
+
+    def test_evm_out_of_range_hpd_400(self, client):
+        resp = client.post('/evm/analyze', json={
+            'nodes': [{'ID': '1', 'Duration': 5, 'TimeUnits': 'days'}],
+            'options': {'statusDate': '2025-01-06T00:00:00Z',
+                        'hoursPerDay': 100},  # > 24
+        })
+        assert resp.status_code == 400
+
+    def test_completion_calendar_non_numeric_400(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': 'A', 'Duration': 5, 'TimeUnits': 'days'}],
+            'status_date': '2025-01-01T00:00:00Z',
+            'project_context': {'calendar': {'hours_per_day': 'abc'}},
+        })
+        assert resp.status_code == 400
+        assert 'hours_per_day' in resp.get_json()['error']
+
+    def test_completion_calendar_not_object_400(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': 'A', 'Duration': 5, 'TimeUnits': 'days'}],
+            'status_date': '2025-01-01T00:00:00Z',
+            'project_context': {'calendar': 'not-a-dict'},
+        })
+        assert resp.status_code == 400
+
+
 class TestLagCandidateNameCasing:
     """Locks Copilot fix: lag candidates use _node_name so both
     capitalized Name and lowercase name work, matching crash options.

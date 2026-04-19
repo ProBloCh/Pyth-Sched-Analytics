@@ -130,6 +130,23 @@ def _validate(data):
     if safe_date(sd_raw) is None:
         return f'options.statusDate is not parseable ISO-8601: {sd_raw!r}'
 
+    # Validate the numeric fields too so engine-side bare float(...)
+    # calls can't surface as 500s on client-side typos (null, empty
+    # string, non-numeric).
+    for key, lo, hi in (
+            ('costRate',            0.0,   1e9),
+            ('hoursPerDay',         0.01,  24.0),
+            ('workingDaysPerWeek',  0.01,  7.0)):
+        v = opts.get(key)
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            return f'options.{key} must be a number'
+        if (not math.isfinite(fv)) or fv < lo or fv > hi:
+            return f'options.{key} must be in [{lo}, {hi}]'
+
     return None
 
 

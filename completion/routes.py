@@ -95,6 +95,32 @@ def _validate_common(data):
     if not data.get('status_date'):
         return None, 'status_date is required (ISO-8601)'
 
+    # Type-guard project_context.calendar numeric fields so the engine's
+    # bare float(...) coercion can't turn client-side typos (null,
+    # empty string, non-numeric) into 500s.
+    pctx = data.get('project_context')
+    if pctx is not None:
+        if not isinstance(pctx, dict):
+            return None, 'project_context must be an object'
+        cal = pctx.get('calendar')
+        if cal is not None:
+            if not isinstance(cal, dict):
+                return None, 'project_context.calendar must be an object'
+            for key, lo, hi in (
+                    ('hours_per_day',         0.01, 24.0),
+                    ('working_days_per_week', 0.01, 7.0)):
+                v = cal.get(key)
+                if v is None:
+                    continue
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    return None, (f'project_context.calendar.{key} '
+                                  f'must be a number')
+                if (not math.isfinite(fv)) or fv < lo or fv > hi:
+                    return None, (f'project_context.calendar.{key} '
+                                  f'must be in [{lo}, {hi}]')
+
     seen_ids = set()
     for i, node in enumerate(nodes):
         if not isinstance(node, dict):
