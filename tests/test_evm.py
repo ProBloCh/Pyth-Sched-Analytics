@@ -1172,6 +1172,34 @@ class TestDurationToWorkHoursCalendar:
         assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
 
 
+class TestCalibrationEarlyFinishClamp:
+    """Locks Copilot fix: calibration_report clamps early-finish
+    actual_overrun to 0 so a project that came in ahead of baseline
+    counts as 'no overrun' rather than dragging the mean negative
+    and breaking the >1.3 advisory threshold."""
+
+    def test_early_finish_yields_zero_ratio(self):
+        import completion.outcomes as oc
+        # Reset in-proc store, force in-process branch.
+        oc._inproc._data.clear()
+        oc.register_outcome({
+            'project_id': 'EARLY-1',
+            'reference_class': 'oil_gas_offshore',
+            'predicted': {
+                'baseline_finish': '2026-06-01T00:00:00Z',
+                'p80_finish':      '2026-12-01T00:00:00Z',
+            },
+            # Finished BEFORE baseline -> negative actual_overrun.
+            'actual': {'finish': '2026-04-01T00:00:00Z'},
+        })
+        report = oc.calibration_report(reference_class='oil_gas_offshore')
+        cls = report['by_class'].get('oil_gas_offshore')
+        assert cls is not None
+        # Ratio should be 0 (clamped), not negative.
+        assert cls['mean_ratio'] >= 0.0
+        assert cls['p50_ratio'] == 0.0
+
+
 class TestReferenceClassesDiscoveryNoPathLeak:
     """Locks Copilot fix: /completion/reference-classes does not leak
     the server's PYTH_REFERENCE_CLASSES_PATH filesystem location.

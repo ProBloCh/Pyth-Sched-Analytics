@@ -2265,6 +2265,18 @@ function _evmRecordTelemetry(kind, detail) {
     } catch (_) { /* never break the calling path */ }
 }
 
+// Reference-identity cache for the FNV-1a content hash.  The expensive
+// loop (O(N+L) on the UI thread) is the per-node mix() chain; if the
+// caller passes the same nodes / links arrays as last time AND the
+// invalidation key + relevant cybereumState fields haven't changed, we
+// short-circuit to the previous fingerprint.  This keeps tab switches
+// jank-free on large schedules where the user isn't editing -- the
+// reviewer's main concern -- while still refreshing the moment the
+// data model produces new arrays or bumps evmInvalidationKey.
+let _evmFingerprintCache = {
+    nodes: null, links: null, key: null, fp: null,
+};
+
 function _evmFingerprint(nodes, links) {
     // Fingerprint that changes when the project data changes but not
     // when the user just switches tabs.  Two projects with the same
@@ -2279,6 +2291,20 @@ function _evmFingerprint(nodes, links) {
     const projectId = (window.cybereumState && window.cybereumState.project
                        && (window.cybereumState.project.id
                            || window.cybereumState.project.projectId)) || '';
+
+    // Reference-identity short-circuit: if the caller passed the same
+    // arrays as last time AND nothing in the cache key changed, skip
+    // the O(N+L) loop entirely.  Tab switches (the common case) reuse
+    // the cached fingerprint and avoid janking the UI thread on large
+    // schedules.
+    const cacheKey = statusDate + '|' + sector + '|' + projectId
+        + '|' + (window.evmInvalidationKey || 0);
+    if (_evmFingerprintCache.nodes === nodes
+            && _evmFingerprintCache.links === links
+            && _evmFingerprintCache.key === cacheKey
+            && _evmFingerprintCache.fp !== null) {
+        return _evmFingerprintCache.fp;
+    }
 
     // Cheap 32-bit FNV-1a over the minimal content string.  Fast (no
     // crypto allocations), stable across tab switches, and collision
@@ -2314,7 +2340,7 @@ function _evmFingerprint(nodes, links) {
         mix(l.lag); mix(l.lagUnits);
     }
 
-    return JSON.stringify({
+    const fp = JSON.stringify({
         n: ns.length,
         l: ls.length,
         sd: statusDate,
@@ -2323,6 +2349,8 @@ function _evmFingerprint(nodes, links) {
         h: h.toString(16),
         v: window.evmInvalidationKey || 0,
     });
+    _evmFingerprintCache = { nodes, links, key: cacheKey, fp };
+    return fp;
 }
 
 function _evmBuildRequestBody(nodes, links) {

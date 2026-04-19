@@ -300,6 +300,12 @@ def calibration_report(reference_class=None):
                 actual_overrun_days = (actual - baseline).total_seconds() / 86400
                 pred_overrun_days = (pred_p80 - baseline).total_seconds() / 86400
                 if pred_overrun_days > 0:
+                    # Clamp early-finish to 0: a project that came in
+                    # ahead of baseline counts as "no overrun" rather
+                    # than a negative ratio, which would drag the mean
+                    # below 0 and break the "P80 acts like P10"
+                    # advisory threshold (mean_ratio > 1.3).
+                    actual_overrun_days = max(0.0, actual_overrun_days)
                     ratio = actual_overrun_days / pred_overrun_days
                     by_class[rc].append(ratio)
         except (KeyError, ValueError, TypeError):
