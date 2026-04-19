@@ -1221,6 +1221,66 @@ class TestNumericOptionsValidation:
         })
         assert resp.status_code == 400
 
+    def test_evm_max_dist_points_non_numeric_400(self, client):
+        resp = client.post('/evm/analyze', json={
+            'nodes': [{'ID': '1', 'Duration': 5, 'TimeUnits': 'days'}],
+            'options': {'statusDate': '2025-01-06T00:00:00Z',
+                        'maxDistributionPoints': 'oops'},
+        })
+        assert resp.status_code == 400
+        assert 'maxDistributionPoints' in resp.get_json()['error']
+
+    def test_evm_max_dist_points_too_small_400(self, client):
+        resp = client.post('/evm/analyze', json={
+            'nodes': [{'ID': '1', 'Duration': 5, 'TimeUnits': 'days'}],
+            'options': {'statusDate': '2025-01-06T00:00:00Z',
+                        'maxDistributionPoints': 1},
+        })
+        assert resp.status_code == 400
+
+
+class TestFalseyCoerceGuard:
+    """Locks Copilot fix: config.thresholds / config.caps / outcomes
+    predicted/actual no longer silently accept falsey non-dict values
+    via `or {}`.  `[]`, `""`, `0` now surface as a clear 400.
+    """
+
+    def test_thresholds_as_list_400(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': 'A', 'Duration': 5, 'TimeUnits': 'days'}],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {'thresholds': []},
+        })
+        assert resp.status_code == 400
+        assert 'thresholds' in resp.get_json()['error']
+
+    def test_caps_as_list_400(self, client):
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': [{'ID': 'A', 'Duration': 5, 'TimeUnits': 'days'}],
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {'caps': []},
+        })
+        assert resp.status_code == 400
+        assert 'caps' in resp.get_json()['error']
+
+    def test_outcome_predicted_as_list_400(self, client):
+        from completion.outcomes import validate_outcome
+        errs = validate_outcome({
+            'project_id': 'p1',
+            'predicted': [],
+            'actual': {'finish': '2025-05-01T00:00:00Z'},
+        })
+        assert any('predicted must be an object' in e for e in errs)
+
+    def test_outcome_project_id_none_400(self, client):
+        from completion.outcomes import validate_outcome
+        errs = validate_outcome({
+            'project_id': None,
+            'predicted': {'p80_finish': '2025-05-01T00:00:00Z'},
+            'actual': {'finish': '2025-05-01T00:00:00Z'},
+        })
+        assert any('project_id must be a non-empty string' in e for e in errs)
+
 
 class TestLagCandidateNameCasing:
     """Locks Copilot fix: lag candidates use _node_name so both

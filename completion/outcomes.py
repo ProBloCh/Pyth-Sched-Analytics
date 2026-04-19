@@ -173,8 +173,12 @@ def validate_outcome(record):
     for k in _REQUIRED_TOP:
         if k not in record:
             errs.append(f'missing required field {k!r}')
-    pid = record.get('project_id')
-    if pid is not None:
+    # project_id is required (checked above).  When the key is
+    # present, it must be a non-empty string -- None / "" / non-string
+    # would otherwise produce ambiguous Redis keys like
+    # "outcomes:<class>:None".
+    if 'project_id' in record:
+        pid = record.get('project_id')
         if not isinstance(pid, str) or not pid.strip():
             errs.append('project_id must be a non-empty string')
         elif not _is_safe_id(pid.strip()):
@@ -182,8 +186,12 @@ def validate_outcome(record):
                 "project_id must contain only letters, digits, "
                 "'_', '-', '.' (Redis key safety)")
 
-    pred = record.get('predicted') or {}
-    if not isinstance(pred, dict):
+    # Type-check raw `predicted` value before defaulting, rather than
+    # `or {}` which would coerce falsey non-dicts ([], "", 0) into a
+    # misleading "missing field" error.
+    pred_raw = record.get('predicted')
+    pred = pred_raw if isinstance(pred_raw, dict) else {}
+    if pred_raw is not None and not isinstance(pred_raw, dict):
         errs.append('predicted must be an object')
     else:
         for k in _REQUIRED_PREDICTED:
@@ -199,8 +207,9 @@ def validate_outcome(record):
                 errs.append(f'predicted.{k} is not a parseable ISO-8601 '
                             f'timestamp: {v!r}')
 
-    actual = record.get('actual') or {}
-    if not isinstance(actual, dict):
+    actual_raw = record.get('actual')
+    actual = actual_raw if isinstance(actual_raw, dict) else {}
+    if actual_raw is not None and not isinstance(actual_raw, dict):
         errs.append('actual must be an object')
     else:
         for k in _REQUIRED_ACTUAL:

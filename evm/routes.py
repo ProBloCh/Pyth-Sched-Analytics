@@ -147,6 +147,21 @@ def _validate(data):
         if (not math.isfinite(fv)) or fv < lo or fv > hi:
             return f'options.{key} must be in [{lo}, {hi}]'
 
+    # maxDistributionPoints gates the time-phased distributions sampler
+    # (_significant_dates).  It's forwarded into the engine without
+    # coercion; a non-numeric / negative / zero value would surface as
+    # a 500.  Accept camelCase and snake_case for consistency with the
+    # rest of the options block.
+    mdp_raw = opts.get('maxDistributionPoints',
+                       opts.get('max_distribution_points'))
+    if mdp_raw is not None:
+        try:
+            mdp = int(mdp_raw)
+        except (TypeError, ValueError):
+            return 'options.maxDistributionPoints must be an integer'
+        if mdp < 2:
+            return 'options.maxDistributionPoints must be >= 2'
+
     return None
 
 

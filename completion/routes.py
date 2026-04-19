@@ -186,11 +186,15 @@ def _validate_mc_config(data):
         if iters < 1 or iters > MAX_ITERATIONS:
             return f'config.iterations must be 1-{MAX_ITERATIONS}'
 
-    thresholds = cfg.get('thresholds') or {}
+    # Only default to {} when the key is truly absent / None -- `or {}`
+    # would silently accept falsey non-dict values like `[]` / `""`.
     # A non-dict thresholds value (e.g. `[...]` or `"abc"`) would
-    # previously AttributeError on `.get(...)` and surface as a 500;
+    # otherwise AttributeError on `.get(...)` and surface as a 500;
     # reject up-front with a clear 400.
-    if not isinstance(thresholds, dict):
+    thresholds = cfg.get('thresholds')
+    if thresholds is None:
+        thresholds = {}
+    elif not isinstance(thresholds, dict):
         return 'config.thresholds must be an object'
     thresh_vals = {}
     for key in ('no_risk_below', 'normal_from', 'fat_tail_from'):
@@ -214,8 +218,11 @@ def _validate_mc_config(data):
             and thresh_vals['normal_from'] > thresh_vals['fat_tail_from']):
         return ('config.thresholds.normal_from must be <= fat_tail_from')
 
-    caps = cfg.get('caps') or {}
-    if not isinstance(caps, dict):
+    # Same falsey-coerce guard as thresholds above.
+    caps = cfg.get('caps')
+    if caps is None:
+        caps = {}
+    elif not isinstance(caps, dict):
         return 'config.caps must be an object'
     cap_checks = [
         ('min_mult',      0.0,  10.0),
