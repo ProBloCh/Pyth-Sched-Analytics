@@ -1172,6 +1172,34 @@ class TestDurationToWorkHoursCalendar:
         assert _duration_to_work_hours(1, 'w', 8.0) == 40.0
 
 
+class TestEmptyJSONObjectFallsThrough:
+    """Locks Copilot fix: `{}` is a valid JSON root and should fall
+    through to validation rather than 400'ing as 'missing JSON body'.
+    """
+
+    def test_evm_empty_object_returns_field_error(self, client):
+        resp = client.post('/evm/analyze', json={})
+        assert resp.status_code == 400
+        # Should mention nodes (or another field-level error), not
+        # the generic "Invalid or missing JSON body".
+        err = resp.get_json()['error']
+        assert 'missing' not in err.lower() or 'nodes' in err.lower()
+        assert 'nodes' in err.lower() or 'options' in err.lower() or \
+            'statusDate' in err
+
+    def test_completion_mc_empty_object_returns_field_error(self, client):
+        resp = client.post('/completion/monte-carlo', json={})
+        assert resp.status_code == 400
+        err = resp.get_json()['error']
+        assert 'nodes' in err.lower() or 'status_date' in err.lower()
+
+    def test_register_outcome_empty_object_returns_field_error(self, client):
+        resp = client.post('/completion/register-outcome', json={})
+        assert resp.status_code == 400
+        err = resp.get_json()['error']
+        assert 'project_id' in err or 'predicted' in err or 'actual' in err
+
+
 class TestStatusDateRequired:
     """Locks Copilot fix: /evm/analyze rejects requests without a
     parseable options.statusDate so downstream ACWP doesn't fall back

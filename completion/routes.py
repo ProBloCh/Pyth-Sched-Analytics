@@ -315,7 +315,10 @@ def _parse_request(validator=_validate):
         return None, (jsonify({'error': 'Payload too large (limit: 10 MB)'}), 413)
 
     data = request.get_json(force=True, silent=True)
-    if not data:
+    # Use `is None` rather than truthiness so an empty-but-valid `{}`
+    # body proceeds to validator, which returns a useful field-level
+    # error instead of the misleading "Invalid or missing JSON body".
+    if data is None:
         return None, (jsonify({'error': 'Invalid or missing JSON body'}), 400)
     if not isinstance(data, dict):
         # validators do data.get(...); a bare list/string body would
@@ -452,7 +455,10 @@ def register_outcome_route():
             and request.content_length > MAX_PAYLOAD_BYTES):
         return jsonify({'error': 'Payload too large (limit: 10 MB)'}), 413
     data = request.get_json(force=True, silent=True)
-    if not data:
+    # Same `is None` guard as the shared _parse_request -- `{}` is a
+    # valid root that should fall through to validate_outcome and
+    # surface a missing-fields error.
+    if data is None:
         return jsonify({'error': 'Invalid or missing JSON body'}), 400
     if not isinstance(data, dict):
         return jsonify({'error': 'JSON root must be an object'}), 400

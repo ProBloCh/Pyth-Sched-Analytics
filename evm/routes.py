@@ -138,7 +138,11 @@ def _parse_request():
         return None, (jsonify({'error': 'Payload too large (limit: 10 MB)'}), 413)
 
     data = request.get_json(force=True, silent=True)
-    if not data:
+    # Use `is None` rather than truthiness so an empty-but-valid `{}`
+    # body proceeds to _validate, which returns a useful field-level
+    # error (e.g., "nodes must be a list") instead of the misleading
+    # "Invalid or missing JSON body".
+    if data is None:
         return None, (jsonify({'error': 'Invalid or missing JSON body'}), 400)
     if not isinstance(data, dict):
         # _validate calls data.get(...); a bare list/string body would
