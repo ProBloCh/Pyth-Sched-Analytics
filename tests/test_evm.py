@@ -1282,6 +1282,28 @@ class TestFalseyCoerceGuard:
         assert any('project_id must be a non-empty string' in e for e in errs)
 
 
+class TestOutcomesEnvIntFallback:
+    """Locks Copilot fix: malformed PYTH_OUTCOMES_TTL_SECONDS /
+    PYTH_OUTCOMES_MAX_REPORT env vars fall back to defaults instead
+    of crashing import with ValueError.
+    """
+
+    def test_env_int_valid(self, monkeypatch):
+        from completion.outcomes import _env_int
+        monkeypatch.setenv('PYTH_TEST_VAR', '42')
+        assert _env_int('PYTH_TEST_VAR', 7) == 42
+
+    def test_env_int_malformed_uses_default(self, monkeypatch):
+        from completion.outcomes import _env_int
+        monkeypatch.setenv('PYTH_TEST_VAR', 'not-an-int')
+        assert _env_int('PYTH_TEST_VAR', 7) == 7
+
+    def test_env_int_missing_uses_default(self, monkeypatch):
+        from completion.outcomes import _env_int
+        monkeypatch.delenv('PYTH_TEST_VAR', raising=False)
+        assert _env_int('PYTH_TEST_VAR', 7) == 7
+
+
 class TestLagCandidateNameCasing:
     """Locks Copilot fix: lag candidates use _node_name so both
     capitalized Name and lowercase name work, matching crash options.

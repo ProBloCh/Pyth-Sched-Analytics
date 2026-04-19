@@ -64,15 +64,32 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
+def _env_int(name, default):
+    """Parse an integer env var, falling back to `default` with a
+    warning on malformed values.  Import-time int(os.environ[...])
+    would crash the service on a misconfigured deployment; degrading
+    to the default is safer.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid %s=%r (not an integer); falling back to default %d",
+            name, raw, default)
+        return default
+
+
 # Default TTL for outcome records: 5 years.  Long enough for capital
 # project lifecycles; deployers can override via env var.
-_DEFAULT_TTL_SECONDS = int(
-    os.environ.get('PYTH_OUTCOMES_TTL_SECONDS', 5 * 365 * 24 * 3600))
+_DEFAULT_TTL_SECONDS = _env_int(
+    'PYTH_OUTCOMES_TTL_SECONDS', 5 * 365 * 24 * 3600)
 
 # Maximum outcomes returned by the calibration report; defends against
 # a customer with millions of historical records loading the full set.
-_MAX_REPORT_OUTCOMES = int(
-    os.environ.get('PYTH_OUTCOMES_MAX_REPORT', 10_000))
+_MAX_REPORT_OUTCOMES = _env_int('PYTH_OUTCOMES_MAX_REPORT', 10_000)
 
 
 # ---------------------------------------------------------------------------
