@@ -207,7 +207,10 @@ def analyze():
     key = _cache_key(data) if (get_fn or set_fn) else None
     if get_fn and key is not None:
         cached = get_fn(key)
-        if cached:
+        # `is not None` rather than truthiness so an empty dict (or
+        # any falsey payload) still registers as a hit.  Matches the
+        # `data is None` guard upstream.
+        if cached is not None:
             cached['cache_hit'] = True
             return jsonify(cached)
 

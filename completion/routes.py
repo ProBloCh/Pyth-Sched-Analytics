@@ -380,7 +380,9 @@ def monte_carlo():
     key = _cache_key('mc', data) if (get_fn or set_fn) else None
     if get_fn and key is not None:
         cached = get_fn(key)
-        if cached:
+        # `is not None` so an empty dict (or any falsey payload)
+        # still counts as a hit; matches the `data is None` parse guard.
+        if cached is not None:
             cached['cache_hit'] = True
             return jsonify(cached)
 
@@ -418,7 +420,9 @@ def recovery_options():
     key = _cache_key('recovery', data) if (get_fn or set_fn) else None
     if get_fn and key is not None:
         cached = get_fn(key)
-        if cached:
+        # `is not None` so an empty dict (or any falsey payload)
+        # still counts as a hit; matches the `data is None` parse guard.
+        if cached is not None:
             cached['cache_hit'] = True
             return jsonify(cached)
 
