@@ -2632,7 +2632,7 @@ function createScheduleOptimizationInterface(nodes, links) {
                             Original: ${pathInfo.duration} days</span>
                             <span class="path-end-date">${originalEndDateStr}</span>
                         </div>
-                        <div class="path-bar optimized" style="width: ${optimizedWidth}%; background: linear-gradient(to right, #50fa7b, #8be9fd);">
+                        <div class="path-bar optimized" style="width: ${optimizedWidth}%; background: linear-gradient(to right, var(--cyb-success, #50fa7b), var(--cyb-info, #8be9fd));">
                             <span class="path-label">${pathInfo.index} | 
                             Optimized: ${optimizedInfo ? optimizedInfo.duration : pathInfo.duration} days${reductionText}</span>
                             <span class="path-end-date">${optimizedEndDateStr}</span>
@@ -2707,7 +2707,7 @@ function createScheduleOptimizationInterface(nodes, links) {
                             <span class="path-label">${pathInfo.index} | Original: ${pathInfo.duration} days</span>
                             <span class="path-end-date">${originalEndDateStr}</span>
                         </div>
-                        <div class="path-bar optimized" style="width: ${optimizedWidth}%; background: linear-gradient(to right, #50fa7b, #8be9fd);">
+                        <div class="path-bar optimized" style="width: ${optimizedWidth}%; background: linear-gradient(to right, var(--cyb-success, #50fa7b), var(--cyb-info, #8be9fd));">
                             <span class="path-label">${pathInfo.index} | Optimized: ${optimizedInfo ? optimizedInfo.duration : pathInfo.duration} days${reductionText}</span>
                             <span class="path-end-date">${optimizedEndDateStr}</span>
                         </div>
@@ -2997,18 +2997,18 @@ function createScheduleOptimizationInterface(nodes, links) {
             }
 
             /* Improved scoring color indicators */
-            .impact-high { color: #50fa7b; font-weight: bold; }
-            .impact-medium { color: #ffb86c; font-weight: bold; }
-            .impact-low { color: #ff5555; font-weight: bold; }
+            .impact-high { color: var(--cyb-success, #50fa7b); font-weight: bold; }
+            .impact-medium { color: var(--cyb-warning, #ffb86c); font-weight: bold; }
+            .impact-low { color: var(--cyb-danger, #ff5555); font-weight: bold; }
             
             .critical-tag {
-                color: #ff5555;
+                color: var(--cyb-danger, #ff5555);
                 font-weight: bold;
                 margin-left: 6px;
             }
             
             .near-critical-tag {
-                color: #ffb86c;
+                color: var(--cyb-warning, #ffb86c);
                 font-weight: bold;
                 margin-left: 6px;
             }
@@ -3030,12 +3030,12 @@ function createScheduleOptimizationInterface(nodes, links) {
             
             .critical-path-tag {
                 background: rgba(255, 85, 85, 0.2);
-                border: 1px solid #ff5555;
+                border: 1px solid var(--cyb-danger, #ff5555);
             }
             
             .near-critical-tag {
                 background: rgba(255, 184, 108, 0.2);
-                border: 1px solid #ffb86c;
+                border: 1px solid var(--cyb-warning, #ffb86c);
             }
 
             /* Improved card-like sections */
@@ -3210,7 +3210,7 @@ function createScheduleOptimizationInterface(nodes, links) {
             }
             
             .path-bar.optimized {
-                background: linear-gradient(to right, #50fa7b, #8be9fd);
+                background: linear-gradient(to right, var(--cyb-success, #50fa7b), var(--cyb-info, #8be9fd));
             }
             
             .path-bar-label {
@@ -3243,11 +3243,11 @@ function createScheduleOptimizationInterface(nodes, links) {
 
             .controlling-path-indicator {
                 background-color: rgba(80, 250, 123, 0.2);
-                border: 1px solid #50fa7b;
+                border: 1px solid var(--cyb-success, #50fa7b);
                 padding: 2px 6px;
                 border-radius: 4px;
                 font-weight: bold;
-                color: #50fa7b;
+                color: var(--cyb-success, #50fa7b);
                 position: absolute;
                 right: -25px;
                 top: -15px;
@@ -3295,11 +3295,11 @@ function createScheduleOptimizationInterface(nodes, links) {
             
             #autoOptimization {
                 background-color: rgba(60, 120, 180, 0.8);
-                border: 2px solid #8be9fd;
+                border: 2px solid var(--cyb-info, #8be9fd);
             }
             
             #autoOptimization:hover {
-                background: #8be9fd;
+                background: var(--cyb-info, #8be9fd);
                 color: var(--bg-darker);
             }
             
@@ -3386,22 +3386,22 @@ function createScheduleOptimizationInterface(nodes, links) {
             
             /* Status indicators */
             .time-savings-positive {
-                color: #50fa7b;
+                color: var(--cyb-success, #50fa7b);
                 font-weight: bold;
             }
             
             .time-savings-negative {
-                color: #ff5555;
+                color: var(--cyb-danger, #ff5555);
                 font-weight: bold;
             }
             
             .positive-value {
-                color: #50fa7b;
+                color: var(--cyb-success, #50fa7b);
                 font-weight: bold;
             }
             
             .negative-value {
-                color: #ff5555;
+                color: var(--cyb-danger, #ff5555);
                 font-weight: bold;
             }
 
@@ -3424,7 +3424,7 @@ function createScheduleOptimizationInterface(nodes, links) {
             }
 
             .loading-feedback {
-                color: #8be9fd;
+                color: var(--cyb-info, #8be9fd);
                 font-style: italic;
                 display: flex;
                 align-items: center;
@@ -3436,7 +3436,7 @@ function createScheduleOptimizationInterface(nodes, links) {
                 width: 12px;
                 height: 12px;
                 border: 2px solid transparent;
-                border-top-color: #8be9fd;
+                border-top-color: var(--cyb-info, #8be9fd);
                 border-radius: 50%;
                 animation: spin 1s linear infinite;
             }
@@ -3452,7 +3452,7 @@ function createScheduleOptimizationInterface(nodes, links) {
                 border-radius: 12px;
                 font-size: 11px;
                 background: rgba(80, 250, 123, 0.2);
-                border: 1px solid #50fa7b;
+                border: 1px solid var(--cyb-success, #50fa7b);
                 transition: all 0.2s;
             }
 
@@ -3464,7 +3464,7 @@ function createScheduleOptimizationInterface(nodes, links) {
             .key-insight {
                 margin-bottom: 6px;
                 padding-left: 5px;
-                border-left: 2px solid #8be9fd;
+                border-left: 2px solid var(--cyb-info, #8be9fd);
                 transition: all 0.2s;
             }
 
@@ -3580,7 +3580,7 @@ function createScheduleOptimizationInterface(nodes, links) {
 
             .target-results h4 {
                 margin-top: 0;
-                color: #50fa7b;
+                color: var(--cyb-success, #50fa7b);
                 margin-bottom: 15px;
                 border-bottom: 1px solid rgba(80, 250, 123, 0.2);
                 padding-bottom: 10px;
@@ -3611,7 +3611,7 @@ function createScheduleOptimizationInterface(nodes, links) {
             .target-result-value {
                 font-size: 1.3em;
                 font-weight: bold;
-                color: #50fa7b;
+                color: var(--cyb-success, #50fa7b);
             }
 
             /* Improved mode selector with tooltip info */
@@ -8662,7 +8662,7 @@ function createMonteCarloSimulationInterface(nodes, links) {
             }
             
             .critical-task {
-                color: #ff5555;
+                color: var(--cyb-danger, #ff5555);
                 font-weight: bold;
             }
             
@@ -8706,7 +8706,7 @@ function createMonteCarloSimulationInterface(nodes, links) {
             }
             
             .monte-carlo-progress-header {
-                color: #5ac8fa;
+                color: var(--cyb-primary, #5ac8fa);
                 font-size: 20px;
                 margin-bottom: 25px;
                 text-shadow: 0 0 10px rgba(90, 200, 250, 0.7);
@@ -8722,7 +8722,7 @@ function createMonteCarloSimulationInterface(nodes, links) {
             }
             
             .monte-carlo-progress-status {
-                color: #cdfaff;
+                color: var(--cyb-text1, #cdfaff);
                 margin-bottom: 25px;
                 font-size: 16px;
                 min-height: 20px;
@@ -8736,7 +8736,7 @@ function createMonteCarloSimulationInterface(nodes, links) {
             }
             
             .monte-carlo-progress-bar-container {
-                border: 1px solid #5ac8fa;
+                border: 1px solid var(--cyb-primary, #5ac8fa);
                 padding: 3px;
                 background: rgba(90, 200, 250, 0.1);
                 border-radius: 8px;
@@ -9396,12 +9396,12 @@ function createMonteCarloSimulationInterface(nodes, links) {
             // Add CSS for enhanced table
             const styleElement = document.createElement('style');
             styleElement.textContent = `
-        .high-risk { color: #ff5555; font-weight: bold; }
-        .medium-risk { color: #ffb86c; font-weight: bold; }
-        .low-risk { color: #50fa7b; }
+        .high-risk { color: var(--cyb-danger, #ff5555); font-weight: bold; }
+        .medium-risk { color: var(--cyb-warning, #ffb86c); font-weight: bold; }
+        .low-risk { color: var(--cyb-success, #50fa7b); }
         
-        .high-importance { color: #bd93f9; font-weight: bold; }
-        .medium-importance { color: #8be9fd; font-weight: bold; }
+        .high-importance { color: var(--cyb-purple, #bd93f9); font-weight: bold; }
+        .medium-importance { color: var(--cyb-info, #8be9fd); font-weight: bold; }
         .low-importance { color: #f8f8f2; }
         
         .recommendation-cell {
@@ -9420,15 +9420,15 @@ function createMonteCarloSimulationInterface(nodes, links) {
             font-weight: bold;
         }
         
-        .critical-tag { background-color: rgba(255, 85, 85, 0.2); color: #ff5555; border: 1px solid #ff5555; }
-        .high-risk-tag { background-color: rgba(255, 184, 108, 0.2); color: #ffb86c; border: 1px solid #ffb86c; }
-        .strategic-tag { background-color: rgba(189, 147, 249, 0.2); color: #bd93f9; border: 1px solid #bd93f9; }
-        .buffer-tag { background-color: rgba(80, 250, 123, 0.2); color: #50fa7b; border: 1px solid #50fa7b; }
-        .monitor-tag { background-color: rgba(139, 233, 253, 0.2); color: #8be9fd; border: 1px solid #8be9fd; }
+        .critical-tag { background-color: rgba(255, 85, 85, 0.2); color: var(--cyb-danger, #ff5555); border: 1px solid var(--cyb-danger, #ff5555); }
+        .high-risk-tag { background-color: rgba(255, 184, 108, 0.2); color: var(--cyb-warning, #ffb86c); border: 1px solid var(--cyb-warning, #ffb86c); }
+        .strategic-tag { background-color: rgba(189, 147, 249, 0.2); color: var(--cyb-purple, #bd93f9); border: 1px solid var(--cyb-purple, #bd93f9); }
+        .buffer-tag { background-color: rgba(80, 250, 123, 0.2); color: var(--cyb-success, #50fa7b); border: 1px solid var(--cyb-success, #50fa7b); }
+        .monitor-tag { background-color: rgba(139, 233, 253, 0.2); color: var(--cyb-info, #8be9fd); border: 1px solid var(--cyb-info, #8be9fd); }
         
         .resource-constrained {
             font-style: italic;
-            color: #ff5555;
+            color: var(--cyb-danger, #ff5555);
             font-size: 0.9em;
         }
         
@@ -9437,8 +9437,8 @@ function createMonteCarloSimulationInterface(nodes, links) {
             width: 14px;
             height: 14px;
             background: rgba(139, 233, 253, 0.2);
-            color: #8be9fd;
-            border: 1px solid #8be9fd;
+            color: var(--cyb-info, #8be9fd);
+            border: 1px solid var(--cyb-info, #8be9fd);
             border-radius: 50%;
             text-align: center;
             line-height: 14px;
@@ -9465,7 +9465,7 @@ function createMonteCarloSimulationInterface(nodes, links) {
             line-height: 1.4;
             text-align: left;
             box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
-            border: 1px solid #8be9fd;
+            border: 1px solid var(--cyb-info, #8be9fd);
         }
     `;
             document.head.appendChild(styleElement);
@@ -10135,6 +10135,14 @@ function createMonteCarloSimulationInterface(nodes, links) {
     simulator.renderInterface();
     simulator.attachEventHandlers();
     window.monteCarloSimulator = simulator;
+
+    // Register optimization surfaces for orchestration
+    var orch = window.CybereumOrchestration;
+    if (orch && orch.registerRegion) {
+        var optEl = document.getElementById('optimization-results') || document.getElementById('monte-carlo-container');
+        if (optEl) orch.registerRegion('monte-carlo-sim', { element: optEl, type: 'analysis', label: 'Monte Carlo Simulation' });
+    }
+
     return simulator;
 }
 
@@ -12069,11 +12077,11 @@ function createConstraintBasedOptimizer(nodes, links) {
                     }
                     
                     .cybereum-optimizer .hard-constraint {
-                        border-left: 3px solid #ff5555;
+                        border-left: 3px solid var(--cyb-danger, #ff5555);
                     }
                     
                     .cybereum-optimizer .soft-constraint {
-                        border-left: 3px solid #50fa7b;
+                        border-left: 3px solid var(--cyb-success, #50fa7b);
                     }
                     
                     .cybereum-optimizer .button-group {
@@ -12100,11 +12108,11 @@ function createConstraintBasedOptimizer(nodes, links) {
                     
                     .cybereum-optimizer .btn-primary {
                         background-color: rgba(60, 120, 180, 0.8);
-                        border-color: #8be9fd;
+                        border-color: var(--cyb-info, #8be9fd);
                     }
                     
                     .cybereum-optimizer .btn-primary:hover {
-                        background-color: #8be9fd;
+                        background-color: var(--cyb-info, #8be9fd);
                     }
                     
                     .cybereum-optimizer .recommendations {
@@ -12146,15 +12154,15 @@ function createConstraintBasedOptimizer(nodes, links) {
                     }
                     
                     .cybereum-optimizer .high-priority {
-                        color: #ff5555;
+                        color: var(--cyb-danger, #ff5555);
                     }
                     
                     .cybereum-optimizer .medium-priority {
-                        color: #ffb86c;
+                        color: var(--cyb-warning, #ffb86c);
                     }
                     
                     .cybereum-optimizer .high-impact {
-                        color: #50fa7b;
+                        color: var(--cyb-success, #50fa7b);
                     }
                     
                     .cybereum-optimizer .settings-form {
@@ -12184,7 +12192,7 @@ function createConstraintBasedOptimizer(nodes, links) {
                     
                     .cybereum-optimizer input:focus {
                         outline: none;
-                        border-color: #8be9fd;
+                        border-color: var(--cyb-info, #8be9fd);
                     }
                     
                     .cybereum-optimizer .results {
@@ -12218,11 +12226,11 @@ function createConstraintBasedOptimizer(nodes, links) {
                     }
                     
                     .cybereum-optimizer .positive-value {
-                        color: #50fa7b;
+                        color: var(--cyb-success, #50fa7b);
                     }
                     
                     .cybereum-optimizer .negative-value {
-                        color: #ff5555;
+                        color: var(--cyb-danger, #ff5555);
                     }
                     
                     .cybereum-optimizer .scenarios {
@@ -13124,7 +13132,7 @@ function createConstraintBasedOptimizer(nodes, links) {
         // If we have any overallocations, show them
         if (Object.keys(resourceUtilization.overallocations).length > 0) {
             let overallocationHtml = '<div style="margin-top: 10px; padding: 10px; background: rgba(255, 85, 85, 0.1); border-radius: 4px;">';
-            overallocationHtml += '<strong style="color: #ff5555;">Resource Overallocations Detected:</strong><ul>';
+            overallocationHtml += '<strong style="color: var(--cyb-danger, #ff5555);">Resource Overallocations Detected:</strong><ul>';
 
             Object.entries(resourceUtilization.overallocations).forEach(([resourceType, periods]) => {
                 overallocationHtml += `<li>${resourceType}: ${periods.length} overallocated periods</li>`;
@@ -14447,7 +14455,7 @@ if (typeof window !== 'undefined') {
                 width: 16px;
                 height: 16px;
                 border: 2px solid #e5e7eb;
-                border-top-color: #3b82f6;
+                border-top-color: var(--cyb-primary, #3b82f6);
                 border-radius: 50%;
                 animation: spin 0.8s linear infinite;
             }
@@ -14463,7 +14471,7 @@ if (typeof window !== 'undefined') {
 
             .productivity-indicator.high { color: #16a34a; }
             .productivity-indicator.medium { color: #d97706; }
-            .productivity-indicator.low { color: #dc2626; }
+            .productivity-indicator.low { color: var(--cyb-danger, #dc2626); }
         `;
         document.head.appendChild(styles);
     }
