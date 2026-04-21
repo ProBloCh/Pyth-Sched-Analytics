@@ -1,0 +1,532 @@
+"""
+paths/routes.py - Flask Blueprint for path analysis services.
+
+Endpoints (mirrors the solver/completion/evm blueprint pattern):
+
+    POST /paths/enumerate      -- enumerate all / longest-first paths
+                                  + structural-diversity / independence filter
+    POST /paths/driving-graph  -- CPM-derived deterministic driving chains
+                                  with predecessor-ranking explainability
+    POST /paths/distances      -- shortest/longest distance-to-start and
+                                  distance-to-end maps
+    POST /paths/calendar-slack -- CPM + calendar-projected ISO dates
+    GET  /paths/health         -- liveness probe
+
+All POST endpoints accept the same ``{nodes, links}`` payload shape as
+/solver and /completion.  Extra fields are endpoint-specific (see
+per-route docstrings).
+
+Caching: lazy bridge to app.py's Redis/LRU cache, same pattern the
+solver blueprint uses.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import math
+from dataclasses import asdict
+
+import numpy as np
+from flask import Blueprint, request, jsonify
+
+from solver.dag import build_dag
+from .distances import distances_to_start, distances_to_end, near_critical_mask
+from .calendar_slack import compute_calendar_slack
+from .enumerate import (
+    find_all_paths, MAX_PATHS_TO_RETURN,
+    NODE_THRESHOLD, LINK_THRESHOLD,
+)
+from .diversity import (
+    DiversityConfig, auto_tune_config,
+    select_independent_near_critical, select_structurally_diverse,
+)
+from .driving_graph import DrivingGraphConfig, extract_driving_graph
+
+
+logger = logging.getLogger(__name__)
+
+paths_bp = Blueprint('paths', __name__, url_prefix='/paths')
+
+
+# ---------------------------------------------------------------------------
+# Config -- line up with solver/routes.py limits
+# ---------------------------------------------------------------------------
+
+MAX_PAYLOAD_BYTES = 10 * 1024 * 1024
+MAX_NODES = 20_000
+MAX_LINKS = 100_000
+
+
+@paths_bp.record_once
+def _set_max_content_length(state):
+    state.app.config.setdefault('MAX_CONTENT_LENGTH', MAX_PAYLOAD_BYTES)
+
+
+# ---------------------------------------------------------------------------
+# Lazy caching bridge (avoids circular import at module-load time)
+# ---------------------------------------------------------------------------
+
+_cache_fns = None  # (get_fn, set_fn) | (None, None)
+
+
+def _cache():
+    global _cache_fns
+    if _cache_fns is None:
+        try:
+            from app import get_cached_result, set_cached_result
+            _cache_fns = (get_cached_result, set_cached_result)
+        except Exception as exc:
+            logger.info("Caching not available for /paths: %s", exc)
+            _cache_fns = (None, None)
+    return _cache_fns
+
+
+def _cache_key(prefix: str, data) -> str:
+    raw = json.dumps(data, sort_keys=True, default=str)
+    return f"paths:{prefix}:{hashlib.sha256(raw.encode()).hexdigest()}"
+
+
+# ---------------------------------------------------------------------------
+# Shared validation
+# ---------------------------------------------------------------------------
+
+def _validate_nodes_links(data):
+    nodes = data.get('nodes')
+    if not isinstance(nodes, list) or not nodes:
+        return 'nodes must be a non-empty list'
+    if len(nodes) > MAX_NODES:
+        return f'Too many nodes ({len(nodes)}); limit is {MAX_NODES}'
+
+    links = data.get('links', [])
+    if not isinstance(links, list):
+        return 'links must be a list'
+    if len(links) > MAX_LINKS:
+        return f'Too many links ({len(links)}); limit is {MAX_LINKS}'
+
+    seen = set()
+    for i, n in enumerate(nodes):
+        if not isinstance(n, dict):
+            return f'nodes[{i}] must be an object'
+        nid = n.get('ID', n.get('id'))
+        if nid is None:
+            return f'nodes[{i}] missing ID'
+        sid = str(nid)
+        if sid in seen:
+            return f'duplicate node ID: {nid}'
+        seen.add(sid)
+        dur = n.get('Duration', n.get('duration', 0))
+        try:
+            df = float(dur)
+        except (TypeError, ValueError):
+            return f'nodes[{i}] Duration not numeric'
+        if math.isnan(df) or math.isinf(df) or df < 0:
+            return f'nodes[{i}] Duration must be finite and non-negative'
+    for i, ln in enumerate(links):
+        if not isinstance(ln, dict):
+            return f'links[{i}] must be an object'
+        if ln.get('source') is None or ln.get('target') is None:
+            return f'links[{i}] missing source/target'
+        if str(ln.get('source')) not in seen:
+            return f'links[{i}] unknown source: {ln.get("source")}'
+        if str(ln.get('target')) not in seen:
+            return f'links[{i}] unknown target: {ln.get("target")}'
+    return None
+
+
+def _parse_request():
+    if request.content_length and request.content_length > MAX_PAYLOAD_BYTES:
+        return None, (jsonify({'error': 'Payload too large (limit: 10 MB)'}), 413)
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return None, (jsonify({'error': 'Invalid or missing JSON body'}), 400)
+    err = _validate_nodes_links(data)
+    if err:
+        return None, (jsonify({'error': err}), 400)
+    return data, None
+
+
+def _serialise(obj):
+    if isinstance(obj, dict):
+        return {k: _serialise(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_serialise(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        v = float(obj)
+        if math.isinf(v) or math.isnan(v):
+            return None
+        return v
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, float):
+        if math.isinf(obj) or math.isnan(obj):
+            return None
+    return obj
+
+
+def _default_start_end(nodes, links):
+    """If caller didn't specify start/end, pick project anchors.
+
+    Start: node with no predecessors (first such).
+    End:   node with no successors (last such in input order).
+    Matches the JS convention used by the frontend dispatch.
+    """
+    ids = [str(n.get('ID', n.get('id', ''))) for n in nodes]
+    has_pred = set()
+    has_succ = set()
+    for ln in links:
+        s = str(ln.get('source', ''))
+        t = str(ln.get('target', ''))
+        has_succ.add(s)
+        has_pred.add(t)
+    start = next((i for i in ids if i not in has_pred), ids[0] if ids else None)
+    end_candidates = [i for i in ids if i not in has_succ]
+    end = end_candidates[-1] if end_candidates else (ids[-1] if ids else None)
+    return start, end
+
+
+# ---------------------------------------------------------------------------
+# POST /paths/enumerate
+# ---------------------------------------------------------------------------
+
+@paths_bp.route('/enumerate', methods=['POST', 'OPTIONS'])
+def enumerate_paths():
+    """Enumerate paths with optional diversity / independence filtering.
+
+    Request body:
+        {
+          "nodes": [...],
+          "links": [...],
+          "start_id":       optional str (default: first predecessor-less node),
+          "end_id":         optional str (default: last successor-less node),
+          "max_paths":      optional int (default 10000),
+          "selection":      "raw" | "diverse" | "independent" (default "independent"),
+          "branch_balanced": bool (default true),
+          "diversity":      optional DiversityConfig overrides,
+        }
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'})
+    data, err = _parse_request()
+    if err:
+        return err
+
+    nodes = data['nodes']
+    links = data.get('links', [])
+    start_id = data.get('start_id')
+    end_id = data.get('end_id')
+    if not start_id or not end_id:
+        d_start, d_end = _default_start_end(nodes, links)
+        start_id = start_id or d_start
+        end_id = end_id or d_end
+
+    max_paths = int(data.get('max_paths', MAX_PATHS_TO_RETURN))
+    max_paths = max(1, min(max_paths, MAX_PATHS_TO_RETURN))
+    selection = str(data.get('selection', 'independent')).lower()
+    branch_balanced = bool(data.get('branch_balanced', True))
+
+    get_fn, set_fn = _cache()
+    cache_payload = {
+        'nodes': nodes, 'links': links,
+        'start_id': start_id, 'end_id': end_id,
+        'max_paths': max_paths, 'selection': selection,
+        'branch_balanced': branch_balanced,
+        'diversity': data.get('diversity'),
+    }
+    key = _cache_key('enumerate', cache_payload)
+    if get_fn:
+        cached = get_fn(key)
+        if cached:
+            cached['cache_hit'] = True
+            return jsonify(cached)
+
+    try:
+        base = find_all_paths(
+            nodes, links, start_id, end_id,
+            max_paths=max_paths,
+            branch_balanced=branch_balanced,
+        )
+
+        result = {
+            'start_id': base['start_id'],
+            'end_id': base['end_id'],
+            'method': base['method'],
+            'makespan_hours': base.get('makespan_hours', 0.0),
+            'raw_path_count': base['raw_path_count'],
+        }
+        if base.get('error'):
+            result['error'] = base['error']
+            result['paths'] = []
+            result['durations'] = []
+            result['cache_hit'] = False
+            return jsonify(_serialise(result))
+
+        raw_paths = base['paths']
+        raw_dur = base['durations']
+
+        if selection == 'raw' or not raw_paths:
+            result['paths'] = raw_paths
+            result['durations'] = raw_dur
+            result['selection'] = 'raw'
+        else:
+            cfg_overrides = data.get('diversity') or {}
+            cfg = DiversityConfig(**{
+                k: v for k, v in cfg_overrides.items()
+                if k in DiversityConfig.__dataclass_fields__
+            })
+            cfg = auto_tune_config(
+                cfg, raw_paths,
+                node_count=len(nodes), link_count=len(links),
+            )
+            if selection == 'diverse':
+                sel = select_structurally_diverse(raw_paths, raw_dur, cfg)
+                result['selection'] = 'diverse'
+            else:
+                sel = select_independent_near_critical(
+                    raw_paths, raw_dur,
+                    ref_path=raw_paths[0] if raw_paths else None,
+                    config=cfg,
+                )
+                result['selection'] = 'independent'
+            result['paths'] = sel.paths
+            result['durations'] = sel.durations
+            result['diversity_info'] = sel.info
+            result['diversity_config'] = asdict(cfg)
+
+        result['cache_hit'] = False
+        payload = _serialise(result)
+        if set_fn:
+            set_fn(key, payload)
+        return jsonify(payload)
+    except Exception as e:
+        logger.exception("/paths/enumerate failed: %s", e)
+        return jsonify({'error': 'Internal path-enumeration error'}), 500
+
+
+# ---------------------------------------------------------------------------
+# POST /paths/driving-graph
+# ---------------------------------------------------------------------------
+
+@paths_bp.route('/driving-graph', methods=['POST', 'OPTIONS'])
+def driving_graph():
+    """CPM-derived driving chains with predecessor-ranking explainability.
+
+    Request body:
+        {
+          "nodes": [...], "links": [...],
+          "start_id": optional, "end_id": optional,
+          "config":   optional DrivingGraphConfig overrides,
+        }
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'})
+    data, err = _parse_request()
+    if err:
+        return err
+
+    nodes = data['nodes']
+    links = data.get('links', [])
+    start_id = data.get('start_id')
+    end_id = data.get('end_id')
+    if not start_id or not end_id:
+        d_start, d_end = _default_start_end(nodes, links)
+        start_id = start_id or d_start
+        end_id = end_id or d_end
+
+    cfg_overrides = data.get('config') or {}
+    cfg = DrivingGraphConfig(**{
+        k: v for k, v in cfg_overrides.items()
+        if k in DrivingGraphConfig.__dataclass_fields__
+    })
+
+    get_fn, set_fn = _cache()
+    key = _cache_key('driving-graph', {
+        'nodes': nodes, 'links': links,
+        'start_id': start_id, 'end_id': end_id,
+        'config': cfg_overrides,
+    })
+    if get_fn:
+        cached = get_fn(key)
+        if cached:
+            cached['cache_hit'] = True
+            return jsonify(cached)
+
+    try:
+        res = extract_driving_graph(nodes, links, start_id, end_id, cfg)
+        result = {
+            'paths': res.paths,
+            'durations': res.durations,
+            'critical_chains': res.critical_chains,
+            'near_critical_chains': res.near_critical_chains,
+            'explainability': res.explainability,
+            'raw_candidate_count': res.raw_candidate_count,
+            'active_node_count': res.active_node_count,
+            'project_finish_hours': res.project_finish_hours,
+            'config': asdict(cfg),
+            'cache_hit': False,
+        }
+        payload = _serialise(result)
+        if set_fn:
+            set_fn(key, payload)
+        return jsonify(payload)
+    except Exception as e:
+        logger.exception("/paths/driving-graph failed: %s", e)
+        return jsonify({'error': 'Internal driving-graph error'}), 500
+
+
+# ---------------------------------------------------------------------------
+# POST /paths/distances
+# ---------------------------------------------------------------------------
+
+@paths_bp.route('/distances', methods=['POST', 'OPTIONS'])
+def distances():
+    """Per-node shortest/longest distance-to-start and -to-end.
+
+    Request body:
+        {"nodes": [...], "links": [...],
+         "near_critical_tol_hours": optional float (default 24)}
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'})
+    data, err = _parse_request()
+    if err:
+        return err
+
+    nodes = data['nodes']
+    links = data.get('links', [])
+    near_tol = float(data.get('near_critical_tol_hours', 24.0))
+
+    get_fn, set_fn = _cache()
+    key = _cache_key('distances', {
+        'nodes': nodes, 'links': links, 'near_tol': near_tol,
+    })
+    if get_fn:
+        cached = get_fn(key)
+        if cached:
+            cached['cache_hit'] = True
+            return jsonify(cached)
+
+    try:
+        state, id_to_idx = build_dag(nodes, links, default_duration=0.0)
+        idx_to_id = {i: nid for nid, i in id_to_idx.items()}
+        d_start = distances_to_start(state)
+        d_end = distances_to_end(state)
+        near = near_critical_mask(state, tolerance_hours=near_tol)
+
+        def _coerce(v):
+            v = float(v)
+            if math.isinf(v) or math.isnan(v):
+                return None
+            return v
+
+        nodes_out = []
+        for i in range(state.n):
+            nodes_out.append({
+                'ID': idx_to_id[i],
+                'duration_hours': float(state.durations[i]),
+                'shortest_to_start': _coerce(d_start['shortest'][i]),
+                'longest_to_start': _coerce(d_start['longest'][i]),
+                'shortest_to_end': _coerce(d_end['shortest'][i]),
+                'longest_to_end': _coerce(d_end['longest'][i]),
+                'TF': float(state.TF[i]),
+                'is_critical': bool(state.critical_mask[i]),
+                'is_near_critical': bool(near[i]),
+            })
+
+        result = {
+            'nodes': nodes_out,
+            'makespan_hours': float(state.makespan),
+            'critical_count': int(np.count_nonzero(state.critical_mask)),
+            'near_critical_count': int(np.count_nonzero(near)),
+            'near_critical_tol_hours': near_tol,
+            'cache_hit': False,
+        }
+        payload = _serialise(result)
+        if set_fn:
+            set_fn(key, payload)
+        return jsonify(payload)
+    except Exception as e:
+        logger.exception("/paths/distances failed: %s", e)
+        return jsonify({'error': 'Internal distance-compute error'}), 500
+
+
+# ---------------------------------------------------------------------------
+# POST /paths/calendar-slack
+# ---------------------------------------------------------------------------
+
+@paths_bp.route('/calendar-slack', methods=['POST', 'OPTIONS'])
+def calendar_slack():
+    """CPM + optional working-calendar projection to ISO dates.
+
+    Request body:
+        {"nodes": [...], "links": [...],
+         "project_start": optional ISO string,
+         "calendar": {"hours_per_day": 8, "working_days": [1..5], "holidays": [...]}}
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'})
+    data, err = _parse_request()
+    if err:
+        return err
+
+    nodes = data['nodes']
+    links = data.get('links', [])
+    project_start = data.get('project_start')
+    calendar_cfg = data.get('calendar') or {}
+
+    get_fn, set_fn = _cache()
+    key = _cache_key('calendar-slack', {
+        'nodes': nodes, 'links': links,
+        'project_start': project_start, 'calendar': calendar_cfg,
+    })
+    if get_fn:
+        cached = get_fn(key)
+        if cached:
+            cached['cache_hit'] = True
+            return jsonify(cached)
+
+    try:
+        result = compute_calendar_slack(
+            nodes, links,
+            project_start=project_start,
+            calendar_config=calendar_cfg,
+        )
+        result['cache_hit'] = False
+        payload = _serialise(result)
+        if set_fn:
+            set_fn(key, payload)
+        return jsonify(payload)
+    except Exception as e:
+        logger.exception("/paths/calendar-slack failed: %s", e)
+        return jsonify({'error': 'Internal calendar-slack error'}), 500
+
+
+# ---------------------------------------------------------------------------
+# GET /paths/health
+# ---------------------------------------------------------------------------
+
+@paths_bp.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        'status': 'healthy',
+        'module': 'paths',
+        'endpoints': [
+            '/paths/enumerate',
+            '/paths/driving-graph',
+            '/paths/distances',
+            '/paths/calendar-slack',
+        ],
+        'limits': {
+            'max_nodes': MAX_NODES,
+            'max_links': MAX_LINKS,
+            'max_payload_bytes': MAX_PAYLOAD_BYTES,
+            'node_threshold_small_dag': NODE_THRESHOLD,
+            'link_threshold_small_dag': LINK_THRESHOLD,
+            'max_paths_return': MAX_PATHS_TO_RETURN,
+        },
+    })
