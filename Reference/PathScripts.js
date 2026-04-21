@@ -8,6 +8,14 @@
 window.DEFAULT_HOURS_PER_DAY = (Number.isFinite(Number(window.DEFAULT_HOURS_PER_DAY)) ? Number(window.DEFAULT_HOURS_PER_DAY) : 8);
 window.DEFAULT_WORKING_DAYS = (Array.isArray(window.DEFAULT_WORKING_DAYS) && window.DEFAULT_WORKING_DAYS.length ? window.DEFAULT_WORKING_DAYS : [1, 2, 3, 4, 5]); // Monday-Friday
 
+// Module-private HTML-escape helper used by the driving-constraints
+// tooltip (`cybDG_showTooltipForNode`). Prefixed `_ps` to avoid colliding
+// with similar helpers in sibling scripts loaded on the same page.
+function _psEscHtml(s) {
+    if (s === null || s === undefined) return '';
+    return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 const CONFIG = {
     WORKING_HOURS_PER_DAY: window.DEFAULT_HOURS_PER_DAY,
     WORKING_DAYS_PER_WEEK: window.DEFAULT_WORKING_DAYS.length,
@@ -1010,7 +1018,7 @@ function annotateClusterPeaks(clusters) {
         padding: 10px 12px;
         border-radius: 6px;
         font-size: 11px;
-        color: #b4f5ff;
+        color: var(--cyb-accent2, #b4f5ff);
         border: 1px solid rgba(70, 185, 250, 0.3);
         box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
         z-index: 100;
@@ -1024,7 +1032,7 @@ function annotateClusterPeaks(clusters) {
 
     // Build annotation content
     let html = `
-        <div style="margin-bottom: 6px; color: #fff; font-weight: bold; font-size: 12px;">
+        <div style="margin-bottom: 6px; color: var(--cyb-text1, #fff); font-weight: bold; font-size: 12px;">
             📊 Path Clusters Detected
         </div>
     `;
@@ -1036,7 +1044,7 @@ function annotateClusterPeaks(clusters) {
             <div style="margin: 4px 0; display: flex; align-items: center;">
                 <span style="color: ${getClusterColor(i)}; font-size: 14px; margin-right: 6px;">●</span>
                 <span>Cluster ${i + 1}: ~${peakHrs.toLocaleString()} hrs</span>
-                <span style="color: #7fb8d8; margin-left: auto;">(${pathCount})</span>
+                <span style="color: var(--cyb-textSecondary, #7fb8d8); margin-left: auto;">(${pathCount})</span>
             </div>
         `;
     });
@@ -1513,7 +1521,7 @@ function renderCalendarView(teamCalendar, elementId, nodes, options = {}) {
                 top: 2px;
                 right: 2px;
                 background: var(--accent-color);
-                color: #fff;
+                color: var(--cyb-text1, #fff);
                 padding: 2px 4px;
                 border-radius: 4px;
                 font-size: 0.7em;
@@ -1711,13 +1719,13 @@ function renderCalendarView(teamCalendar, elementId, nodes, options = {}) {
                 justify-content: center;
                 margin-right: 0;
                 margin-left: 5px;
-                border: 1px solid #5ac8fa;
+                border: 1px solid var(--cyb-primary, #5ac8fa);
                 padding: 1px 6px;
                 box-shadow: 0 0 3px #5ac8fa, inset 0 0 3px #5ac8fa;
             }
             
             .modal-overlay .icon {
-                color: #cdfaff;
+                color: var(--cyb-text1, #cdfaff);
                 text-shadow: 0 0 2px #8ce6ff, 0 0 4px #8ce6ff;
                 font-weight: 700;
                 letter-spacing: 1px;
@@ -2021,8 +2029,8 @@ function renderCalendarView(teamCalendar, elementId, nodes, options = {}) {
             }
             
             .calendar-btn.danger {
-                color: #ff5555;
-                border-color: #ff5555;
+                color: var(--cyb-danger, #ff5555);
+                border-color: var(--cyb-danger, #ff5555);
             }
             
             .calendar-btn.danger:hover {
@@ -2245,7 +2253,7 @@ function renderCalendarView(teamCalendar, elementId, nodes, options = {}) {
                     ">
                         <span class="activity-summary-indicator" 
                             title="${dayActivities.length} activities on this day"
-                            style="background: var(--accent-color); color: #fff; border-radius: 50%; width: 20px; height: 20px; 
+                            style="background: var(--accent-color); color: var(--cyb-text1, #fff); border-radius: 50%; width: 20px; height: 20px; 
                             display: flex; align-items: center; justify-content: center; font-size: 0.8em; font-weight: bold;">
                             ${iconCount}
                         </span>
@@ -7473,7 +7481,7 @@ function cybDG_showTooltipForNode(nodeId, anchorEl = null) {
         const rows = exp.predecessors || [];
 
         const header = `<div style="font-weight:700;margin-bottom:6px;">
-            Driving constraints for <span style="color:#9fd1ff;">${exp.id}</span>
+            Driving constraints for <span style="color:var(--cyb-textSecondary, #9fd1ff);">${_psEscHtml(exp.id)}</span>
             <span style="opacity:0.8;font-weight:500;">(TF=${Number.isFinite(exp.TF) ? exp.TF.toFixed(2) : 'n/a'}h)</span>
         </div>`;
 
@@ -7488,8 +7496,8 @@ function cybDG_showTooltipForNode(nodeId, anchorEl = null) {
                 <tbody>
                 ${rows.map(r => `
                     <tr style="border-top:1px solid rgba(255,255,255,0.06);">
-                        <td style="padding:3px 0;">${r.predId}</td>
-                        <td style="padding:3px 0;">${r.type}</td>
+                        <td style="padding:3px 0;">${_psEscHtml(r.predId)}</td>
+                        <td style="padding:3px 0;">${_psEscHtml(r.type)}</td>
                         <td style="padding:3px 0;text-align:right;">${Number.isFinite(r.lagHrs) ? r.lagHrs.toFixed(2) : '0.00'}</td>
                         <td style="padding:3px 0;text-align:right;">${Number.isFinite(r.deltaHrs) ? r.deltaHrs.toFixed(2) : 'n/a'}</td>
                     </tr>`).join("")}
