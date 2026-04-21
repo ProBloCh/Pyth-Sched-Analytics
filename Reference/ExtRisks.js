@@ -2169,12 +2169,24 @@ function renderRiskTaxonomyChart(riskRegister) {
 
     const legend = document.createElement('div');
     legend.className = 'risk-taxonomy-legend';
-    legend.innerHTML = categoryNames.slice(0, 8).map(name => `
-        <span class="risk-taxonomy-legend-item">
-            <span class="risk-taxonomy-legend-dot" style="background:${color(name)}"></span>
-            ${escapeHtml(name)}
-        </span>
-    `).join('');
+    const Prims = window.CybereumPrimitives;
+    if (Prims && Prims.Chip) {
+        categoryNames.slice(0, 8).forEach(function (name) {
+            var chip = Prims.Chip({ label: name, status: 'info', dot: true });
+            // Apply the category-specific color to the dot
+            var dot = chip.querySelector('.cyb-badge-dot');
+            if (dot) dot.style.background = color(name);
+            chip.classList.add('risk-taxonomy-legend-item');
+            legend.appendChild(chip);
+        });
+    } else {
+        legend.innerHTML = categoryNames.slice(0, 8).map(name => `
+            <span class="risk-taxonomy-legend-item">
+                <span class="risk-taxonomy-legend-dot" style="background:${color(name)}"></span>
+                ${escapeHtml(name)}
+            </span>
+        `).join('');
+    }
     container.appendChild(legend);
 }
 
@@ -4455,22 +4467,22 @@ function showMitigationDetails(activity) {
     const successors = (activity.recommended_successors || []).join(', ');
 
     content.innerHTML = `
-        <h3 style="color:#8ce6ff;">Mitigation Activity: ${escapeHtml(activity.name)}</h3>
-        <p><strong>Risk:</strong> ${activity.risk_name}</p>
+        <h3 style="color:var(--cyb-textSecondary, #8ce6ff);">Mitigation Activity: ${escapeHtml(activity.name)}</h3>
+        <p><strong>Risk:</strong> ${escapeHtml(activity.risk_name)}</p>
         <p><strong>Description:</strong> ${escapeHtml(cleanMitigationText(activity.description))}</p>
         <p><strong>Duration:</strong> ${activity.duration} hours</p>
         <p><strong>Estimated Cost:</strong> $${(activity.estimated_cost || 0).toLocaleString()}</p>
         <hr>
-        <h4 style="color:#8ce6ff;">Dependencies</h4>
-        <p><strong>Predecessors:</strong> ${predecessors || 'None'}</p>
-        <p><strong>Successors:</strong> ${successors || 'None'}</p>
-        <p><strong>Reasoning:</strong> ${activity.dependency_reasoning || 'Not provided'}</p>
+        <h4 style="color:var(--cyb-textSecondary, #8ce6ff);">Dependencies</h4>
+        <p><strong>Predecessors:</strong> ${escapeHtml(predecessors) || 'None'}</p>
+        <p><strong>Successors:</strong> ${escapeHtml(successors) || 'None'}</p>
+        <p><strong>Reasoning:</strong> ${escapeHtml(activity.dependency_reasoning) || 'Not provided'}</p>
         <hr>
-        <h4 style="color:#8ce6ff;">Resources & Deliverables</h4>
+        <h4 style="color:var(--cyb-textSecondary, #8ce6ff);">Resources & Deliverables</h4>
         <p><strong>Resources:</strong> ${escapeHtml((activity.resource_requirements || []).join(', ' ))}</p>
         <p><strong>Deliverables:</strong> ${escapeHtml((activity.deliverables || []).join(', ' ))}</p>
         <button onclick="this.parentElement.parentElement.remove()" 
-                class="icon-button" style="margin-top: 20px; padding: 8px 12px; background: #113464; color: #cdfaff; border: 1px solid #3292cd; border-radius: 5px; cursor: pointer;">
+                class="icon-button" style="margin-top: 20px; padding: 8px 12px; background: var(--cyb-bgMid, #113464); color: var(--cyb-text1, #cdfaff); border: 1px solid var(--cyb-border-strong, #3292cd); border-radius: 5px; cursor: pointer;">
             Close
         </button>
     `;
@@ -4505,28 +4517,35 @@ function populateExternalRiskTables(enrichedNodes, risk_register) {
                 const affectedCount = enrichedNodes.filter(node =>
                     node.externalRisks && node.externalRisks.some(r => String(r.id) === String(normalizedRisk.id))
                 ).length;
-                const affectedActivities = enrichedNodes
+                // Build the activity labels already-escaped so they're safe for
+                // BOTH the title="..." attribute and the <div>...</div> content
+                // below. escapeHtml covers quotes (&quot;), which is what the
+                // attribute context specifically requires.
+                const affectedActivityLabels = enrichedNodes
                     .filter(node => node.externalRisks && node.externalRisks.some(r => String(r.id) === String(normalizedRisk.id)))
-                    .map(node => `${node.ID}: ${node.Name}`)
+                    .map(node => `${escapeHtml(node.ID)}: ${escapeHtml(node.Name)}`)
                     .slice(0, 6);
-                const hasMoreActivities = affectedCount > affectedActivities.length;
+                const hasMoreActivities = affectedCount > affectedActivityLabels.length;
+                const signalsEscaped = Array.isArray(normalizedRisk.source_signals)
+                    ? normalizedRisk.source_signals.map(escapeHtml).join(', ')
+                    : '';
 
                 console.log(`RScores Risk ${index + 1}: ${normalizedRisk.name} affects ${affectedCount} activities`);
 
                 const row = document.createElement('tr');
                 const riskTypeClass = String(normalizedRisk.type || 'general').toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
                 row.innerHTML = `
-                    <td>${normalizedRisk.id}</td>
-                    <td contenteditable="false" data-field="name"><strong>${normalizedRisk.name}</strong></td>
-                    <td><span class="risk-type-badge ${riskTypeClass}">${normalizedRisk.type}</span></td>
+                    <td>${escapeHtml(normalizedRisk.id)}</td>
+                    <td contenteditable="false" data-field="name"><strong>${escapeHtml(normalizedRisk.name)}</strong></td>
+                    <td><span class="risk-type-badge ${riskTypeClass}">${escapeHtml(normalizedRisk.type)}</span></td>
                     <td>${(Number(normalizedRisk.probability || 0) * 100).toFixed(1)}%</td>
                     <td>${(Number(normalizedRisk.cost_impact || 0) * 100).toFixed(1)}%</td>
                     <td>${(Number(normalizedRisk.schedule_impact || 0) * 100).toFixed(1)}%</td>
-                    <td title="${affectedActivities.join(' | ')}"><strong>${affectedCount}</strong>${affectedActivities.length ? `<div style="font-size:11px;color:#8ce6ff;max-width:280px;">${affectedActivities.join('<br/>')}${hasMoreActivities ? '<br/>…' : ''}</div>` : ''}</td>
-                    <td>${normalizedRisk.source || 'LLM'}${Array.isArray(normalizedRisk.source_signals) && normalizedRisk.source_signals.length ? '<div style="font-size:10px;color:#8ce6ff;margin-top:2px;">Signals: ' + normalizedRisk.source_signals.join(', ') + '</div>' : ''}</td>
-                    <td title="Driver: ${normalizedRisk.taxonomy?.driver || 'Multi-factor'}">${normalizedRisk.taxonomyLabel}</td>
-                    <td style="max-width: 240px; word-wrap: break-word;">${normalizedRisk.manifestation_mechanism || 'Not specified'}</td>
-                    <td style="max-width: 300px; word-wrap: break-word;" contenteditable="false" data-field="description">${normalizedRisk.description || 'No description provided'}</td>
+                    <td title="${affectedActivityLabels.join(' | ')}"><strong>${affectedCount}</strong>${affectedActivityLabels.length ? `<div style="font-size:11px;color:var(--cyb-textSecondary, #8ce6ff);max-width:280px;">${affectedActivityLabels.join('<br/>')}${hasMoreActivities ? '<br/>…' : ''}</div>` : ''}</td>
+                    <td>${escapeHtml(normalizedRisk.source || 'LLM')}${signalsEscaped ? '<div style="font-size:10px;color:var(--cyb-textSecondary, #8ce6ff);margin-top:2px;">Signals: ' + signalsEscaped + '</div>' : ''}</td>
+                    <td title="Driver: ${escapeHtml(normalizedRisk.taxonomy?.driver || 'Multi-factor')}">${escapeHtml(normalizedRisk.taxonomyLabel)}</td>
+                    <td style="max-width: 240px; word-wrap: break-word;">${escapeHtml(normalizedRisk.manifestation_mechanism || 'Not specified')}</td>
+                    <td style="max-width: 300px; word-wrap: break-word;" contenteditable="false" data-field="description">${escapeHtml(normalizedRisk.description || 'No description provided')}</td>
                 `;
                 row.addEventListener('input', () => {
                     const nameCell = row.querySelector('[data-field="name"]');
@@ -4580,7 +4599,7 @@ function populateExternalRiskTables(enrichedNodes, risk_register) {
                 <td><strong>${node.Name}</strong></td>
                 <td style="max-width: 250px; word-wrap: break-word; font-size: 0.9em;" title="${riskNames}">
                     ${riskTypes || 'General'}
-                    ${manifestations ? `<div style="font-size:11px;color:#8ce6ff;margin-top:4px;">${manifestations}</div>` : ''}
+                    ${manifestations ? `<div style="font-size:11px;color:var(--cyb-textSecondary, #8ce6ff);margin-top:4px;">${manifestations}</div>` : ''}
                 </td>
                 <td>
                     <div class="risk-score-cell">
@@ -4611,7 +4630,7 @@ function populateExternalRiskTables(enrichedNodes, risk_register) {
             // Add summary info if no activities
             if (activitiesWithExternalRisks.length === 0) {
                 const emptyRow = document.createElement('tr');
-                emptyRow.innerHTML = '<td colspan="8" style="text-align: center; padding: 20px; color: #666;">No activities with external risks found</td>';
+                emptyRow.innerHTML = '<td colspan="8" style="text-align: center; padding: 20px; color: var(--cyb-textTertiary, #666);">No activities with external risks found</td>';
                 activitiesTableBody.appendChild(emptyRow);
             }
         } else {
@@ -4622,6 +4641,16 @@ function populateExternalRiskTables(enrichedNodes, risk_register) {
 
         // Render external signal feed if available
         renderSignalFeed();
+
+        // Register risk regions for Dyeus orchestration
+        var orch = window.CybereumOrchestration;
+        if (orch && orch.registerRegion) {
+            var taxonomy = document.getElementById('riskTaxonomyChart');
+            var coverage = document.getElementById('riskCoverageSummary');
+            if (taxonomy) orch.registerRegion('ext-risk-taxonomy', { element: taxonomy, type: 'risk', label: 'Risk Taxonomy' });
+            if (coverage) orch.registerRegion('ext-risk-coverage', { element: coverage, type: 'risk', label: 'Risk Coverage Summary' });
+            if (externalRiskTableBody) orch.registerRegion('ext-risk-register', { element: externalRiskTableBody.closest('table') || externalRiskTableBody, type: 'risk', label: 'External Risk Register' });
+        }
 
         // Dispatch completion event
         window.dispatchEvent(new CustomEvent('externalRiskTablesPopulated', {
@@ -4819,7 +4848,7 @@ function showActivityRiskDetails(node) {
             </div>
         `).join('')}
         <button onclick="this.parentElement.parentElement.remove()" 
-                class="icon-button" style="margin-top: 20px; padding: 8px 12px; background: #113464; color: #cdfaff; border: 1px solid #3292cd; border-radius: 5px; cursor: pointer;">
+                class="icon-button" style="margin-top: 20px; padding: 8px 12px; background: var(--cyb-bgMid, #113464); color: var(--cyb-text1, #cdfaff); border: 1px solid var(--cyb-border-strong, #3292cd); border-radius: 5px; cursor: pointer;">
             Close
         </button>
     `;
