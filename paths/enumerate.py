@@ -494,6 +494,16 @@ def find_all_paths(
     start_idx = id_to_idx[s]
     end_idx = id_to_idx[e]
 
+    # Self-loop endpoint: there is no meaningful s -> e path other than
+    # the singleton {s}.  Return an empty result set rather than the
+    # degenerate one-node path; callers expect no engine error here.
+    if start_idx == end_idx:
+        return {
+            'paths': [], 'durations': [], 'method': 'none',
+            'raw_path_count': 0, 'start_id': s, 'end_id': e,
+            'makespan_hours': float(state.makespan),
+        }
+
     is_large = (state.n > node_threshold) or (len(links) > link_threshold)
 
     if not is_large:

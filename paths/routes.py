@@ -16,8 +16,11 @@ All POST endpoints accept the same ``{nodes, links}`` payload shape as
 /solver and /completion.  Extra fields are endpoint-specific (see
 per-route docstrings).
 
-Caching: lazy bridge to app.py's Redis/LRU cache, same pattern the
-solver blueprint uses.
+Caching: lazy bridge to app.py's Redis cache.  When Redis is not
+configured (``app.redis_client is None``), ``_cache()`` returns
+``(None, None)`` and the route skips both the cache key SHA-256 and the
+get/set callbacks entirely.  No in-process LRU fallback; this matches
+the solver/completion/evm pattern.
 """
 
 from __future__ import annotations

@@ -627,13 +627,18 @@ class TestEndpointValidation:
 
     def test_enumerate_start_equals_end_returns_200(self, client, diamond_schedule):
         """When start_id == end_id, the engine reports zero paths but no
-        error; the route should return 200 with an empty result set."""
+        error; the route should return 200 with an empty result set
+        (NOT the degenerate single-node path)."""
         nodes, links = diamond_schedule
         r = client.post('/paths/enumerate', json={
             'nodes': nodes, 'links': links,
             'start_id': 'A', 'end_id': 'A',
         })
         assert r.status_code == 200
+        body = r.get_json()
+        assert body['paths'] == []
+        assert body['durations'] == []
+        assert body['raw_path_count'] == 0
 
     def test_enumerate_unknown_endpoint_returns_400(self, client, diamond_schedule):
         """find_all_paths reports start/end-not-in-schedule via an error
