@@ -1,0 +1,24 @@
+{
+  "name": "parallel",
+  "description": "4 parallel branches of decreasing length: A -> {B,C,D,E} -> F. Branches B/C/D/E differ by 1h each so they're easy to rank.",
+  "nodes": [
+    {"ID": "A", "Duration": 5,  "TimeUnits": "Hours"},
+    {"ID": "B", "Duration": 30, "TimeUnits": "Hours"},
+    {"ID": "C", "Duration": 29, "TimeUnits": "Hours"},
+    {"ID": "D", "Duration": 28, "TimeUnits": "Hours"},
+    {"ID": "E", "Duration": 27, "TimeUnits": "Hours"},
+    {"ID": "F", "Duration": 7,  "TimeUnits": "Hours"}
+  ],
+  "links": [
+    {"source": "A", "target": "B", "type": "FS", "lag": 0},
+    {"source": "A", "target": "C", "type": "FS", "lag": 0},
+    {"source": "A", "target": "D", "type": "FS", "lag": 0},
+    {"source": "A", "target": "E", "type": "FS", "lag": 0},
+    {"source": "B", "target": "F", "type": "FS", "lag": 0},
+    {"source": "C", "target": "F", "type": "FS", "lag": 0},
+    {"source": "D", "target": "F", "type": "FS", "lag": 0},
+    {"source": "E", "target": "F", "type": "FS", "lag": 0}
+  ],
+  "start_id": "A",
+  "end_id": "F"
+}

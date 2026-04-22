@@ -1,0 +1,18 @@
+{
+  "name": "lag_relations",
+  "description": "Mixed FS/SS/FF/SF + lag to exercise all four PDM rules. Single path A->B->D and A->C->D so the path-set is small enough to compare exactly.",
+  "nodes": [
+    {"ID": "A", "Duration": 10, "TimeUnits": "Hours"},
+    {"ID": "B", "Duration": 5,  "TimeUnits": "Hours"},
+    {"ID": "C", "Duration": 8,  "TimeUnits": "Hours"},
+    {"ID": "D", "Duration": 3,  "TimeUnits": "Hours"}
+  ],
+  "links": [
+    {"source": "A", "target": "B", "type": "SS", "lag": 2,  "lagUnits": "Hours"},
+    {"source": "A", "target": "C", "type": "FS", "lag": 0,  "lagUnits": "Hours"},
+    {"source": "B", "target": "D", "type": "FF", "lag": 1,  "lagUnits": "Hours"},
+    {"source": "C", "target": "D", "type": "FS", "lag": 0,  "lagUnits": "Hours"}
+  ],
+  "start_id": "A",
+  "end_id": "D"
+}
