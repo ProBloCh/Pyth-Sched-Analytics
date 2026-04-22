@@ -239,21 +239,6 @@ def enumerate_all_paths_exact(
 # Longest-first enumeration (large DAGs)
 # ---------------------------------------------------------------------------
 
-def _heuristic_edge_hours(state: DAGState) -> Dict[Tuple[int, int], float]:
-    """FS-based upper bound ``dur(pred) + lag`` per edge -- JS line 3517-3532.
-
-    Used as the priority-queue ranking weight during best-first search.
-    Returns a dict keyed by ``(src, tgt)`` index pairs.
-    """
-    out: Dict[Tuple[int, int], float] = {}
-    d = state.durations
-    for u in range(state.n):
-        for k, v in enumerate(state.succ[u]):
-            lag, _rel = state.succ_edges[u][k]
-            out[(u, int(v))] = float(d[u]) + float(lag)
-    return out
-
-
 class _PathTracker:
     """Top-K longest paths via min-heap eviction.  Matches JS PathTracker."""
 
@@ -336,7 +321,9 @@ def enumerate_longest_paths_first(
     if critical_mask is None:
         critical_mask = state.critical_mask
 
-    edge_h = _heuristic_edge_hours(state)
+    # Per-edge heuristic weight is computed inline below as
+    # ``durations[last] + lag`` -- no need for an O(E) precomputed dict.
+    durations = state.durations
     heap: List = []
 
     # Stable tie-break counter (heapq doesn't allow custom cmp).
@@ -416,11 +403,15 @@ def enumerate_longest_paths_first(
         # cycle-break block in build_dag), so a successor cannot already
         # appear in the current path -- no membership check needed in the
         # hot loop.
+        # FS-based heuristic weight per hop = dur(last) + lag.  Computing
+        # this inline avoids a precomputed O(E) dict and one (tuple, dict)
+        # lookup per expansion (JS findAllPaths line 3517-3532 equivalent).
+        last_dur = float(durations[last])
         for k, s in enumerate(state.succ[last]):
             nbr = int(s)
+            lag, _rel = state.succ_edges[last][k]
             new_path = path + (nbr,)
-            w = edge_h.get((last, nbr), 0.0)
-            new_est = est + w
+            new_est = est + last_dur + float(lag)
             new_crit = crit + (1 if bool(critical_mask[nbr]) else 0)
             push(new_path, new_est, new_crit)
             _branch_inc(new_path)

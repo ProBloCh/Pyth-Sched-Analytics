@@ -157,7 +157,7 @@ def _parse_request():
     if data is None:
         return None, (jsonify({'error': 'Invalid or missing JSON body'}), 400)
     if not isinstance(data, dict):
-        return None, (jsonify({'error': 'Request body must be a JSON object'}), 400)
+        return None, (jsonify({'error': 'JSON root must be an object'}), 400)
     err = _validate_nodes_links(data)
     if err:
         return None, (jsonify({'error': err}), 400)

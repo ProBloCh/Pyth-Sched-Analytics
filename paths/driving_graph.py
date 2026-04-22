@@ -427,6 +427,10 @@ def extract_driving_graph(
         'project_finish_hours': float(state.makespan),
         'critical_chain_count': len(critical_chains),
         'near_critical_chain_count': len(near_critical_chains),
+        # Predecessor-ranking detail is only useful for nodes that
+        # actually appear in the returned chains (the UI tooltip walks
+        # one chain at a time).  Emitting rankings for every node in the
+        # active subgraph can blow up response size on large schedules.
         'pred_rankings': {
             idx_to_id[j]: [
                 {
@@ -437,7 +441,11 @@ def extract_driving_graph(
                 }
                 for r in rankings[j][:cfg.max_display_chains]
             ]
-            for j in range(state.n)
+            for j in {
+                i for chain in (
+                    list(sel_paths) + critical_chains + near_critical_chains
+                ) for i in chain
+            }
         },
     }
 
