@@ -449,6 +449,27 @@ class TestEndpointEnumerate:
         assert body['start_id'] == 'A'
         assert body['end_id'] == 'E'
 
+    def test_default_endpoints_nan_inf_ids_ignored(self, client):
+        """Malicious or malformed IDs parsing as NaN/Inf must not be
+        selected as the max-numeric end anchor.  Without the isfinite
+        filter, NaN-first ordering in max() would pick the NaN entry."""
+        nodes = [
+            {'ID': 'nan', 'Duration': 1},
+            {'ID': '5',   'Duration': 2},
+            {'ID': 'inf', 'Duration': 3},
+            {'ID': '99',  'Duration': 4},
+        ]
+        links = [
+            {'source': '5', 'target': '99'},
+        ]
+        r = client.post('/paths/enumerate', json={
+            'nodes': nodes, 'links': links, 'selection': 'raw',
+        })
+        assert r.status_code == 200
+        body = r.get_json()
+        # End must be '99' (max finite numeric ID), not 'nan' or 'inf'.
+        assert body['end_id'] == '99'
+
     def test_default_endpoints_app_convention(self, client):
         """Main-app convention: start='0', end=max numeric ID."""
         nodes = [

@@ -358,6 +358,7 @@ _DRIVING_GRAPH_BOUNDS = {
     'max_depth_guard': (1, 100_000),
     'max_display_chains': (1, 1_000),
     'min_jaccard_novelty': (0.0, 1.0),
+    'max_pred_rankings_per_node': (1, 500),
 }
 _DRIVING_GRAPH_ALLOWED = {
     'selection_mode': {'raw', 'outliers'},
@@ -399,10 +400,16 @@ def _default_start_end(nodes, links):
     numeric_ids = []
     for nid in ids:
         try:
-            numeric_ids.append((float(nid), nid))
+            v = float(nid)
         except (TypeError, ValueError):
-            pass
-    end = max(numeric_ids)[1] if numeric_ids else None
+            continue
+        # Reject NaN/Inf: ``float('nan')`` slipping through would break
+        # ``max()`` (NaN comparisons make max return whatever appears
+        # first), and ``inf`` would always win even against legitimate
+        # numeric IDs.
+        if math.isfinite(v):
+            numeric_ids.append((v, nid))
+    end = max(numeric_ids, key=lambda item: item[0])[1] if numeric_ids else None
 
     # Fallback for non-conforming inputs: predecessor-less / successor-less.
     if start is None or end is None:

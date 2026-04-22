@@ -53,6 +53,10 @@ class DrivingGraphConfig:
     selection_mode: str = 'outliers'   # 'raw' or 'outliers'
     max_display_chains: int = 15
     min_jaccard_novelty: float = 0.25
+    # Per-node predecessor-ranking truncation for explainability.  Kept
+    # separate from max_display_chains so a client lowering returned chains
+    # doesn't also lose pred-ranking detail used by the UI tooltip.
+    max_pred_rankings_per_node: int = 10
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +444,7 @@ def extract_driving_graph(
                     'lag_hours': r.lag_hours,
                     'delta_hours': r.delta_hours,
                 }
-                for r in rankings[j][:cfg.max_display_chains]
+                for r in rankings[j][:cfg.max_pred_rankings_per_node]
             ]
             for j in {
                 i for chain in (

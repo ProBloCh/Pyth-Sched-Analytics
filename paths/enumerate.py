@@ -397,7 +397,15 @@ def enumerate_longest_paths_first(
     # realised edge weights (no "remaining-to-end" admissible heuristic),
     # heap-top est cannot upper-bound future completions, so we cap by
     # number of expansions without improvement instead.
-    no_improvement_cap = max(max_paths * 2, 2000)
+    #
+    # Budget: a small constant so the extra post-fill work stays bounded
+    # even for large ``max_paths``.  Earlier we used ``max(max_paths * 2,
+    # 2000)``, which meant a default ``max_paths=10000`` paid up to 20k
+    # extra pops per request.  The flat cap keeps worst-case latency
+    # predictable at the cost of occasionally missing a late improvement
+    # on very high-fanout graphs -- an acceptable trade since the JS
+    # reference breaks immediately on first fill anyway.
+    no_improvement_cap = 2000
     expansions_since_improve = 0
 
     while heap and expansions < max_expansions:
