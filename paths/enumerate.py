@@ -411,14 +411,13 @@ def enumerate_longest_paths_first(
                 expansions_since_improve = 0
             continue
 
-        # Expand neighbours in DAG topo order.  Because state is a valid
-        # DAG, none of the successors can be an ancestor -- but we still
-        # guard against re-entry (e.g. aliasing after cycle breaking).
-        path_set = set(path)
+        # Expand neighbours.  solver.dag.build_dag prunes edges so they
+        # always go forward in topo order and drops self-loops (see the
+        # cycle-break block in build_dag), so a successor cannot already
+        # appear in the current path -- no membership check needed in the
+        # hot loop.
         for k, s in enumerate(state.succ[last]):
             nbr = int(s)
-            if nbr in path_set:
-                continue
             new_path = path + (nbr,)
             w = edge_h.get((last, nbr), 0.0)
             new_est = est + w

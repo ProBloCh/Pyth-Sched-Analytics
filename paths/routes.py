@@ -72,11 +72,21 @@ _cache_fns = None  # (get_fn, set_fn) | (None, None)
 
 
 def _cache():
+    """Return ``(get_fn, set_fn)`` only when a backing store is actually
+    configured.  When Redis isn't connected, ``app.get_cached_result``
+    always returns None on lookup and ``set_cached_result`` is a no-op,
+    so calling them just wastes cycles -- and the SHA-256 over a large
+    nodes/links payload is the dominant cost.  Returning ``(None, None)``
+    here lets callers skip the cache key computation entirely.
+    """
     global _cache_fns
     if _cache_fns is None:
         try:
-            from app import get_cached_result, set_cached_result
-            _cache_fns = (get_cached_result, set_cached_result)
+            from app import get_cached_result, set_cached_result, redis_client
+            if redis_client is None:
+                _cache_fns = (None, None)
+            else:
+                _cache_fns = (get_cached_result, set_cached_result)
         except Exception as exc:
             logger.info("Caching not available for /paths: %s", exc)
             _cache_fns = (None, None)
@@ -160,7 +170,9 @@ def _serialise(obj):
     if isinstance(obj, (list, tuple)):
         return [_serialise(v) for v in obj]
     if isinstance(obj, np.ndarray):
-        return obj.tolist()
+        # Recurse over tolist() so NaN/Inf inside the array map to null,
+        # matching completion/routes.py::_serialise behaviour.
+        return [_serialise(v) for v in obj.tolist()]
     if isinstance(obj, np.integer):
         return int(obj)
     if isinstance(obj, np.floating):

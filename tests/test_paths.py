@@ -603,16 +603,25 @@ class TestEndpointValidation:
         })
         assert r.status_code == 200
 
-    def test_enumerate_returns_400_for_unknown_endpoint(self, client, diamond_schedule):
+    def test_enumerate_start_equals_end_returns_200(self, client, diamond_schedule):
+        """When start_id == end_id, the engine reports zero paths but no
+        error; the route should return 200 with an empty result set."""
+        nodes, links = diamond_schedule
+        r = client.post('/paths/enumerate', json={
+            'nodes': nodes, 'links': links,
+            'start_id': 'A', 'end_id': 'A',
+        })
+        assert r.status_code == 200
+
+    def test_enumerate_unknown_endpoint_returns_400(self, client, diamond_schedule):
         """find_all_paths reports start/end-not-in-schedule via an error
         payload; the route must surface that as 4xx, not 200."""
         nodes, links = diamond_schedule
         r = client.post('/paths/enumerate', json={
             'nodes': nodes, 'links': links,
-            'start_id': 'A', 'end_id': 'A',  # valid IDs ...
+            'start_id': 'A', 'end_id': 'NOT_A_NODE',
         })
-        # A->A finds zero paths but no engine error; 200 is correct here.
-        assert r.status_code == 200
+        assert r.status_code == 400
 
     def test_driving_graph_returns_400_when_endpoint_unreachable(self, client):
         """Disconnected start/end -> engine signals 'no active subgraph';
