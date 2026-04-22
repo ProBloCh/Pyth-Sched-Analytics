@@ -438,7 +438,8 @@ class TestEndpointEnumerate:
         assert body['durations'][0] == 42.0
 
     def test_default_endpoints(self, client, diamond_schedule):
-        """If start/end not provided, the service picks them."""
+        """Falls back to predecessor-less / successor-less when '0' and
+        a numeric max are not present."""
         nodes, links = diamond_schedule
         r = client.post('/paths/enumerate', json={
             'nodes': nodes, 'links': links, 'selection': 'raw',
@@ -447,6 +448,27 @@ class TestEndpointEnumerate:
         body = r.get_json()
         assert body['start_id'] == 'A'
         assert body['end_id'] == 'E'
+
+    def test_default_endpoints_app_convention(self, client):
+        """Main-app convention: start='0', end=max numeric ID."""
+        nodes = [
+            {'ID': '0', 'Duration': 0},
+            {'ID': '1', 'Duration': 5},
+            {'ID': '2', 'Duration': 3},
+            {'ID': '99', 'Duration': 0},   # the artificial end
+        ]
+        links = [
+            {'source': '0', 'target': '1'},
+            {'source': '1', 'target': '2'},
+            {'source': '2', 'target': '99'},
+        ]
+        r = client.post('/paths/enumerate', json={
+            'nodes': nodes, 'links': links, 'selection': 'raw',
+        })
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body['start_id'] == '0'
+        assert body['end_id'] == '99'
 
     def test_independence_filter(self, client, parallel_schedule):
         nodes, links = parallel_schedule

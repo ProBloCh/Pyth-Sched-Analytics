@@ -137,6 +137,23 @@ scikit-learn calls) without verifying output equivalence. Subtle changes to
 matrix operations, clustering parameters, or graph traversals can silently
 alter analytical results.
 
+### Project DAG Convention: Start ID '0', End = Max Numeric ID
+
+The main app maintains every project graph as a DAG between an artificially
+created start node (ID `'0'`) and end node (the largest numeric ID).  Treat
+this as the canonical convention across blueprints:
+
+* Default-anchor selection in routes (e.g. `paths/routes.py::_default_start_end`,
+  matching `Reference/PathScripts.js::findPathsToAndFromNode` lines 6720-6721)
+  must prefer `'0'` for start and the max numeric ID for end before falling
+  back to predecessor-less / successor-less heuristics.
+* `'0'` and `0` are valid IDs -- never use truthiness checks (`if not start_id`,
+  `start_id or default`) on user-supplied or inferred IDs; use explicit
+  `is None` / empty-string checks instead.
+* Activities with these IDs are typically zero-duration milestones; validators
+  must accept `Duration` sentinels `('', None, 0, '0')` as `0.0` (matches
+  `solver/dag.py::build_dag`, `completion/`, `evm/`).
+
 ### Architecture: app.py + solver/ package
 
 Descriptive analytics lives in `app.py` (single file). Prescriptive analytics

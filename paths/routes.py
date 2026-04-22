@@ -377,21 +377,45 @@ _DIVERSITY_BOUNDS = {
 def _default_start_end(nodes, links):
     """If caller didn't specify start/end, pick project anchors.
 
-    Start: node with no predecessors (first such).
-    End:   node with no successors (last such in input order).
-    Matches the JS convention used by the frontend dispatch.
+    The main app maintains a DAG between an artificial start (ID '0')
+    and end (the largest numeric ID).  Match that convention exactly --
+    same as JS ``findPathsToAndFromNode`` (Reference/PathScripts.js
+    lines 6720-6721): ``start = node with ID '0'``,
+    ``end = node with max numeric ID``.
+
+    Falls back to the predecessor-less / successor-less heuristic only
+    when neither anchor is present (e.g. user-supplied subgraphs that
+    don't follow the convention).
     """
     ids = [str(n.get('ID', n.get('id', ''))) for n in nodes]
-    has_pred = set()
-    has_succ = set()
-    for ln in links:
-        s = str(ln.get('source', ''))
-        t = str(ln.get('target', ''))
-        has_succ.add(s)
-        has_pred.add(t)
-    start = next((i for i in ids if i not in has_pred), ids[0] if ids else None)
-    end_candidates = [i for i in ids if i not in has_succ]
-    end = end_candidates[-1] if end_candidates else (ids[-1] if ids else None)
+    if not ids:
+        return None, None
+
+    # Primary: app convention (start='0', end=max numeric ID).
+    start = '0' if '0' in ids else None
+    numeric_ids = []
+    for nid in ids:
+        try:
+            numeric_ids.append((float(nid), nid))
+        except (TypeError, ValueError):
+            pass
+    end = max(numeric_ids)[1] if numeric_ids else None
+
+    # Fallback for non-conforming inputs: predecessor-less / successor-less.
+    if start is None or end is None:
+        has_pred = set()
+        has_succ = set()
+        for ln in links:
+            s = str(ln.get('source', ''))
+            t = str(ln.get('target', ''))
+            has_succ.add(s)
+            has_pred.add(t)
+        if start is None:
+            start = next((i for i in ids if i not in has_pred), ids[0])
+        if end is None:
+            end_candidates = [i for i in ids if i not in has_succ]
+            end = end_candidates[-1] if end_candidates else ids[-1]
+
     return start, end
 
 
