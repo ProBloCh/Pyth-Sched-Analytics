@@ -64,53 +64,43 @@ _FF = 'FF'
 _SF = 'SF'
 
 
-def _build_succ_edge_index(state: DAGState):
-    """``[src] -> {tgt: (lag, rel)}`` for O(1) hop lookup.
+def build_succ_edge_index(state: DAGState):
+    """Build a per-node ``{tgt: (lag, rel)}`` lookup for O(1) hop access.
 
-    Built once and reused across path_duration() calls so we avoid an
-    O(out_degree) scan per hop in the per-path duration loop.  Built
-    lazily and stashed on the DAGState via a dunder attribute.
+    Returns a list ``idx`` where ``idx[src][tgt]`` is the edge metadata.
+    Callers that need to compute many path_duration() values for the same
+    DAGState should build this once per request and pass it explicitly --
+    do NOT keep a process-wide cache keyed on ``id(state)``: id() can be
+    reused after GC and would silently return the wrong index.
     """
-    cached = getattr(state, '_succ_edge_index', None)
-    if cached is not None:
-        return cached
     idx: List[Dict[int, Tuple[float, str]]] = [None] * state.n  # type: ignore[list-item]
     for u in range(state.n):
         m: Dict[int, Tuple[float, str]] = {}
         for k, v in enumerate(state.succ[u]):
             m[int(v)] = state.succ_edges[u][k]
         idx[u] = m
-    # DAGState uses __slots__, so we can't attach attributes -- thread the
-    # cache through a function attribute keyed by the state's id() instead.
-    _build_succ_edge_index._cache[id(state)] = idx
     return idx
 
 
-_build_succ_edge_index._cache = {}  # type: ignore[attr-defined]
-
-
-def _succ_edge_lookup(state: DAGState, src: int, tgt: int):
-    """Return (lag, rel) for the src->tgt edge, or None.  O(1) via cache."""
-    cached = _build_succ_edge_index._cache.get(id(state))
-    if cached is None:
-        cached = _build_succ_edge_index(state)
-    return cached[src].get(tgt)
-
-
-def path_duration(state: DAGState, path: Sequence[int]) -> float:
+def path_duration(state: DAGState, path: Sequence[int],
+                  edge_index=None) -> float:
     """
     Duration of a single path using exact FS/SS/FF/SF + lag arithmetic.
 
     Mirrors JS ``calculatePathDuration`` line-for-line but operates on
-    node indices and NumPy duration array.  Uses an O(1) per-hop edge
-    lookup via the lazily-built ``_build_succ_edge_index`` cache.
+    node indices and NumPy duration array.
+
+    ``edge_index``: optional per-node ``{tgt: (lag, rel)}`` lookup built
+    via :func:`build_succ_edge_index`.  When provided, the per-hop edge
+    lookup is O(1).  When ``None`` (e.g. from a one-off caller), the
+    function falls back to a linear scan of ``state.succ[src]`` -- still
+    correct, just slower for high out-degree graphs.
     """
     L = len(path)
     if L <= 1:
         return 0.0
 
     d = state.durations
-    edge_idx = _build_succ_edge_index(state)
     start_times = {path[0]: 0.0}
     finish_times = {path[0]: float(d[path[0]])}
 
@@ -121,7 +111,16 @@ def path_duration(state: DAGState, path: Sequence[int]) -> float:
         cf = finish_times[cur]
         dur_n = float(d[nxt])
 
-        edge = edge_idx[cur].get(nxt)
+        if edge_index is not None:
+            edge = edge_index[cur].get(nxt)
+        else:
+            # One-off caller: linear scan over successors.
+            edge = None
+            succs = state.succ[cur]
+            for k, s in enumerate(succs):
+                if s == nxt:
+                    edge = state.succ_edges[cur][k]
+                    break
         if edge is None:
             # No direct edge -- JS falls back to FS with zero lag.  Happens
             # when a caller asks the duration of an arbitrary node path
@@ -512,7 +511,8 @@ def find_all_paths(
     path_ids: List[List[str]] = [[idx_to_id[i] for i in p] for p in raw]
 
     if include_durations:
-        durations = [path_duration(state, p) for p in raw]
+        edge_index = build_succ_edge_index(state) if raw else None
+        durations = [path_duration(state, p, edge_index) for p in raw]
     else:
         durations = []
 

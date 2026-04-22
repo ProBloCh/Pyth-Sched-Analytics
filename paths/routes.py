@@ -705,6 +705,15 @@ def calendar_slack():
     nodes = data['nodes']
     links = data.get('links', [])
     project_start = data.get('project_start')
+    if project_start is not None:
+        if not isinstance(project_start, str):
+            return jsonify({
+                'error': 'project_start must be a string ISO timestamp'}), 400
+        # Lazy import to keep the route module light at top level.
+        from completion.monte_carlo import _parse_iso_to_ms
+        if _parse_iso_to_ms(project_start) is None:
+            return jsonify({
+                'error': 'project_start must be a valid ISO timestamp'}), 400
     calendar_cfg, err_ = _coerce_dict_overrides(data.get('calendar'),
                                                 'calendar')
     if err_:

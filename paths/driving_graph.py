@@ -32,7 +32,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 import numpy as np
 
 from solver.dag import build_dag, DAGState
-from .enumerate import path_duration
+from .enumerate import path_duration, build_succ_edge_index
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +409,8 @@ def extract_driving_graph(
         by_sig.setdefault(p, p)
 
     candidates = list(by_sig.values())
-    cand_durations = [path_duration(state, p) for p in candidates]
+    edge_index = build_succ_edge_index(state) if candidates else None
+    cand_durations = [path_duration(state, p, edge_index) for p in candidates]
 
     if cfg.selection_mode == 'raw':
         sel_paths, sel_dur = list(candidates), list(cand_durations)

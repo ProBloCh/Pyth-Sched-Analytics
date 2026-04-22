@@ -632,6 +632,22 @@ class TestEndpointValidation:
         })
         assert r.status_code == 400
 
+    def test_calendar_slack_project_start_must_parse(self, client, diamond_schedule):
+        nodes, links = diamond_schedule
+        r = client.post('/paths/calendar-slack', json={
+            'nodes': nodes, 'links': links,
+            'project_start': 'not-a-date',
+        })
+        assert r.status_code == 400
+
+    def test_calendar_slack_project_start_must_be_string(self, client, diamond_schedule):
+        nodes, links = diamond_schedule
+        r = client.post('/paths/calendar-slack', json={
+            'nodes': nodes, 'links': links,
+            'project_start': 123,
+        })
+        assert r.status_code == 400
+
     def test_driving_graph_selection_mode_allowlist(self, client, diamond_schedule):
         """selection_mode must be one of {raw, outliers}."""
         nodes, links = diamond_schedule
