@@ -137,6 +137,75 @@ scikit-learn calls) without verifying output equivalence. Subtle changes to
 matrix operations, clustering parameters, or graph traversals can silently
 alter analytical results.
 
+### JS Reference, Python Service, Frontend Fallback
+
+Several backend services in this repo are direct ports of frontend
+algorithms from `Reference/*.js` (EVM.js, Completionprediction.js,
+PathScripts.js, etc.).  The same pattern recurs and should be followed
+for any new port:
+
+1. **JS is the source of truth** for the algorithm.  When porting,
+   match its semantics function-for-function -- including known
+   bugfixes documented in the JS comments.  When in doubt about
+   intended behaviour, the JS implementation wins.
+
+2. **Python service replicates the algorithm** behind a Flask
+   blueprint endpoint (one of `/solver/*`, `/completion/*`, `/evm/*`,
+   `/paths/*`).  The response shape must match what the frontend
+   consumer (`window.evmMetrics`, `findAllPaths` callers, etc.)
+   expects, so the JS callers don't need to change.
+
+3. **JS-vs-Py diff harness in `tests/diff_harness/`** verifies parity
+   on shared JSON fixtures.  Pattern:
+   * `tests/diff_harness/run_js_<area>.js` -- a Node CLI that loads
+     `Reference/*.js` in a stubbed browser sandbox, runs the JS
+     functions on the fixture, emits JSON.
+   * `tests/diff_harness/<area>_fixture_*.json` -- shared fixtures
+     covering the analytical edge cases (linear, diamond, parallel
+     branches, mixed FS/SS/FF/SF + lag, etc.).
+   * `tests/test_<area>_diff.py` -- pytest module that spawns the
+     Node harness via subprocess, runs the Python implementation on
+     the same fixtures, asserts numerical equivalence within
+     `1e-6` relative tolerance.  Skips automatically when Node isn't
+     installed (`shutil.which('node')`).
+
+   Existing examples: `tests/test_evm_diff.py` (EVM scalars, working
+   calendar, distributions), `tests/test_recovery_diff.py`,
+   `tests/test_paths_diff.py` (path enumeration, CPM, distances,
+   driving graph).
+
+4. **Divergence policy.**  When the harness reports a JS-vs-Py
+   mismatch, treat it as **investigate which side is right before
+   adjusting**.  The Python port is sometimes more correct than the
+   JS reference (e.g., JS `findDistancesToStart` only seeds
+   `startNode` at 0 while Python seeds every predecessor-less node).
+   Document expected divergences inline in the test with the JS
+   line number and a short justification, then guard the assertion
+   accordingly -- don't silently relax the Python behaviour to match
+   a JS bug.
+
+5. **JS retained as a fallback.**  We do not delete the JS once a
+   Python service exists.  The frontend calling pattern is:
+
+       try {
+           result = await callPythonService(...);   // /paths/enumerate, etc.
+       } catch (err) {
+           console.warn('Backend unavailable, falling back to JS', err);
+           result = findAllPaths(...);              // JS reference
+       }
+
+   This keeps the app functional during deploys, Azure outages, or
+   when the service hits validation/timeout limits.  For this to
+   work the JS and Py outputs must remain shape-compatible, which
+   the diff harness enforces.
+
+6. **Updated JS files are copied back to the frontend.**  When a port
+   surfaces a JS bug (or a frontend caller needs a tweak to match the
+   new Python service), the corrected JS goes both into
+   `Reference/*.js` (so the diff harness exercises it) and into the
+   main app's vendored copy.  Both paths must stay in sync; the diff
+   harness will catch drift on the next CI run.
+
 ### Project DAG Convention: Start ID '0', End = Max Numeric ID
 
 The main app maintains every project graph as a DAG between an artificially
