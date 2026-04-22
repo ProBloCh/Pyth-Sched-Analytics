@@ -20,8 +20,8 @@ Runs in O(N + E) on the existing DAGState -- no graph rebuild.
 
 import numpy as np
 
-# Kept in sync with solver/dag.py.  Interned strings let us compare
-# with `is` in the hot loop (micro-win vs. tuple unpack equality).
+# Kept in sync with solver/dag.py.  Compared with `==` in the hot loop;
+# do not switch to `is` -- callers may pass non-interned literals.
 _FS = 'FS'
 _SS = 'SS'
 _FF = 'FF'
@@ -104,21 +104,6 @@ def distances_to_start(state):
     # should coerce, matching the JS convention (node.shortestDistanceToStart
     # = finite ? v : 0).
     return {'shortest': shortest, 'longest': longest}
-
-
-def _edge_weights_backward(p_idx, s_idx, lag, rel, d):
-    """Backward edge weight: how much d(p) grows over d(s) looking back.
-
-    JS semantics (findDistancesToEnd):
-        FS:  d(p) = d(s) + dur(p) + lag
-        SS:  d(p) = max(dur(p), lag + d(s))
-        FF:  d(p) = max(dur(p), max(0, dur(p) + lag - dur(s)) + d(s))
-        SF:  d(p) = max(dur(p), max(0, lag - dur(s)) + d(s))
-    """
-    dp = d[p_idx]
-    ds = d[s_idx]
-    # ``p_idx`` here is the *predecessor* (node we're updating); ``s_idx``
-    # the *successor*.  JS builds this map from the successor backward.
 
 
 def distances_to_end(state):

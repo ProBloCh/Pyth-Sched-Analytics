@@ -139,8 +139,10 @@ def _parse_request():
     if request.content_length and request.content_length > MAX_PAYLOAD_BYTES:
         return None, (jsonify({'error': 'Payload too large (limit: 10 MB)'}), 413)
     data = request.get_json(force=True, silent=True)
-    if not data:
+    if data is None:
         return None, (jsonify({'error': 'Invalid or missing JSON body'}), 400)
+    if not isinstance(data, dict):
+        return None, (jsonify({'error': 'Request body must be a JSON object'}), 400)
     err = _validate_nodes_links(data)
     if err:
         return None, (jsonify({'error': err}), 400)
@@ -167,6 +169,65 @@ def _serialise(obj):
         if math.isinf(obj) or math.isnan(obj):
             return None
     return obj
+
+
+def _coerce_int(value, default, field, min_val=None, max_val=None):
+    """Return ``(int, None)`` or ``(None, jsonify-err)``.  Keeps bad client
+    input from turning into a 500."""
+    if value is None:
+        v = default
+    else:
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            return None, (jsonify({'error': f'{field} must be an integer'}), 400)
+    if min_val is not None and v < min_val:
+        return None, (jsonify({'error': f'{field} must be >= {min_val}'}), 400)
+    if max_val is not None and v > max_val:
+        return None, (jsonify({'error': f'{field} must be <= {max_val}'}), 400)
+    return v, None
+
+
+def _coerce_float(value, default, field, min_val=None, max_val=None):
+    if value is None:
+        v = default
+    else:
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return None, (jsonify({'error': f'{field} must be a number'}), 400)
+    if math.isnan(v) or math.isinf(v):
+        return None, (jsonify({'error': f'{field} must be finite'}), 400)
+    if min_val is not None and v < min_val:
+        return None, (jsonify({'error': f'{field} must be >= {min_val}'}), 400)
+    if max_val is not None and v > max_val:
+        return None, (jsonify({'error': f'{field} must be <= {max_val}'}), 400)
+    return v, None
+
+
+def _coerce_bool(value, default, field):
+    if value is None:
+        return default, None
+    if isinstance(value, bool):
+        return value, None
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value), None
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ('true', '1', 'yes', 'on'):
+            return True, None
+        if s in ('false', '0', 'no', 'off'):
+            return False, None
+    return None, (jsonify({'error': f'{field} must be a boolean'}), 400)
+
+
+def _coerce_dict_overrides(value, field):
+    """Accept None or a JSON object; reject anything else with 400."""
+    if value is None:
+        return {}, None
+    if isinstance(value, dict):
+        return value, None
+    return None, (jsonify({'error': f'{field} must be an object'}), 400)
 
 
 def _default_start_end(nodes, links):
@@ -225,10 +286,20 @@ def enumerate_paths():
         start_id = start_id or d_start
         end_id = end_id or d_end
 
-    max_paths = int(data.get('max_paths', MAX_PATHS_TO_RETURN))
-    max_paths = max(1, min(max_paths, MAX_PATHS_TO_RETURN))
+    max_paths, err_ = _coerce_int(data.get('max_paths'), MAX_PATHS_TO_RETURN,
+                                  'max_paths', min_val=1,
+                                  max_val=MAX_PATHS_TO_RETURN)
+    if err_:
+        return err_
     selection = str(data.get('selection', 'independent')).lower()
-    branch_balanced = bool(data.get('branch_balanced', True))
+    branch_balanced, err_ = _coerce_bool(data.get('branch_balanced'), True,
+                                         'branch_balanced')
+    if err_:
+        return err_
+    diversity_overrides, err_ = _coerce_dict_overrides(data.get('diversity'),
+                                                      'diversity')
+    if err_:
+        return err_
 
     get_fn, set_fn = _cache()
     cache_payload = {
@@ -236,12 +307,12 @@ def enumerate_paths():
         'start_id': start_id, 'end_id': end_id,
         'max_paths': max_paths, 'selection': selection,
         'branch_balanced': branch_balanced,
-        'diversity': data.get('diversity'),
+        'diversity': diversity_overrides or None,
     }
     key = _cache_key('enumerate', cache_payload)
     if get_fn:
         cached = get_fn(key)
-        if cached:
+        if cached is not None:
             cached['cache_hit'] = True
             return jsonify(cached)
 
@@ -274,7 +345,7 @@ def enumerate_paths():
             result['durations'] = raw_dur
             result['selection'] = 'raw'
         else:
-            cfg_overrides = data.get('diversity') or {}
+            cfg_overrides = diversity_overrides
             cfg = DiversityConfig(**{
                 k: v for k, v in cfg_overrides.items()
                 if k in DiversityConfig.__dataclass_fields__
@@ -338,7 +409,9 @@ def driving_graph():
         start_id = start_id or d_start
         end_id = end_id or d_end
 
-    cfg_overrides = data.get('config') or {}
+    cfg_overrides, err_ = _coerce_dict_overrides(data.get('config'), 'config')
+    if err_:
+        return err_
     cfg = DrivingGraphConfig(**{
         k: v for k, v in cfg_overrides.items()
         if k in DrivingGraphConfig.__dataclass_fields__
@@ -348,11 +421,11 @@ def driving_graph():
     key = _cache_key('driving-graph', {
         'nodes': nodes, 'links': links,
         'start_id': start_id, 'end_id': end_id,
-        'config': cfg_overrides,
+        'config': cfg_overrides or None,
     })
     if get_fn:
         cached = get_fn(key)
-        if cached:
+        if cached is not None:
             cached['cache_hit'] = True
             return jsonify(cached)
 
@@ -399,7 +472,11 @@ def distances():
 
     nodes = data['nodes']
     links = data.get('links', [])
-    near_tol = float(data.get('near_critical_tol_hours', 24.0))
+    near_tol, err_ = _coerce_float(data.get('near_critical_tol_hours'),
+                                   24.0, 'near_critical_tol_hours',
+                                   min_val=0.0, max_val=1_000_000.0)
+    if err_:
+        return err_
 
     get_fn, set_fn = _cache()
     key = _cache_key('distances', {
@@ -407,7 +484,7 @@ def distances():
     })
     if get_fn:
         cached = get_fn(key)
-        if cached:
+        if cached is not None:
             cached['cache_hit'] = True
             return jsonify(cached)
 
@@ -477,16 +554,19 @@ def calendar_slack():
     nodes = data['nodes']
     links = data.get('links', [])
     project_start = data.get('project_start')
-    calendar_cfg = data.get('calendar') or {}
+    calendar_cfg, err_ = _coerce_dict_overrides(data.get('calendar'),
+                                                'calendar')
+    if err_:
+        return err_
 
     get_fn, set_fn = _cache()
     key = _cache_key('calendar-slack', {
         'nodes': nodes, 'links': links,
-        'project_start': project_start, 'calendar': calendar_cfg,
+        'project_start': project_start, 'calendar': calendar_cfg or None,
     })
     if get_fn:
         cached = get_fn(key)
-        if cached:
+        if cached is not None:
             cached['cache_hit'] = True
             return jsonify(cached)
 

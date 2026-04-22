@@ -186,8 +186,10 @@ def enumerate_chains_backwards(
 ) -> List[Tuple[int, ...]]:
     """Walk back from ``end_idx`` following driving predecessors.
 
-    Uses an iterative DFS that tries the most-driving predecessor
-    first (smallest delta) and bails once ``max_chains`` is reached.
+    Iterative DFS that tries the most-driving predecessor first (smallest
+    delta) and bails once ``max_chains`` is reached.  Iterative because
+    ``cfg.max_depth_guard`` defaults to 20,000 -- well past Python's
+    recursion limit.
     """
     out: List[Tuple[int, ...]] = []
     if start_idx < 0 or end_idx < 0:
@@ -195,42 +197,58 @@ def enumerate_chains_backwards(
 
     path: List[int] = [end_idx]
     path_set: Set[int] = {end_idx}
-    expansions = [0]
+    expansions = 0
 
-    def dfs(current: int) -> bool:
-        if len(out) >= max_chains:
-            return True
-        expansions[0] += 1
-        if expansions[0] > cfg.max_expansions:
-            return True
-        if len(path) > cfg.max_depth_guard:
-            return False
+    # Frame: [node, ordered_preds_or_None, next_child_idx]
+    stack: List[List] = [[end_idx, None, 0]]
 
-        if current == start_idx:
-            out.append(tuple(reversed(path)))
-            return False
+    while stack and len(out) < max_chains:
+        if expansions > cfg.max_expansions:
+            break
 
-        preds = pred_sets.get(current, [])
-        if not preds:
-            return False
+        node, ordered, child_idx = stack[-1]
 
-        ordered = sorted(preds, key=lambda r: r.delta_hours)
-        for p in ordered:
-            pid = p.pred_idx
-            if pid in path_set:
+        if ordered is None:
+            expansions += 1
+            if len(path) > cfg.max_depth_guard:
+                stack.pop()
+                if stack:
+                    path.pop()
+                    path_set.discard(node)
                 continue
-            path.append(pid)
-            path_set.add(pid)
-            stop = dfs(pid)
-            path.pop()
-            path_set.discard(pid)
-            if stop:
-                return True
-            if len(out) >= max_chains:
-                return True
-        return False
+            if node == start_idx:
+                out.append(tuple(reversed(path)))
+                stack.pop()
+                if stack:
+                    path.pop()
+                    path_set.discard(node)
+                continue
+            preds = pred_sets.get(node, [])
+            ordered = sorted(preds, key=lambda r: r.delta_hours)
+            stack[-1][1] = ordered
+            if not ordered:
+                stack.pop()
+                if stack:
+                    path.pop()
+                    path_set.discard(node)
+                continue
 
-    dfs(end_idx)
+        if child_idx >= len(ordered):
+            stack.pop()
+            if stack:
+                path.pop()
+                path_set.discard(node)
+            continue
+
+        p = ordered[child_idx]
+        stack[-1][2] = child_idx + 1
+        pid = p.pred_idx
+        if pid in path_set:
+            continue
+        path.append(pid)
+        path_set.add(pid)
+        stack.append([pid, None, 0])
+
     return out
 
 

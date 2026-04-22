@@ -475,6 +475,60 @@ class TestEndpointEnumerate:
         })
         assert r.status_code == 400
 
+    def test_root_must_be_object(self, client):
+        r = client.post('/paths/enumerate', json=[1, 2, 3])
+        assert r.status_code == 400
+
+    def test_max_paths_non_integer_returns_400(self, client, diamond_schedule):
+        nodes, links = diamond_schedule
+        r = client.post('/paths/enumerate', json={
+            'nodes': nodes, 'links': links,
+            'max_paths': 'abc',
+        })
+        assert r.status_code == 400
+
+    def test_diversity_must_be_object(self, client, diamond_schedule):
+        nodes, links = diamond_schedule
+        r = client.post('/paths/enumerate', json={
+            'nodes': nodes, 'links': links,
+            'diversity': [1, 2, 3],
+        })
+        assert r.status_code == 400
+
+
+class TestEndpointValidation:
+    """Type-guard regression tests for the four POST endpoints."""
+
+    def test_driving_graph_config_must_be_object(self, client, diamond_schedule):
+        nodes, links = diamond_schedule
+        r = client.post('/paths/driving-graph', json={
+            'nodes': nodes, 'links': links, 'config': 'oops',
+        })
+        assert r.status_code == 400
+
+    def test_calendar_must_be_object(self, client, diamond_schedule):
+        nodes, links = diamond_schedule
+        r = client.post('/paths/calendar-slack', json={
+            'nodes': nodes, 'links': links, 'calendar': [1, 2],
+        })
+        assert r.status_code == 400
+
+    def test_distances_near_tol_non_numeric(self, client, diamond_schedule):
+        nodes, links = diamond_schedule
+        r = client.post('/paths/distances', json={
+            'nodes': nodes, 'links': links,
+            'near_critical_tol_hours': 'foo',
+        })
+        assert r.status_code == 400
+
+    def test_distances_near_tol_negative(self, client, diamond_schedule):
+        nodes, links = diamond_schedule
+        r = client.post('/paths/distances', json={
+            'nodes': nodes, 'links': links,
+            'near_critical_tol_hours': -5,
+        })
+        assert r.status_code == 400
+
 
 class TestEndpointDrivingGraph:
 

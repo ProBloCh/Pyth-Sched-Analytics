@@ -359,9 +359,22 @@ def enumerate_longest_paths_first(
         )
 
     branch_counts: Dict[int, int] = {}
+
+    def _branch_inc(p: Tuple[int, ...]):
+        if len(p) >= 2:
+            branch_counts[p[1]] = branch_counts.get(p[1], 0) + 1
+
+    def _branch_dec(p: Tuple[int, ...]):
+        if len(p) >= 2:
+            br = p[1]
+            cur = branch_counts.get(br, 0)
+            if cur <= 1:
+                branch_counts.pop(br, None)
+            else:
+                branch_counts[br] = cur - 1
+
     push(start_path, 0.0, start_crit)
-    if len(start_path) >= 2:
-        branch_counts[start_path[1]] = branch_counts.get(start_path[1], 0) + 1
+    _branch_inc(start_path)
 
     tracker = _PathTracker(max_paths)
     state_cache: Dict[Tuple[int, ...], float] = {}
@@ -369,6 +382,9 @@ def enumerate_longest_paths_first(
 
     while heap and expansions < max_expansions:
         _pe, _pc, _pl, _ct, path, est, crit = heapq.heappop(heap)
+        # Track in-heap branch counts (JS BranchBalancedQueue parity:
+        # decrement on pop so penalties reflect live items, not lifetime).
+        _branch_dec(path)
         expansions += 1
 
         # Skip memoised if we've seen this exact path with >= est.
@@ -379,8 +395,9 @@ def enumerate_longest_paths_first(
 
         last = path[-1]
         if last == end_idx:
-            dur = path_duration(state, path)
-            tracker.add(path, dur)
+            # Track by heuristic estimate (JS PathTracker keys on est;
+            # exact durations are computed by find_all_paths for final sort).
+            tracker.add(path, est)
             if tracker.is_full():
                 break
             continue
@@ -398,16 +415,17 @@ def enumerate_longest_paths_first(
             new_est = est + w
             new_crit = crit + (1 if bool(critical_mask[nbr]) else 0)
             push(new_path, new_est, new_crit)
-            if len(new_path) >= 2:
-                br = new_path[1]
-                branch_counts[br] = branch_counts.get(br, 0) + 1
+            _branch_inc(new_path)
 
-        # Trim: heap blow-up guard (JS line 3472).
+        # Trim: heap blow-up guard (JS line 3472).  Re-derive branch_counts
+        # from survivors so penalties don't count dropped states.
         if len(heap) > max_paths * 4:
-            # heapq has no efficient trim; rebuild from the best fraction.
             heap.sort()
             del heap[max_paths * 2:]
             heapq.heapify(heap)
+            branch_counts.clear()
+            for entry in heap:
+                _branch_inc(entry[4])
 
     # Sort results by duration desc; tie-break by path length.
     items = tracker.items()

@@ -28,6 +28,7 @@ from completion.calendar import (
     WorkingCalendar, advance_working_ms, estimate_horizon_days,
 )
 from completion.monte_carlo import _parse_iso_to_ms, _ms_to_iso
+from evm.helpers import convert_to_hours
 
 
 # Sensible defaults when caller doesn't supply project_start / horizon.
@@ -36,55 +37,42 @@ _DEFAULT_WORKING_DAYS = frozenset({1, 2, 3, 4, 5})  # ISO Mon-Fri
 _DEFAULT_HORIZON_MIN_DAYS = 365
 
 
-def _normalise_durations_to_hours(nodes, hours_per_day):
+def _normalise_durations_to_hours(nodes, hours_per_day, working_days_per_week):
     """Rewrite each node's Duration in working hours (as solver/dag.py expects).
 
-    JS ``getNodeDurationHours`` treats the input as hours by default
-    and applies unit conversion when ``TimeUnits`` is 'days' / 'weeks'
-    etc.  We mirror that narrow subset; anything else passes through
-    as-is (i.e. raw hours) since that matches the solver convention.
+    Delegates to ``evm.helpers.convert_to_hours`` so the unit map (minutes,
+    seconds, weeks, months, years, plus prefix fallbacks) and the
+    JS-compatible ``m`` ambiguity (minutes vs months) stay in one place.
     """
     out = []
     for n in nodes:
         m = dict(n)
-        try:
-            d = float(m.get('Duration', m.get('duration', 0)))
-        except (TypeError, ValueError):
-            d = 0.0
-        units = str(m.get('TimeUnits', m.get('timeUnits', 'Hours'))).lower()
-        if units in ('d', 'day', 'days'):
-            d = d * hours_per_day
-        elif units in ('w', 'wk', 'week', 'weeks'):
-            d = d * hours_per_day * 5.0  # JS CONFIG.WORKING_DAYS_PER_WEEK
-        elif units in ('mo', 'mon', 'month', 'months'):
-            d = d * hours_per_day * 5.0 * 4.345
-        elif units in ('y', 'yr', 'year', 'years'):
-            d = d * hours_per_day * 5.0 * 52.14
-        # 'h'/'hour'/'hours'/default: already hours
-        m['Duration'] = d
+        units = m.get('TimeUnits', m.get('timeUnits', 'Hours'))
+        m['Duration'] = convert_to_hours(
+            m.get('Duration', m.get('duration', 0)), units,
+            hours_per_day=hours_per_day,
+            working_days_per_week=working_days_per_week,
+        )
         m['TimeUnits'] = 'Hours'
         out.append(m)
     return out
 
 
-def _normalise_link_lags_to_hours(links, hours_per_day):
-    """JS converts lag units the same way as node durations."""
+def _normalise_link_lags_to_hours(links, hours_per_day, working_days_per_week):
+    """Lag conversion via the same ``convert_to_hours`` helper as node
+    durations, so any future unit additions stay consistent."""
     out = []
     for link in links:
         m = dict(link)
-        try:
-            lag = float(m.get('lag', 0))
-        except (TypeError, ValueError):
-            lag = 0.0
-        units = str(
-            m.get('lagUnits',
-                  m.get('timeUnits', m.get('TimeUnits', 'Hours')))
-        ).lower()
-        if units in ('d', 'day', 'days'):
-            lag = lag * hours_per_day
-        elif units in ('w', 'wk', 'week', 'weeks'):
-            lag = lag * hours_per_day * 5.0
-        m['lag'] = lag
+        units = (m.get('lagUnits')
+                 or m.get('timeUnits')
+                 or m.get('TimeUnits')
+                 or 'Hours')
+        m['lag'] = convert_to_hours(
+            m.get('lag', 0), units,
+            hours_per_day=hours_per_day,
+            working_days_per_week=working_days_per_week,
+        )
         out.append(m)
     return out
 
@@ -123,9 +111,14 @@ def compute_calendar_slack(nodes, links, project_start=None,
     working_days = cfg.get('working_days') or list(_DEFAULT_WORKING_DAYS)
     holidays = cfg.get('holidays') or []
 
+    # Use the configured working-week length so weeks/months/years
+    # convert consistently with the calendar (e.g. 6-day weeks won't get
+    # silently scaled by the 5-day default in convert_to_hours).
+    wdpw = float(len(working_days)) if working_days else 5.0
+
     # ---- CPM in working hours ------------------------------------------------
-    nodes_h = _normalise_durations_to_hours(nodes, hpd)
-    links_h = _normalise_link_lags_to_hours(links, hpd)
+    nodes_h = _normalise_durations_to_hours(nodes, hpd, wdpw)
+    links_h = _normalise_link_lags_to_hours(links, hpd, wdpw)
     state, id_to_idx = build_dag(nodes_h, links_h, default_duration=0.0)
 
     n = state.n
