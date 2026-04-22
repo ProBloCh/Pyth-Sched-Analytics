@@ -117,10 +117,15 @@ def _validate_nodes_links(data):
             return f'duplicate node ID: {nid}'
         seen.add(sid)
         dur = n.get('Duration', n.get('duration', 0))
-        try:
-            df = float(dur)
-        except (TypeError, ValueError):
-            return f'nodes[{i}] Duration not numeric'
+        # Milestone sentinels mean "no work" and are accepted across the
+        # repo (solver.dag, completion/, evm/).  Treat them as 0.
+        if dur in ('', None):
+            df = 0.0
+        else:
+            try:
+                df = float(dur)
+            except (TypeError, ValueError):
+                return f'nodes[{i}] Duration not numeric'
         if math.isnan(df) or math.isinf(df) or df < 0:
             return f'nodes[{i}] Duration must be finite and non-negative'
     for i, ln in enumerate(links):
@@ -230,6 +235,72 @@ def _coerce_dict_overrides(value, field):
     return None, (jsonify({'error': f'{field} must be an object'}), 400)
 
 
+def _resolve_start_end(start_id, end_id, nodes, links):
+    """Default start/end IDs only when the caller omitted them.
+
+    ``id == 0`` / ``"0"`` are valid in real schedules (P6/MSP imports), so
+    we cannot use truthiness here -- only ``None`` and ``""`` count as
+    "missing" and trigger the inferred-anchor fallback.
+    """
+    def _missing(v):
+        return v is None or v == '' or v == b''
+    if _missing(start_id) or _missing(end_id):
+        d_start, d_end = _default_start_end(nodes, links)
+        if _missing(start_id):
+            start_id = d_start
+        if _missing(end_id):
+            end_id = d_end
+    return start_id, end_id
+
+
+def _coerce_dataclass_overrides(raw, dc_type, field):
+    """Validate per-field types for dataclass override dicts.
+
+    Iterates the dataclass annotations; coerces ints/floats/bools/strings
+    into the expected primitive type and rejects malformed values with
+    a 400.  Unknown keys are silently dropped (matches the existing
+    behaviour but stays type-safe).
+    """
+    overrides, err = _coerce_dict_overrides(raw, field)
+    if err:
+        return None, err
+    out = {}
+    fields = dc_type.__dataclass_fields__
+    for k, v in overrides.items():
+        if k not in fields:
+            continue
+        ann = fields[k].type
+        # Annotation may be a class or a string (PEP 563 future-annotations).
+        ann_name = ann.__name__ if hasattr(ann, '__name__') else str(ann)
+        if ann_name == 'bool' or ann is bool:
+            cv, e = _coerce_bool(v, None, f'{field}.{k}')
+            if e:
+                return None, e
+            if cv is None:
+                continue
+            out[k] = cv
+        elif ann_name == 'int' or ann is int:
+            cv, e = _coerce_int(v, None, f'{field}.{k}')
+            if e:
+                return None, e
+            out[k] = cv
+        elif ann_name == 'float' or ann is float:
+            cv, e = _coerce_float(v, None, f'{field}.{k}')
+            if e:
+                return None, e
+            out[k] = cv
+        elif ann_name == 'str' or ann is str:
+            if not isinstance(v, str):
+                return None, (jsonify({
+                    'error': f'{field}.{k} must be a string'}), 400)
+            out[k] = v
+        else:
+            # Unrecognised annotation: pass through (DiversityConfig and
+            # DrivingGraphConfig only use primitives today).
+            out[k] = v
+    return out, None
+
+
 def _default_start_end(nodes, links):
     """If caller didn't specify start/end, pick project anchors.
 
@@ -279,12 +350,9 @@ def enumerate_paths():
 
     nodes = data['nodes']
     links = data.get('links', [])
-    start_id = data.get('start_id')
-    end_id = data.get('end_id')
-    if not start_id or not end_id:
-        d_start, d_end = _default_start_end(nodes, links)
-        start_id = start_id or d_start
-        end_id = end_id or d_end
+    start_id, end_id = _resolve_start_end(
+        data.get('start_id'), data.get('end_id'), nodes, links,
+    )
 
     max_paths, err_ = _coerce_int(data.get('max_paths'), MAX_PATHS_TO_RETURN,
                                   'max_paths', min_val=1,
@@ -292,12 +360,17 @@ def enumerate_paths():
     if err_:
         return err_
     selection = str(data.get('selection', 'independent')).lower()
+    if selection not in ('raw', 'diverse', 'independent'):
+        return jsonify({'error': (
+            "selection must be one of 'raw', 'diverse', 'independent'"
+        )}), 400
     branch_balanced, err_ = _coerce_bool(data.get('branch_balanced'), True,
                                          'branch_balanced')
     if err_:
         return err_
-    diversity_overrides, err_ = _coerce_dict_overrides(data.get('diversity'),
-                                                      'diversity')
+    diversity_overrides, err_ = _coerce_dataclass_overrides(
+        data.get('diversity'), DiversityConfig, 'diversity',
+    )
     if err_:
         return err_
 
@@ -345,11 +418,7 @@ def enumerate_paths():
             result['durations'] = raw_dur
             result['selection'] = 'raw'
         else:
-            cfg_overrides = diversity_overrides
-            cfg = DiversityConfig(**{
-                k: v for k, v in cfg_overrides.items()
-                if k in DiversityConfig.__dataclass_fields__
-            })
+            cfg = DiversityConfig(**diversity_overrides)
             cfg = auto_tune_config(
                 cfg, raw_paths,
                 node_count=len(nodes), link_count=len(links),
@@ -402,20 +471,16 @@ def driving_graph():
 
     nodes = data['nodes']
     links = data.get('links', [])
-    start_id = data.get('start_id')
-    end_id = data.get('end_id')
-    if not start_id or not end_id:
-        d_start, d_end = _default_start_end(nodes, links)
-        start_id = start_id or d_start
-        end_id = end_id or d_end
+    start_id, end_id = _resolve_start_end(
+        data.get('start_id'), data.get('end_id'), nodes, links,
+    )
 
-    cfg_overrides, err_ = _coerce_dict_overrides(data.get('config'), 'config')
+    cfg_overrides, err_ = _coerce_dataclass_overrides(
+        data.get('config'), DrivingGraphConfig, 'config',
+    )
     if err_:
         return err_
-    cfg = DrivingGraphConfig(**{
-        k: v for k, v in cfg_overrides.items()
-        if k in DrivingGraphConfig.__dataclass_fields__
-    })
+    cfg = DrivingGraphConfig(**cfg_overrides)
 
     get_fn, set_fn = _cache()
     key = _cache_key('driving-graph', {

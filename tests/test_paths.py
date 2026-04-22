@@ -529,6 +529,69 @@ class TestEndpointValidation:
         })
         assert r.status_code == 400
 
+    def test_milestone_duration_accepted(self, client):
+        """ID '0' / Duration '' / 0 must be accepted (matches solver.dag)."""
+        r = client.post('/paths/distances', json={
+            'nodes': [
+                {'ID': '0', 'Duration': ''},
+                {'ID': '1', 'Duration': 5},
+                {'ID': '2', 'Duration': None},
+            ],
+            'links': [
+                {'source': '0', 'target': '1'},
+                {'source': '1', 'target': '2'},
+            ],
+        })
+        assert r.status_code == 200
+
+    def test_zero_id_is_not_clobbered(self, client):
+        """start_id='0' must NOT be replaced by the inferred anchor."""
+        r = client.post('/paths/enumerate', json={
+            'nodes': [
+                {'ID': '0', 'Duration': 1},
+                {'ID': '1', 'Duration': 2},
+            ],
+            'links': [{'source': '0', 'target': '1'}],
+            'start_id': '0', 'end_id': '1',
+            'selection': 'raw',
+        })
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body['start_id'] == '0'
+
+    def test_unknown_selection_rejected(self, client, diamond_schedule):
+        nodes, links = diamond_schedule
+        r = client.post('/paths/enumerate', json={
+            'nodes': nodes, 'links': links, 'selection': 'mysterious',
+        })
+        assert r.status_code == 400
+
+    def test_diversity_field_type_validated(self, client, diamond_schedule):
+        nodes, links = diamond_schedule
+        r = client.post('/paths/enumerate', json={
+            'nodes': nodes, 'links': links,
+            'diversity': {'overlap_threshold': 'not-a-number'},
+        })
+        assert r.status_code == 400
+
+    def test_driving_graph_field_type_validated(self, client, diamond_schedule):
+        nodes, links = diamond_schedule
+        r = client.post('/paths/driving-graph', json={
+            'nodes': nodes, 'links': links,
+            'config': {'epsilon_hours': 'huh'},
+        })
+        assert r.status_code == 400
+
+    def test_calendar_garbage_inputs_dont_500(self, client, diamond_schedule):
+        """Malformed hours_per_day / working_days fall back to defaults
+        rather than crashing the request."""
+        nodes, links = diamond_schedule
+        r = client.post('/paths/calendar-slack', json={
+            'nodes': nodes, 'links': links,
+            'calendar': {'hours_per_day': 'eight', 'working_days': 'mtwf'},
+        })
+        assert r.status_code == 200
+
 
 class TestEndpointDrivingGraph:
 

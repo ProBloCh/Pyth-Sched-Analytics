@@ -104,17 +104,38 @@ def compute_calendar_slack(nodes, links, project_start=None,
         }
     """
     cfg = calendar_config or {}
-    hpd = float(cfg.get('hours_per_day', _DEFAULT_HOURS_PER_DAY))
-    if hpd <= 0:
+
+    # Validate hours_per_day defensively -- ``calendar_config`` is
+    # forwarded straight from the HTTP body so values like ``[]`` or
+    # ``"eight"`` would otherwise blow up float() with a 500.  Fall back
+    # to the default on any malformed input.
+    raw_hpd = cfg.get('hours_per_day', _DEFAULT_HOURS_PER_DAY)
+    try:
+        hpd = float(raw_hpd)
+    except (TypeError, ValueError):
+        hpd = _DEFAULT_HOURS_PER_DAY
+    if not (hpd > 0) or hpd != hpd:  # rejects 0, negatives, NaN
         hpd = _DEFAULT_HOURS_PER_DAY
 
-    working_days = cfg.get('working_days') or list(_DEFAULT_WORKING_DAYS)
-    holidays = cfg.get('holidays') or []
+    # Coerce working_days to a sanitised set of ISO weekdays {1..7}.
+    raw_wd = cfg.get('working_days')
+    if isinstance(raw_wd, (list, tuple, set)):
+        working_days = sorted({
+            int(d) for d in raw_wd
+            if isinstance(d, (int, float)) and 1 <= int(d) <= 7
+        })
+    else:
+        working_days = []
+    if not working_days:
+        working_days = sorted(_DEFAULT_WORKING_DAYS)
+
+    raw_h = cfg.get('holidays')
+    holidays = list(raw_h) if isinstance(raw_h, (list, tuple)) else []
 
     # Use the configured working-week length so weeks/months/years
     # convert consistently with the calendar (e.g. 6-day weeks won't get
     # silently scaled by the 5-day default in convert_to_hours).
-    wdpw = float(len(working_days)) if working_days else 5.0
+    wdpw = float(len(working_days))
 
     # ---- CPM in working hours ------------------------------------------------
     nodes_h = _normalise_durations_to_hours(nodes, hpd, wdpw)
