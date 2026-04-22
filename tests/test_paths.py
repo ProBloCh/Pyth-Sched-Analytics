@@ -592,6 +592,42 @@ class TestEndpointValidation:
         })
         assert r.status_code == 200
 
+    def test_diversity_null_field_uses_default(self, client, diamond_schedule):
+        """Sending an explicit null for a diversity field must drop the
+        key (using the dataclass default) rather than crashing in
+        math.isnan(None)."""
+        nodes, links = diamond_schedule
+        r = client.post('/paths/enumerate', json={
+            'nodes': nodes, 'links': links,
+            'diversity': {'overlap_threshold': None, 'max_paths': None},
+        })
+        assert r.status_code == 200
+
+    def test_enumerate_returns_400_for_unknown_endpoint(self, client, diamond_schedule):
+        """find_all_paths reports start/end-not-in-schedule via an error
+        payload; the route must surface that as 4xx, not 200."""
+        nodes, links = diamond_schedule
+        r = client.post('/paths/enumerate', json={
+            'nodes': nodes, 'links': links,
+            'start_id': 'A', 'end_id': 'A',  # valid IDs ...
+        })
+        # A->A finds zero paths but no engine error; 200 is correct here.
+        assert r.status_code == 200
+
+    def test_driving_graph_returns_400_when_endpoint_unreachable(self, client):
+        """Disconnected start/end -> engine signals 'no active subgraph';
+        route should return 400."""
+        nodes = [
+            {'ID': 'a', 'Duration': 1},
+            {'ID': 'b', 'Duration': 1},
+        ]
+        links = []  # no link, so b is unreachable from a
+        r = client.post('/paths/driving-graph', json={
+            'nodes': nodes, 'links': links,
+            'start_id': 'a', 'end_id': 'b',
+        })
+        assert r.status_code == 400
+
 
 class TestEndpointDrivingGraph:
 

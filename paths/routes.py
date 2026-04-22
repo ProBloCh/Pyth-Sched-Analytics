@@ -180,6 +180,8 @@ def _coerce_int(value, default, field, min_val=None, max_val=None):
     """Return ``(int, None)`` or ``(None, jsonify-err)``.  Keeps bad client
     input from turning into a 500."""
     if value is None:
+        if default is None:
+            return None, None  # treat as "unset" so caller can drop it
         v = default
     else:
         try:
@@ -195,6 +197,11 @@ def _coerce_int(value, default, field, min_val=None, max_val=None):
 
 def _coerce_float(value, default, field, min_val=None, max_val=None):
     if value is None:
+        # When caller has no default (i.e. wants the field treated as
+        # "unset"), short-circuit with (None, None) so downstream can drop
+        # the key.  math.isnan(None) would otherwise raise TypeError.
+        if default is None:
+            return None, None
         v = default
     else:
         try:
@@ -283,11 +290,15 @@ def _coerce_dataclass_overrides(raw, dc_type, field):
             cv, e = _coerce_int(v, None, f'{field}.{k}')
             if e:
                 return None, e
+            if cv is None:
+                continue   # explicit null -> use dataclass default
             out[k] = cv
         elif ann_name == 'float' or ann is float:
             cv, e = _coerce_float(v, None, f'{field}.{k}')
             if e:
                 return None, e
+            if cv is None:
+                continue   # explicit null -> use dataclass default
             out[k] = cv
         elif ann_name == 'str' or ann is str:
             if not isinstance(v, str):
@@ -375,15 +386,16 @@ def enumerate_paths():
         return err_
 
     get_fn, set_fn = _cache()
-    cache_payload = {
-        'nodes': nodes, 'links': links,
-        'start_id': start_id, 'end_id': end_id,
-        'max_paths': max_paths, 'selection': selection,
-        'branch_balanced': branch_balanced,
-        'diversity': diversity_overrides or None,
-    }
-    key = _cache_key('enumerate', cache_payload)
-    if get_fn:
+    key = None
+    if get_fn or set_fn:
+        key = _cache_key('enumerate', {
+            'nodes': nodes, 'links': links,
+            'start_id': start_id, 'end_id': end_id,
+            'max_paths': max_paths, 'selection': selection,
+            'branch_balanced': branch_balanced,
+            'diversity': diversity_overrides or None,
+        })
+    if get_fn and key is not None:
         cached = get_fn(key)
         if cached is not None:
             cached['cache_hit'] = True
@@ -404,11 +416,13 @@ def enumerate_paths():
             'raw_path_count': base['raw_path_count'],
         }
         if base.get('error'):
+            # Engine-side client-input errors (e.g. start/end not in
+            # schedule) deserve a 4xx so callers can branch on it.
             result['error'] = base['error']
             result['paths'] = []
             result['durations'] = []
             result['cache_hit'] = False
-            return jsonify(_serialise(result))
+            return jsonify(_serialise(result)), 400
 
         raw_paths = base['paths']
         raw_dur = base['durations']
@@ -440,7 +454,7 @@ def enumerate_paths():
 
         result['cache_hit'] = False
         payload = _serialise(result)
-        if set_fn:
+        if set_fn and key is not None:
             set_fn(key, payload)
         return jsonify(payload)
     except Exception as e:
@@ -483,12 +497,14 @@ def driving_graph():
     cfg = DrivingGraphConfig(**cfg_overrides)
 
     get_fn, set_fn = _cache()
-    key = _cache_key('driving-graph', {
-        'nodes': nodes, 'links': links,
-        'start_id': start_id, 'end_id': end_id,
-        'config': cfg_overrides or None,
-    })
-    if get_fn:
+    key = None
+    if get_fn or set_fn:
+        key = _cache_key('driving-graph', {
+            'nodes': nodes, 'links': links,
+            'start_id': start_id, 'end_id': end_id,
+            'config': cfg_overrides or None,
+        })
+    if get_fn and key is not None:
         cached = get_fn(key)
         if cached is not None:
             cached['cache_hit'] = True
@@ -508,8 +524,11 @@ def driving_graph():
             'config': asdict(cfg),
             'cache_hit': False,
         }
+        # Surface client-input errors (start/end not in schedule) as 400.
+        if isinstance(res.explainability, dict) and res.explainability.get('error'):
+            return jsonify(_serialise(result)), 400
         payload = _serialise(result)
-        if set_fn:
+        if set_fn and key is not None:
             set_fn(key, payload)
         return jsonify(payload)
     except Exception as e:
@@ -544,10 +563,12 @@ def distances():
         return err_
 
     get_fn, set_fn = _cache()
-    key = _cache_key('distances', {
-        'nodes': nodes, 'links': links, 'near_tol': near_tol,
-    })
-    if get_fn:
+    key = None
+    if get_fn or set_fn:
+        key = _cache_key('distances', {
+            'nodes': nodes, 'links': links, 'near_tol': near_tol,
+        })
+    if get_fn and key is not None:
         cached = get_fn(key)
         if cached is not None:
             cached['cache_hit'] = True
@@ -589,7 +610,7 @@ def distances():
             'cache_hit': False,
         }
         payload = _serialise(result)
-        if set_fn:
+        if set_fn and key is not None:
             set_fn(key, payload)
         return jsonify(payload)
     except Exception as e:
@@ -625,11 +646,13 @@ def calendar_slack():
         return err_
 
     get_fn, set_fn = _cache()
-    key = _cache_key('calendar-slack', {
-        'nodes': nodes, 'links': links,
-        'project_start': project_start, 'calendar': calendar_cfg or None,
-    })
-    if get_fn:
+    key = None
+    if get_fn or set_fn:
+        key = _cache_key('calendar-slack', {
+            'nodes': nodes, 'links': links,
+            'project_start': project_start, 'calendar': calendar_cfg or None,
+        })
+    if get_fn and key is not None:
         cached = get_fn(key)
         if cached is not None:
             cached['cache_hit'] = True
@@ -643,7 +666,7 @@ def calendar_slack():
         )
         result['cache_hit'] = False
         payload = _serialise(result)
-        if set_fn:
+        if set_fn and key is not None:
             set_fn(key, payload)
         return jsonify(payload)
     except Exception as e:

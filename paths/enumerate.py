@@ -379,13 +379,23 @@ def enumerate_longest_paths_first(
     tracker = _PathTracker(max_paths)
     state_cache: Dict[Tuple[int, ...], float] = {}
     expansions = 0
+    # Convergence guard: once the tracker is full, allow a bounded run of
+    # additional expansions to give the eviction logic a chance to swap in
+    # higher-est completions discovered later.  Since est accumulates only
+    # realised edge weights (no "remaining-to-end" admissible heuristic),
+    # heap-top est cannot upper-bound future completions, so we cap by
+    # number of expansions without improvement instead.
+    no_improvement_cap = max(max_paths * 2, 2000)
+    expansions_since_improve = 0
 
     while heap and expansions < max_expansions:
         _pe, _pc, _pl, _ct, path, est, crit = heapq.heappop(heap)
-        # Track in-heap branch counts (JS BranchBalancedQueue parity:
-        # decrement on pop so penalties reflect live items, not lifetime).
         _branch_dec(path)
         expansions += 1
+        if tracker.is_full():
+            expansions_since_improve += 1
+            if expansions_since_improve >= no_improvement_cap:
+                break
 
         # Skip memoised if we've seen this exact path with >= est.
         prev = state_cache.get(path)
@@ -397,9 +407,8 @@ def enumerate_longest_paths_first(
         if last == end_idx:
             # Track by heuristic estimate (JS PathTracker keys on est;
             # exact durations are computed by find_all_paths for final sort).
-            tracker.add(path, est)
-            if tracker.is_full():
-                break
+            if tracker.add(path, est):
+                expansions_since_improve = 0
             continue
 
         # Expand neighbours in DAG topo order.  Because state is a valid
