@@ -623,6 +623,24 @@ class TestEndpointValidation:
         })
         assert r.status_code == 400
 
+    def test_driving_graph_max_expansions_capped(self, client, diamond_schedule):
+        """Range bounds prevent abuse like config.max_expansions=10**9."""
+        nodes, links = diamond_schedule
+        r = client.post('/paths/driving-graph', json={
+            'nodes': nodes, 'links': links,
+            'config': {'max_expansions': 1_000_000_000},
+        })
+        assert r.status_code == 400
+
+    def test_driving_graph_selection_mode_allowlist(self, client, diamond_schedule):
+        """selection_mode must be one of {raw, outliers}."""
+        nodes, links = diamond_schedule
+        r = client.post('/paths/driving-graph', json={
+            'nodes': nodes, 'links': links,
+            'config': {'selection_mode': 'mystery'},
+        })
+        assert r.status_code == 400
+
     def test_driving_graph_returns_400_when_endpoint_unreachable(self, client):
         """Disconnected start/end -> engine signals 'no active subgraph';
         route should return 400."""

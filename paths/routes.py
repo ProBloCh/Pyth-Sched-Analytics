@@ -272,17 +272,26 @@ def _resolve_start_end(start_id, end_id, nodes, links):
     return start_id, end_id
 
 
-def _coerce_dataclass_overrides(raw, dc_type, field):
+def _coerce_dataclass_overrides(raw, dc_type, field, bounds=None,
+                                allowed_values=None):
     """Validate per-field types for dataclass override dicts.
 
     Iterates the dataclass annotations; coerces ints/floats/bools/strings
     into the expected primitive type and rejects malformed values with
     a 400.  Unknown keys are silently dropped (matches the existing
     behaviour but stays type-safe).
+
+    ``bounds``: optional dict ``{field_name: (min, max)}`` enforced on
+    numeric fields to prevent resource-exhaustion abuse (e.g.,
+    ``max_expansions: 1_000_000_000``).
+    ``allowed_values``: optional dict ``{field_name: {valid, ...}}``
+    for enum-like string fields.
     """
     overrides, err = _coerce_dict_overrides(raw, field)
     if err:
         return None, err
+    bounds = bounds or {}
+    allowed_values = allowed_values or {}
     out = {}
     fields = dc_type.__dataclass_fields__
     for k, v in overrides.items():
@@ -291,6 +300,7 @@ def _coerce_dataclass_overrides(raw, dc_type, field):
         ann = fields[k].type
         # Annotation may be a class or a string (PEP 563 future-annotations).
         ann_name = ann.__name__ if hasattr(ann, '__name__') else str(ann)
+        lo, hi = bounds.get(k, (None, None))
         if ann_name == 'bool' or ann is bool:
             cv, e = _coerce_bool(v, None, f'{field}.{k}')
             if e:
@@ -299,14 +309,16 @@ def _coerce_dataclass_overrides(raw, dc_type, field):
                 continue
             out[k] = cv
         elif ann_name == 'int' or ann is int:
-            cv, e = _coerce_int(v, None, f'{field}.{k}')
+            cv, e = _coerce_int(v, None, f'{field}.{k}',
+                                min_val=lo, max_val=hi)
             if e:
                 return None, e
             if cv is None:
                 continue   # explicit null -> use dataclass default
             out[k] = cv
         elif ann_name == 'float' or ann is float:
-            cv, e = _coerce_float(v, None, f'{field}.{k}')
+            cv, e = _coerce_float(v, None, f'{field}.{k}',
+                                  min_val=lo, max_val=hi)
             if e:
                 return None, e
             if cv is None:
@@ -316,12 +328,50 @@ def _coerce_dataclass_overrides(raw, dc_type, field):
             if not isinstance(v, str):
                 return None, (jsonify({
                     'error': f'{field}.{k} must be a string'}), 400)
+            allowed = allowed_values.get(k)
+            if allowed is not None and v not in allowed:
+                return None, (jsonify({
+                    'error': f'{field}.{k} must be one of: '
+                             + ', '.join(sorted(allowed))}), 400)
             out[k] = v
         else:
             # Unrecognised annotation: pass through (DiversityConfig and
             # DrivingGraphConfig only use primitives today).
             out[k] = v
     return out, None
+
+
+# Per-config bounds and enum-allowlists.  Defaults come from the
+# dataclasses; here we cap user overrides to defensible operational
+# ranges so a malicious or buggy client can't request 1B expansions.
+_DRIVING_GRAPH_BOUNDS = {
+    'epsilon_hours': (0.0, 1_000.0),
+    'critical_float_tol_hours': (0.0, 100_000.0),
+    'near_critical_float_tol_hours': (0.0, 100_000.0),
+    'near_driving_tol_hours': (0.0, 100_000.0),
+    'max_critical_chains': (1, 10_000),
+    'max_near_critical_chains': (1, 10_000),
+    'max_expansions': (1, 5_000_000),
+    'max_depth_guard': (1, 100_000),
+    'max_display_chains': (1, 1_000),
+    'min_jaccard_novelty': (0.0, 1.0),
+}
+_DRIVING_GRAPH_ALLOWED = {
+    'selection_mode': {'raw', 'outliers'},
+}
+
+_DIVERSITY_BOUNDS = {
+    'max_paths': (1, 1_000),
+    'branch_depth': (1, 30),
+    'midpoint_depth': (1, 8),
+    'min_paths_per_branch': (1, 200),
+    'max_paths_per_branch': (1, 200),
+    'overlap_threshold': (0.0, 1.0),
+    'min_unique_edges': (0, 200),
+    'max_per_family': (1, 200),
+    'candidate_multiplier': (1, 50),
+    'candidate_cap': (1, 50_000),
+}
 
 
 def _default_start_end(nodes, links):
@@ -393,6 +443,7 @@ def enumerate_paths():
         return err_
     diversity_overrides, err_ = _coerce_dataclass_overrides(
         data.get('diversity'), DiversityConfig, 'diversity',
+        bounds=_DIVERSITY_BOUNDS,
     )
     if err_:
         return err_
@@ -503,6 +554,8 @@ def driving_graph():
 
     cfg_overrides, err_ = _coerce_dataclass_overrides(
         data.get('config'), DrivingGraphConfig, 'config',
+        bounds=_DRIVING_GRAPH_BOUNDS,
+        allowed_values=_DRIVING_GRAPH_ALLOWED,
     )
     if err_:
         return err_
