@@ -98,6 +98,13 @@ except Exception as _evm_err:
     logging.warning("EVM package failed to load: %s. "
                     "EVM endpoints will be unavailable.", _evm_err)
 
+try:
+    from paths import paths_bp
+    app.register_blueprint(paths_bp)
+except Exception as _paths_err:
+    logging.warning("Paths package failed to load: %s. "
+                    "Path endpoints will be unavailable.", _paths_err)
+
 ###############################################################################
 # Redis Cache Setup                                                           #
 ###############################################################################

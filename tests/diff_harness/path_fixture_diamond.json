@@ -1,0 +1,20 @@
+{
+  "name": "diamond",
+  "description": "A->B->D->E and A->C->D->E. Critical 42, alternate 35.",
+  "nodes": [
+    {"ID": "A", "Duration": 10, "TimeUnits": "Hours"},
+    {"ID": "B", "Duration": 15, "TimeUnits": "Hours"},
+    {"ID": "C", "Duration": 8,  "TimeUnits": "Hours"},
+    {"ID": "D", "Duration": 12, "TimeUnits": "Hours"},
+    {"ID": "E", "Duration": 5,  "TimeUnits": "Hours"}
+  ],
+  "links": [
+    {"source": "A", "target": "B", "type": "FS", "lag": 0},
+    {"source": "A", "target": "C", "type": "FS", "lag": 0},
+    {"source": "B", "target": "D", "type": "FS", "lag": 0},
+    {"source": "C", "target": "D", "type": "FS", "lag": 0},
+    {"source": "D", "target": "E", "type": "FS", "lag": 0}
+  ],
+  "start_id": "A",
+  "end_id": "E"
+}

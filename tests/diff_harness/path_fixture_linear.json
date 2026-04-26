@@ -1,0 +1,15 @@
+{
+  "name": "linear",
+  "description": "A -> B -> C, all FS, single path of duration 35.",
+  "nodes": [
+    {"ID": "A", "Duration": 10, "TimeUnits": "Hours"},
+    {"ID": "B", "Duration": 20, "TimeUnits": "Hours"},
+    {"ID": "C", "Duration": 5,  "TimeUnits": "Hours"}
+  ],
+  "links": [
+    {"source": "A", "target": "B", "type": "FS", "lag": 0},
+    {"source": "B", "target": "C", "type": "FS", "lag": 0}
+  ],
+  "start_id": "A",
+  "end_id": "C"
+}
