@@ -114,7 +114,7 @@ def compute_calendar_slack(nodes, links, project_start=None,
         hpd = float(raw_hpd)
     except (TypeError, ValueError):
         hpd = _DEFAULT_HOURS_PER_DAY
-    if not (hpd > 0) or hpd != hpd:  # rejects 0, negatives, NaN
+    if not (hpd > 0) or np.isnan(hpd):  # rejects 0, negatives, NaN
         hpd = _DEFAULT_HOURS_PER_DAY
 
     # Coerce working_days to a sanitised set of ISO weekdays {1..7}.

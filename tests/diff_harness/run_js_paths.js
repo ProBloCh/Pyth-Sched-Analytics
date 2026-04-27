@@ -184,6 +184,16 @@ try {
     } else {
         pathsResult = { paths: [], durations: [] };
     }
+    // Honour the fixture's max_paths cap so the JS side matches Python's
+    // find_all_paths(max_paths=...) truncation.  PathScripts.findAllPaths
+    // has no maxPaths parameter (it caps at MAX_PATHS_TO_RETURN=10000), so
+    // we clip post-hoc.
+    if (Number.isFinite(maxPaths) && pathsResult.paths.length > maxPaths) {
+        pathsResult.paths = pathsResult.paths.slice(0, maxPaths);
+        if (pathsResult.durations.length > maxPaths) {
+            pathsResult.durations = pathsResult.durations.slice(0, maxPaths);
+        }
+    }
 } catch (err) {
     pathsErr = err.message;
 }

@@ -11,7 +11,6 @@ Covers:
   - HTTP endpoint validation and happy path
 """
 
-import math
 import pytest
 
 from completion.monte_carlo import (

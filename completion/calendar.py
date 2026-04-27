@@ -22,7 +22,7 @@ Weekday convention: ISO (Mon=1..Sun=7), matching solver.models.ProjectContext.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import logging
 import numpy as np
 

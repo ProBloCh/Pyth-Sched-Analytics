@@ -196,7 +196,7 @@ def test_predicted_dates_within_one_day(fixture_path):
     is fragile across implementations."""
     from datetime import datetime
     js = _run_js(fixture_path)
-    py = _run_py(fixture_path)
+    _run_py(fixture_path)  # smoke-test the Py path; we recompute below
 
     js_pred = {p['id']: p for p in js['predictedDates']}
 
@@ -214,7 +214,7 @@ def test_predicted_dates_within_one_day(fixture_path):
     )
     from evm.metrics import (
         compute_bcws_hours, compute_bcwp_hours, compute_acwp,
-        compute_bac_hours, compute_duration_weighted,
+        compute_duration_weighted,
     )
     from evm.helpers import safe_date
 
@@ -235,7 +235,6 @@ def test_predicted_dates_within_one_day(fixture_path):
     bcws = compute_bcws_hours(nodes_actual, status_date, hpd, dpw)
     bcwp = compute_bcwp_hours(nodes_actual, hpd, dpw)
     acwp = compute_acwp(nodes_actual, cost_rate, status_date, hpd, dpw)
-    bac = compute_bac_hours(nodes_actual, hpd, dpw)
     bcws_c = bcws * cost_rate
     bcwp_c = bcwp * cost_rate
     metrics = compute_evm_metrics(bcwp_c, acwp, bcws_c)

@@ -20,11 +20,10 @@ What is *not* extracted:
     (UI-layer risk-register concern, separate from recovery)
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import logging
 import re
 import time
-from typing import Optional
 
 import numpy as np
 

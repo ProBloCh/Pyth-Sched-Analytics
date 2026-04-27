@@ -829,8 +829,6 @@ def _agglomerative_precomputed_kwargs():
 
 def _centralities(G: nx.DiGraph, df: pd.DataFrame):
     """Compute centralities with NetworkKit acceleration when available"""
-    node_ids = df['ID'].astype(str).tolist()
-    
     # Use NetworkKit for better performance if available (lower threshold)
     if _NK and len(G) > 50:
         try:
