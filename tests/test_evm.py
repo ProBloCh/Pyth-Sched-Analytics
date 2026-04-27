@@ -1424,10 +1424,6 @@ class TestBuildDagDefaultDuration:
             links=[{'source': '1', 'target': '2', 'type': 'FS'}])
         # Node 1 treated as 1-unit activity under default path.
         assert state.TF is not None  # CPM ran without crash
-        # Check durations array directly for node 1.
-        import numpy as np
-        durs = np.asarray(state.durations if hasattr(state, 'durations')
-                          else getattr(state, 'dur', None))
         # solver/dag.py stores durations on the DAGState; access via
         # attribute name used by the module.
         assert hasattr(state, 'durations') or hasattr(state, 'dur')

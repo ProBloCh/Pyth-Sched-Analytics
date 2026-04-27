@@ -18,7 +18,7 @@ walk then processes one activity at a time but broadcasts over all M
 samples simultaneously, keeping the inner loop in C-level NumPy.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import logging
 import time
 

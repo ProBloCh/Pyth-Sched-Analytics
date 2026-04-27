@@ -128,7 +128,6 @@ const links = fixture.links || [];
 const opts = fixture.options || {};
 const statusDate = new Date(opts.statusDate || '2025-01-01T00:00:00Z');
 const costRate = +opts.costRate || 1;
-const currency = opts.currency || 'USD';
 
 // Sync the calendar from fixture's cybereumState.teamCalendar
 sandbox.window.cybereumState.dataDate = statusDate;
