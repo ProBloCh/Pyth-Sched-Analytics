@@ -97,7 +97,17 @@ Content-Type: application/json
 }
 ```
 
-### Hard Constraints
+### Hard Constraints (soft-penalty enforcement)
+
+> **Naming caveat.** The constraint mechanism here is a **soft
+> penalty**, not a hard refusal.  An infeasible bound produces a
+> best-effort solution with `satisfied: false` and a `violation`
+> magnitude in the response -- not a guaranteed-feasible output and
+> not an error.  Strict hard enforcement (Augmented Lagrangian,
+> active-set SQP, or projection onto the feasible set) is on the
+> roadmap but not in this implementation.  Callers that require a
+> guaranteed bound should treat `satisfied: false` as "infeasible"
+> and reject the result themselves.
 
 When `constraints.max_makespan` (or a resolvable `max_end_date`) and / or
 `constraints.max_budget` are supplied, the optimizer adds a quadratic
@@ -518,7 +528,18 @@ best-effort solution with `satisfied: false`, not an error.
 
 ---
 
-## Calendar Mapping
+## Calendar Mapping (response-side / edge mapping only)
+
+> **Scope caveat.** This is the **edge mapping** -- a single
+> abstract-makespan-to-ISO-date conversion at the response boundary.
+> The solver's internal CPM (`solver/dag.py`) still treats every
+> `Duration` as an abstract time unit, so per-activity ES/EF do
+> NOT come back as real dates and FF/SF lags do NOT respect
+> non-working days during the forward/backward pass.  Consumers
+> that need per-activity calendar dates (e.g. for a Gantt-chart
+> view) must do their own per-activity mapping or wait for the
+> compute-side parity (deferred; see `CLAUDE.md`'s "Calendar-aware
+> scheduling inside the solver CPM" note).
 
 The solver's CPM operates in abstract time units (whatever `Duration`
 units the request supplied).  Real-world deployments need to know

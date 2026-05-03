@@ -195,6 +195,18 @@ activity and each date:
 
 ### Earned Schedule (Lipke 2003)
 
+> **Uncertainty caveat.** The returned `ES` / `SPI(t)` / `TEAC` are
+> **deterministic point estimates**.  This sits awkwardly in a system
+> whose research foundation (Natarajan PMJ 2022, Flyvbjerg JMIS 2022)
+> emphasises fat-tailed overruns -- a single `TEAC_date` value should
+> not be read as a forecast.  For uncertainty bands on finish dates
+> use `/completion/monte-carlo`'s P10/P50/P80 percentiles, which
+> compose the same five-tier risk model
+> (triangular → normal → Birnbaum-Saunders → Pareto) used elsewhere
+> in the codebase.  Composing ES with that ensemble to produce
+> `TEAC_p10` / `TEAC_p50` / `TEAC_p80` is a meaningful follow-up but
+> not yet implemented.
+
 The cost-based `SPI = EV / PV` collapses to 1.0 at completion regardless
 of how late the project actually finished, because once all work is
 earned both EV and PV equal BAC.  Earned Schedule fixes this by
