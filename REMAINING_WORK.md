@@ -307,13 +307,396 @@ cumulative arrays).
 
 ---
 
+## 6. Library upgrade backlog (researched 2026-05)
+
+Compressed output of a broad library-and-dataset survey done on the
+`claude/research-libraries-tools-Xl4Ld` branch.  Each item lists the
+incumbent in this codebase, the candidate, the verified evidence
+(version, license, an actual code reference where relevant), and what
+unblocks adopting it.  Items are grouped by what they touch and what
+they're gated on -- the Tier-A "do first" cluster is intentionally
+small because the gating measurement (py-spy) hasn't been taken yet.
+
+### 6.1 Profile-gated runtime upgrades
+
+These three look high-value on inspection but are NOT yet justified by
+measurement.  Per CLAUDE.md "Goal-Driven Execution" they are deferred
+until `py-spy` confirms each lives in the top-3 hot path.
+
+#### 6.1.1 `orjson` as Flask JSON provider
+
+**What**: Replace `flask.json` with an `orjson`-backed provider.
+Native NumPy-array / datetime / UUID encoding, ~3-10x throughput on
+large payloads.  Targets the `/graph-metrics`, `/completion/monte-
+carlo`, and `/evm/analyze` responses (large nested NumPy-laden JSON
+read by both the C# backend and the JS frontend).
+
+**Why not now**: No profile data yet shows JSON encoding is in the
+hot path.  CLAUDE.md performance benchmarks point at CPM + MC
+propagation as the dominant cost; serialization may already be < 5%
+of request time, in which case `orjson` is premature optimization.
+
+**Unblocked by**: A `py-spy record` against a live gunicorn worker
+servicing a representative `/graph-metrics` payload, showing JSON
+encoding > 5% of wall time.  Add `requirements-dev.txt` (already
+present) is the one-line install path.
+
+#### 6.1.2 `flask-compress` + brotli response compression
+
+**What**: Wrap the Flask app with `flask_compress.Compress(app)` so
+brotli is offered ahead of gzip.  Brotli is typically 4-6x smaller
+than gzip on JSON payloads, cutting Azure egress and frontend TTFB
+on the multi-megabyte responses.
+
+**Why not now**: No measurement of current response sizes or egress
+costs.  Worth knowing before adding a content-negotiation layer that
+both consumers (C# `ComputeMetrics.cs`, JS `CommunityGroups.js`)
+must understand.
+
+**Unblocked by**: Sample 5 representative response sizes from
+production logs + 1 confirmation that the C# HttpClient and the JS
+fetch wrappers will accept `Content-Encoding: br`.
+
+#### 6.1.3 `azure-monitor-opentelemetry` first-class APM
+
+**What**: One-call `configure_azure_monitor()` auto-instruments
+Flask, Redis, requests; ships traces + metrics + logs to App
+Insights.  Already paid for by the Azure subscription.
+
+**Why not now**: Need to confirm the deployment environment isn't
+already wired to App Insights via a different mechanism (the
+existing telemetry hooks live in the JS wrappers, item 4.4) and
+that a Python-side tracer doesn't double-count.
+
+**Unblocked by**: Deployment-config check + an off-hours staging
+deploy with the SDK enabled to confirm trace shape.
+
+### 6.2 Test-tooling additions (safe, additive, no runtime change)
+
+#### 6.2.1 `hypothesis` for property-based DAG generation -- READY
+
+**What**: Wire `hypothesis` strategies that generate random DAGs
+with mixed FS/SS/FF/SF edges and arbitrary lag values into the
+existing `tests/diff_harness/` modules.  Catches fixture gaps in
+`test_paths_diff.py`, `test_evm_diff.py`, `test_recovery_diff.py`
+beyond the curated 5-fixture sets.
+
+**Why not yet**: `hypothesis` is now in `requirements-dev.txt`; the
+strategy + invariant tests still need writing.  No blocker.
+
+**Unblocked by**: Self.  See `requirements-dev.txt` line 18.
+
+#### 6.2.2 `py-spy` profiling baseline -- READY
+
+**What**: Run `py-spy record` against a representative gunicorn
+worker servicing `/graph-metrics` (5K and 15K activity inputs) and
+`/completion/monte-carlo` (M=512 sample run).  Output a flame graph
+under `docs/perf/` to gate items 6.1.1-6.1.3 and 6.5.
+
+**Why not yet**: Same -- `py-spy` is in `requirements-dev.txt`; the
+profiling run itself hasn't been done in a deployed-shape
+environment.
+
+**Unblocked by**: Self + access to a worker shape comparable to
+production.
+
+### 6.3 Verified runtime swaps with a clear feature gate
+
+#### 6.3.1 `leidenalg` Louvain -> Leiden in multi-resolution pipeline
+
+**What**: Swap the Louvain calls in `multi_resolution_pipeline.py`
+for `leidenalg.find_partition` behind a config flag (e.g.
+`COMMUNITY_ALGORITHM=leiden|louvain`, default `louvain` for back-
+compat).  Leiden eliminates Louvain's disconnected-community
+defect (γ-connectivity guarantee) and substantially mitigates the
+resolution-limit problem via its refinement phase.  It does NOT
+eliminate the resolution limit, which is intrinsic to modularity.
+
+**Why not now**: The `CommunityGroup` field in the
+`/graph-metrics` response is part of the API contract (consumed by
+`CommunityGroups.js`).  Switching the underlying algorithm changes
+community labels and counts.  Requires (a) the flag, (b) a small
+diff harness comparing Louvain vs Leiden NMI + community-count
+distributions on a fixture suite, (c) a docs/api/graph-metrics.md
+note.
+
+**Unblocked by**: Branch-specific feature spec.  Verified PyPI
+version: `leidenalg==0.11.0` (current, Oct 2025).
+
+#### 6.3.2 `scipy.optimize.minimize(method='trust-constr')` in solver
+
+**What**: One-line method change in `solver/optimizer.py:173`
+from `method='L-BFGS-B'` to `method='trust-constr'` with explicit
+`NonlinearConstraint(makespan_fn, 0, max_makespan)` and a
+`LinearConstraint` for `max_budget`.  Replaces the soft quadratic
+penalty (`CONSTRAINT_PENALTY_LAMBDA = 50`) with hard enforcement.
+Reuses the existing analytic adjoints in `solver/adjoints.py`.
+
+**Why not now**: The `constraints` report shape returned by
+`/solver/sensitivity` and `/solver/optimize` (see
+`docs/api/solver.md`) currently exposes `{bound, final_value,
+violation, satisfied}` per active constraint -- meaningful only
+under a soft-penalty regime.  Hard enforcement means
+`satisfied: false` becomes "infeasible, no solution returned"
+which is a contract change for the C# consumer.
+
+**Unblocked by**: API-contract decision: does the C# consumer want
+"best-effort with magnitude" (today) or "feasible-or-fail" (with
+trust-constr)?  Possibly both, behind a `config.constraint_mode`
+flag.
+
+#### 6.3.3 `pymoo` NSGA-II / MOEA/D as alternative Pareto sweep
+
+**What**: Add `pymoo` (`==0.6.1.6`) as a parallel branch in
+`solver/pareto.py` alongside the existing Tchebycheff sweep,
+gated by a `config.pareto_method = "tchebycheff" | "nsga2" |
+"moead"` field.
+
+**Why not now**: This is a new code path, not a flag swap --
+`pareto.py` currently has no method-dispatch layer.  Sizable PR.
+Also overlaps the open backlog item ("NSGA-II / MOEA/D as
+alternative to Tchebycheff" already noted in CLAUDE.md).
+
+**Unblocked by**: Concrete user request that the Tchebycheff
+sweep is missing frontier points, OR a many-objective (>3
+disciplines) project that motivates reference-direction methods.
+
+#### 6.3.4 `holidays` library feeding `WorkingCalendar`
+
+**What**: Use the `holidays` package to populate the holiday list
+fed into `completion/calendar.py::WorkingCalendar` from a country
+code + year range, instead of users supplying ISO date strings.
+Net new helper, no calendar refactor.
+
+**Why not now**: Needs a small request-shape addition (e.g.
+`project_context.calendar.country = "GB"`) and validation.  Trivial
+but not free.
+
+**Unblocked by**: A customer who wants country-default holidays
+without uploading their own list.
+
+### 6.4 Verified diagnostic additions (low-risk feature work)
+
+#### 6.4.1 `powerlaw.distribution_compare` in reference-class validation
+
+**What**: Add a one-shot validation script under `solver/` that
+takes the per-class Pareto α and runs `powerlaw.Fit` +
+`distribution_compare('power_law', 'lognormal')` against historical
+overrun samples once item 1.1 (outcome accumulation) yields enough
+data.  Confirms the `α = 2.0 + 1.5 * (1 - risk)` calibration
+empirically per Flyvbjerg-style methodology.
+
+**Why not now**: Same data dependency as section 1 -- needs 30+
+closed projects per class to run meaningfully.
+
+**Unblocked by**: Item 1.1 producing data.
+
+#### 6.4.2 `pycop` upper-tail-dependence coefficient in 2D clusters
+
+**What**: Add a `tail_dependence_coefficient` scalar to the
+`/solver/sensitivity` 2D cost-schedule extreme-event clustering
+output.  Validates whether K-means clusters in the joint cost-
+schedule overrun space reflect real joint extremes (λᵤ > 0) vs
+independent fat tails.  Verified library: `pycop==0.0.13`
+(March 2024, has theoretical, non-parametric, and plateau-finding
+empirical TDC).
+
+**Why not now**: Adds one new field to the response (additive, no
+breaking change) but the v0.0.x version label means the dep is
+small (21 KB wheel) and the math is well-defined, but pinning is
+required to keep the diagnostic stable.
+
+**Unblocked by**: API decision on whether to add `λᵤ` or to keep
+the response shape minimal.
+
+#### 6.4.3 `scoringrules` CRPS in calibration loop
+
+**What**: Wire `scoringrules.crps_ensemble(...)` into
+`completion/outcomes.py` / `completion/calibration-report` so the
+per-percentile P10/P20/P50/P80/P95 band collapses to a single
+proper score per recorded outcome.  CRPS makes per-class
+calibration monotone-comparable across customers and over time.
+Verified library: `scoringrules==0.10.0` (active, pure-Python).
+NOT `properscoring` -- that one is at v0.1, single release, and
+unmaintained since 2015.
+
+**Why not now**: Same data dependency as 4.4 / section 1; CRPS is
+only meaningful with accumulated outcomes.  But the hookup is
+trivial and could ship in advance, returning `null` until enough
+data lands.
+
+**Unblocked by**: Section 1 accumulation OR a "ship the field
+returning null" decision.
+
+#### 6.4.4 `SALib` Saltelli-Sobol indices alongside gradient sensitivity
+
+**What**: Add a SALib-backed sample-based S1 / ST sensitivity
+report alongside the existing gradient-based output of
+`/solver/sensitivity`.  Gradient sensitivity gives local
+derivatives; Sobol indices give variance-decomposed global
+sensitivity.  Reuses the existing Sobol QMC infrastructure in
+`solver/stochastic.py` for the Saltelli A/B/AB matrices.
+
+**Why not now**: Doubles the cost of `/solver/sensitivity` for
+each requested coordinate.  Should be opt-in via
+`config.sensitivity_global = true`.
+
+**Unblocked by**: User who wants global, not local, sensitivity.
+
+### 6.5 Strategic infrastructure decisions
+
+#### 6.5.1 `mpxj` ingest layer (XER / MPP / PMXML / Asta / Synchro)
+
+**What**: Add an optional ingestion layer that turns customer
+project files (Primavera P6 .xer/.pmxml, MS Project .mpp/.mspdi,
+Asta, Synchro, Phoenix, Deltek Open Plan, GanttProject, etc.)
+directly into the JSON shape `/graph-metrics` and `/solver/*`
+already accept.  `mpxj` (Java, JPype-bridged) is the single library
+covering ~20 formats.  Pair with `xer-reader` (pure-Python,
+XER-only) as a no-JVM fallback.
+
+**Why not now**: This is the gating strategic question of the
+research output: **does the deployment image accept a JVM?**
+Today's Dockerfile is `python:3.12-slim` with no JRE.  Adding
+OpenJDK adds ~150-200 MB to the image and a second runtime to
+operate.
+
+**Unblocked by**: Product decision on whether "drop your
+Primavera/MSP file" is a customer-facing capability worth the
+container weight.  If no, the no-JVM path is `xer-reader` for the
+XER subset only.
+
+#### 6.5.2 `OR-Tools` CP-SAT for hard RCPSP/max enforcement
+
+**What**: Replace the soft-penalty constraint enforcement (item
+6.3.2) with a true CP-SAT-backed RCPSP/max engine for the
+hard-enforcement roadmap item flagged in CLAUDE.md.  CP-SAT is the
+only mature open-source RCPSP/max solver with sub-second
+performance on 100-activity instances; ~3% optimality gap on
+PSPLIB.
+
+**Why not now**: Strictly larger lift than 6.3.2 trust-constr.
+The CP-SAT model has to express FS/SS/FF/SF + lag (intervals +
+linear constraints between starts/ends), resource-cumulative
+constraints, and the Tchebycheff scalarisation -- nontrivial
+porting.
+
+**Unblocked by**: A user who needs guaranteed-feasible schedules
+under hard resource caps, where 6.3.2's continuous nonlinear
+constraints are insufficient.
+
+#### 6.5.3 `pyAgrum` Bayesian-network risk-cascade engine
+
+**What**: Replace the topological-averaging risk propagation in
+`solver/analysis.py` with a Bayesian network whose CPTs encode
+per-activity at-risk probabilities and per-edge conditional
+inflation.  `pyAgrum==2.3.2` is C++-backed (aGrUM core), no
+PyTorch dep -- contrast with `pomegranate` v1.1.2 which pulls
+torch (~700 MB - 2 GB image bloat).
+
+**Why not now**: This is a methodological change, not a swap.
+Needs (a) a CPT specification format on the request, (b) a JS-vs-
+Py diff harness against the current topological propagation on a
+linear-Gaussian fixture where the two should agree, (c) a
+sensitivity story for how the BN choice affects the published
+criticality / cruciality indices.
+
+**Unblocked by**: Concrete proposal + design doc.  Until then the
+`pyAgrum` recommendation supersedes `pomegranate` and `pgmpy` on
+deploy weight + scale alone.
+
+### 6.6 Verified data ingestion (open-licensed, machine-readable)
+
+#### 6.6.1 UK IPA Government Major Projects Portfolio (GMPP) reference class
+
+**What**: Bundle a built-in `gov_uk_gmpp` reference class derived
+from the per-department GMPP CSV/XLSX series published annually on
+gov.uk under the Open Government Licence.  Each department (ONS,
+MOD, HMRC, DHSC, MOJ, DCMS, VOA, NCA, ...) publishes its own
+file.  Verified: the 2023-24 IPA annual report itself includes
+CSV + XLSX downloads.
+
+**Why not now**: Ingestion is **N CSV files (one per department),
+not one** -- needs a small ETL that unions them, normalises the
+delivery-confidence (RAG) ratings to per-percentile factors, and
+ships the result as a JSON in the per-class registry alongside
+the existing 19 sectors.  License is OGL (compatible with this
+project's distribution model) but the file structure varies year
+to year and across departments.
+
+**Unblocked by**: A focused 1-day ETL + a pinned snapshot date so
+the bundled JSON is reproducible.
+
+#### 6.6.2 Aaen / Flyvbjerg PMJ 2025 23-type table extension
+
+**What**: Extend `solver/reference_classes.py` from 19 to 23
+classes by encoding the per-class P10 / P50 / P80 cost & schedule
+deltas + Pareto α from the PMJ 2025 "Uniqueness of IT Cost Risk"
+paper.
+
+**Why not now**: The paper is paywalled (SAGE).  Per-class
+parameters need hand-extraction from the paper body, which is
+research / documentation work, not engineering.
+
+**Unblocked by**: Paper access + the section 2.1 senior-
+practitioner review (so new entries don't repeat the JUDGEMENT
+labelling pattern).
+
+### 6.7 Anti-findings (researched, do not adopt)
+
+These were investigated and rejected; recording so the next
+researcher doesn't redo the work.
+
+- **`scipy.stats.fatiguelife` to replace `_bs_ppf_z`** -- would
+  re-do `ndtri` per call and break the Sobol QMC pipeline's
+  shared-`z` optimisation.  Hand-rolled BS PPF in
+  `solver/stochastic.py:127` stays.
+- **`numpy.busday_count` / `busdaycalendar`** -- only supports
+  integer day deltas + one weekmask; loses `WorkingCalendar`'s
+  per-resource calendars + half-days + exceptions.
+- **GPU graph (`nx-cugraph`, cuGraph)** -- no GPU on the Azure
+  App Service tier; 20K-node graphs finish in <2s on NetworKit.
+- **GNN libs (PyG, DGL)** -- 1-2 GB of deps for marginal gain on
+  deterministic CPM analytics.
+- **`graph-tool`** -- conda-only install; rules it out for the
+  current pip-based Azure CI.
+- **FastAPI / ASGI migration, gevent / eventlet workers** --
+  handlers are CPU-bound (NumPy, NetworKit hold the GIL); ASGI
+  buys nothing and breaks the C# / JS contract surface.
+- **`dask`, `polars`** -- overkill for a 2-worker single-node
+  service; pandas isn't the bottleneck per the published
+  performance benchmarks.
+- **`cvxpy`** -- `C = rate * r * d` plus BS / Pareto inflation
+  are non-convex; doesn't fit DCP.
+- **`DEAP`, `Platypus`, `pygmo`, `parego`, `moead-py`** --
+  strictly dominated by `pymoo` for this use case.
+- **`TensorFlow Probability`, `Pyro`, `emcee`, `mc3`** --
+  redundant with `pyAgrum` / NumPyro for the BN use case.
+- **`pgmpy`, `bnlearn`** -- pure-Python; too slow on 15K-node
+  DAGs.  Use `pyAgrum`.
+- **`scikit-extremes`, `pyschedule`, `pyrcpsp`, `pyevm`,
+  `earned-schedule-py`, `py-tail-risk`, `GPyOpt`,
+  `scikit-optimize`** -- all abandoned.
+- **`properscoring`** -- single-release v0.1 since 2015.  Use
+  `scoringrules==0.10.0` instead.
+- **`@RISK` / Crystal Ball / RiskyProject parsers** -- none
+  exist on PyPI.
+- **No mature open-source SRA package exists** anywhere -- the
+  in-house criticality / cruciality + Tchebycheff Pareto + five-
+  tier risk distributions in this service is genuinely a moat.
+
+---
+
 ## How to use this document
 
 Treat this as a triage list.  The items in section 1 are the most
 strategically important but require data accumulation that has to
 happen in production over months.  Section 2 needs a person, not
 code.  Section 3 needs infrastructure that exists in the deployment
-environment but not here.  Section 4 is engineering polish.
+environment but not here.  Section 4 is engineering polish.  Section
+6 is the library-upgrade backlog produced in 2026-05; the gating
+measurement (`py-spy`) and the gating product decision (JVM in image
+yes/no) are called out explicitly per item.
 
 When picking up a future PR, start at the top of the relevant section
 and work down.  Update this file as items get done so future
