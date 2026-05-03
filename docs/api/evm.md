@@ -122,7 +122,7 @@ so no key conversion is required on the JS side.
       "SPI_t":               0.714,           // ES / AT  -- raw, may be Inf
       "SPI_t_model":         0.714,           //   clamped to MIN_SPI..MAX_SPI
       "earnedScheduleDate":  "2025-01-11",    // ISO date of ES on the plan
-      "TEAC_days":           44.8,            // Time-based EAC = max(AT, PD/SPI(t))
+      "TEAC_days":           44.8,            // Time-based EAC = max(AT, PD/SPI_t_model)
       "TEAC_date":           "2025-02-15",    // project_start + TEAC_days
       "projectStartDate":    "2025-01-01",
       "projectFinishDate":   "2025-02-02",
@@ -201,9 +201,16 @@ at which the work currently earned should have been completed.
 ```
 ES        = date on the planned curve where cumulative PV first equals current EV
 AT        = (status_date - project_start) in calendar days
-SPI(t)    = ES / AT                  // stays < 1 if the project is late, even at finish
-TEAC(t)   = max(AT, PD / SPI(t))     // Lipke's IEAC(t); clamped >= AT
+SPI(t)    = ES / AT                       // stays < 1 if late, even at finish
+TEAC(t)   = max(AT, PD / SPI_t_model)     // Lipke's IEAC(t); clamped >= AT
 ```
+
+**TEAC uses `SPI_t_model` (clamped), not raw `SPI_t`.**  This mirrors
+how `compute_eac` uses `CPIcum_model` / `SPI_model` and avoids
+pathological outputs when the raw SPI(t) is Inf (status_date at
+project_start with non-zero EV) or near zero (very small ES).
+Consumers reproducing TEAC should clamp SPI(t) to
+`Bounds.MIN_SPI..MAX_SPI` before dividing.
 
 Implemented in `evm/metrics.py::compute_earned_schedule`.  Surfaced on
 `actual.earnedSchedule` (additive; cost-SPI fields are unchanged).

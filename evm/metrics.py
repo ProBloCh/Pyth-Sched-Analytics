@@ -382,9 +382,12 @@ def compute_earned_schedule(nodes, status_date, hours_per_day: float = 8.0,
     spi_t_model = (clamp(spi_t, Bounds.MIN_SPI, Bounds.MAX_SPI)
                    if math.isfinite(spi_t) else 1.0)
 
-    # Time-based EAC: Lipke IEAC(t) = PD / SPI(t).  Clamped to be at
-    # least the elapsed AT (a project that's already taken AT days
-    # cannot finish in fewer than AT days).
+    # Time-based EAC: Lipke IEAC(t) = PD / SPI(t), where SPI(t) is the
+    # **clamped** SPI_t_model -- not the raw SPI_t.  This stabilises
+    # against extreme values (raw can be Inf when AT=0 with EV>0, or
+    # near zero on tiny ES) the same way compute_eac uses CPIcum_model
+    # and SPI_model.  Clamped >= AT because a project that's already
+    # taken AT days cannot finish in fewer than AT days.
     if pd_days <= 0 or spi_t_model <= 0:
         teac_days = 0.0
     else:

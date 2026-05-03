@@ -349,9 +349,14 @@ def _harmonise_makespan_units(project_ctx, nodes):
         # Bound is already in working hours and the schedule is too -- no
         # conversion needed.
         return
-    wd_count = sum(1 for d in (project_ctx.working_days or [])
-                   if isinstance(d, (int, float))
-                   and 1 <= int(d) <= 7) or 5
+    # Match _resolve_max_makespan and WorkingCalendar.build's filtering:
+    # ISO 1..7, deduplicated.  Without this, the harmonisation would
+    # use a different working-day count than the resolver did, producing
+    # an inconsistent bound (e.g. resolver used 5, harmonisation
+    # divides by 6 because of duplicates).
+    wd_count = len({int(d) for d in (project_ctx.working_days or [])
+                    if isinstance(d, (int, float))
+                    and 1 <= int(d) <= 7}) or 5
     project_ctx.max_makespan = working_hours_to_unit(
         project_ctx.max_makespan, units,
         project_ctx.hours_per_day, wd_count)
@@ -478,12 +483,15 @@ def _resolve_constraint_warnings(project_ctx, project_context_dict):
                         'project start_date; the constraint was '
                         'ignored.'),
         }]
+    # _resolve_max_makespan falls back to wd_count=5 when working_days
+    # is empty/invalid, so the only way to land here in practice is a
+    # bad hours_per_day (non-numeric, NaN, +/-Inf, or non-positive).
+    # The message points at that specifically rather than implying
+    # working_days could also be the culprit.
     return [{
         'code': 'malformed_calendar_config',
         'message': ('constraints.max_end_date and start_date are '
-                    'both valid ISO dates but the calendar '
-                    'configuration produced a non-positive working-'
-                    'hour bound (check hours_per_day and '
-                    'working_days for zero / NaN / out-of-range '
-                    'values); the constraint was ignored.'),
+                    'both valid ISO dates but calendar.hours_per_day '
+                    'is non-numeric, non-finite, or non-positive; '
+                    'the constraint was ignored.'),
     }]

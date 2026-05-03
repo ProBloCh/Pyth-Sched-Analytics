@@ -34,6 +34,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timezone
 import logging
+import math
 
 from completion.calendar import (
     WorkingCalendar, advance_working_ms, estimate_horizon_days,
@@ -157,7 +158,7 @@ def map_makespan_to_date(makespan, project_ctx, project_ctx_dict=None,
     only start_date with no calendar fields get None, signalling
     that the response should omit the calendar block.
     """
-    if makespan is None or makespan < 0:
+    if makespan is None or makespan < 0 or not math.isfinite(makespan):
         return None
     start_ms = _parse_iso_to_ms(getattr(project_ctx, 'start_date', None))
     if start_ms is None:
@@ -170,16 +171,17 @@ def map_makespan_to_date(makespan, project_ctx, project_ctx_dict=None,
 
     # Defensive parsing of hours_per_day: a non-numeric value
     # ('"eight"') would raise inside ``float()`` and crash the solver
-    # endpoint, and NaN would propagate through advance_working_ms to
-    # produce nonsense epoch ms.  Reject either case by skipping the
-    # mapping (returning None) -- consistent with the unparseable
-    # start_date path above.
+    # endpoint, and NaN/+-Inf would propagate through advance_working_ms
+    # and WorkingCalendar.build's cumulative-hours array to produce
+    # nonsense epoch ms.  Reject any of those by skipping the mapping
+    # (returning None) -- consistent with the unparseable-start_date
+    # path above.
     raw_hpd = getattr(project_ctx, 'hours_per_day', 8.0)
     try:
         hours_per_day = float(raw_hpd) if raw_hpd is not None else 8.0
     except (TypeError, ValueError):
         return None
-    if not (hours_per_day > 0) or hours_per_day != hours_per_day:  # finite + > 0
+    if not math.isfinite(hours_per_day) or hours_per_day <= 0:
         return None
 
     working_days = getattr(project_ctx, 'working_days', None) or [1, 2, 3, 4, 5]
@@ -197,7 +199,12 @@ def map_makespan_to_date(makespan, project_ctx, project_ctx_dict=None,
     units, mixed_units = _dominant_time_units(nodes)
     makespan_hours = convert_to_hours(
         float(makespan), units, hours_per_day, wd_count)
-    if not (makespan_hours is not None and makespan_hours >= 0):
+    # convert_to_hours can yield +Inf on extreme inputs (e.g. very large
+    # Duration values combined with Year units).  Building a
+    # WorkingCalendar long enough to advance Inf hours would either OOM
+    # or wrap around, and advance_working_ms would return nonsense.
+    # Guard explicitly.
+    if not (math.isfinite(makespan_hours) and makespan_hours >= 0):
         return None
 
     horizon_days = estimate_horizon_days(

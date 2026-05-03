@@ -1104,6 +1104,33 @@ class TestCalendarMapping:
         })
         assert "calendar" not in result
 
+    def test_infinite_hours_per_day_skips_mapping(self):
+        """+/-Inf hours_per_day used to slip past the NaN-only check
+        (`x != x`) and corrupt the WorkingCalendar's cumulative-hours
+        arrays.  math.isfinite catches Inf as well as NaN."""
+        nodes, links = self._chain()
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": float("inf"),
+                         "working_days": [1, 2, 3, 4, 5]},
+        })
+        assert "calendar" not in result
+
+    def test_infinite_makespan_skips_mapping(self):
+        """convert_to_hours can return Inf on extreme inputs (e.g.
+        Duration=1e308 with Year units).  The mapping must guard
+        against that rather than handing Inf to advance_working_ms."""
+        from solver.calendar_map import map_makespan_to_date
+        from solver.models import ProjectContext
+        ctx = ProjectContext(start_date="2026-01-05",
+                             hours_per_day=8.0,
+                             working_days=[1, 2, 3, 4, 5])
+        result = map_makespan_to_date(
+            float("inf"), ctx,
+            project_ctx_dict={"calendar": {"hours_per_day": 8.0}},
+            nodes=[{"ID": "1", "Duration": 1, "TimeUnits": "Hours"}])
+        assert result is None
+
     def test_duplicate_working_days_dont_inflate_calendar(self):
         """Same dedupe/clamp behaviour as _resolve_max_makespan, but
         on the calendar-mapping side: duplicates and out-of-range
