@@ -176,11 +176,13 @@ Content-Type: application/json
 | `critical_path` | `array<string>` | Always | Activity IDs on the critical path. |
 | `sensitivity` | `array<object>` | Always | Per-activity sensitivity rankings (see [Sensitivity Entry](#sensitivity-entry)). Sorted by `composite_sensitivity` descending. |
 | `analysis` | `object` | Always | Conflict/synergy analysis (see [Analysis](#analysis)). |
+| `constraints` | `object \| null` | Always | Per-constraint feasibility report at the **current baseline** (no optimisation has been performed).  `null` when no `max_makespan` / `max_budget` was supplied; otherwise see [Constraints Report](#constraints-report). |
 | `config` | `object` | Always | Echo of active config: `{disciplines, weights}`. |
 | `computation_ms` | `float` | Always | Wall-clock milliseconds. |
 | `cache_hit` | `boolean` | Always | `true` if served from cache. |
 | `stochastic` | `object` | Conditional | Monte Carlo results. **Present only when** `stochastic: true`. See [Stochastic](#stochastic). |
 | `calendar` | `object` | Conditional | Calendar mapping from `makespan` to a real end date. **Present only when** the request supplies a parseable `project_context.start_date` together with at least one calendar field. See [Calendar Mapping](#calendar-mapping). |
+| `warnings` | `array<object>` | Conditional | Non-fatal advisory messages.  Same codes as the optimize endpoint (`unresolved_max_end_date_no_start`, `unresolved_max_end_date_bad_start`, `malformed_max_end_date`, `max_end_date_before_start`). |
 
 #### `objectives` Object
 
@@ -282,7 +284,7 @@ Content-Type: application/json
 | `stochastic` | `object` | Conditional | Monte Carlo results on optimized state. **Present only when** `stochastic: true`. See [Stochastic](#stochastic). |
 | `constraints` | `object \| null` | Conditional | Per-constraint feasibility report.  Present (non-null) when at least one of `max_makespan` / resolvable `max_end_date` / `max_budget` was supplied.  See [Constraints Report](#constraints-report). |
 | `calendar` | `object` | Conditional | Calendar mapping from final `makespan` to a real end date.  Same shape as the sensitivity-endpoint `calendar`.  See [Calendar Mapping](#calendar-mapping). |
-| `warnings` | `array<object>` | Conditional | Non-fatal advisory messages.  Currently emits `unresolved_max_end_date` when an ISO `max_end_date` cannot be resolved without a `start_date`. |
+| `warnings` | `array<object>` | Conditional | Non-fatal advisory messages.  Possible codes: `unresolved_max_end_date_no_start` (ISO date supplied without a project `start_date`), `unresolved_max_end_date_bad_start` (`start_date` not parseable), `malformed_max_end_date` (neither numeric nor ISO; or numeric but non-positive), `max_end_date_before_start` (ISO end on/before ISO start). |
 
 #### Activity Change
 

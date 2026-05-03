@@ -811,7 +811,60 @@ class TestHardConstraints:
         assert result.get("constraints") is None
         warnings = result.get("warnings", [])
         codes = [w.get("code") for w in warnings]
-        assert "unresolved_max_end_date" in codes
+        # Specific warning code distinguishes this case from a malformed
+        # value or end-before-start; see _resolve_constraint_warnings.
+        assert "unresolved_max_end_date_no_start" in codes
+
+    def test_malformed_max_end_date_warns(self):
+        """Non-numeric, non-ISO max_end_date should emit a malformed
+        warning -- not the same code as the missing-start_date case,
+        which had been confusingly conflated."""
+        nodes, links = self._chain()
+        result = run_optimize(nodes, links, {"max_iterations": 20}, {}, {
+            "constraints": {"max_end_date": "next-Tuesday"},
+        })
+        codes = [w.get("code") for w in result.get("warnings", [])]
+        assert "malformed_max_end_date" in codes
+
+    def test_max_end_date_before_start_warns(self):
+        nodes, links = self._chain()
+        result = run_optimize(nodes, links, {"max_iterations": 20}, {}, {
+            "start_date": "2026-12-31",
+            "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5]},
+            "constraints": {"max_end_date": "2026-01-05"},
+        })
+        codes = [w.get("code") for w in result.get("warnings", [])]
+        assert "max_end_date_before_start" in codes
+
+    def test_sensitivity_emits_constraints_report(self):
+        """run_sensitivity should report current-baseline feasibility
+        when bounds are supplied -- useful as a pre-flight check before
+        kicking off /solver/optimize."""
+        nodes, links = self._chain()
+        # 33 baseline; bound at 25 -> violation > 0 even at baseline.
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "constraints": {"max_makespan": 25.0},
+        })
+        assert result["constraints"] is not None
+        assert result["constraints"]["max_makespan"]["bound"] == 25.0
+        assert result["constraints"]["max_makespan"]["violation"] > 0
+        assert result["constraints"]["max_makespan"]["satisfied"] is False
+
+    def test_tz_mixed_iso_does_not_raise(self):
+        """Mixing tz-aware ('2026-12-31Z') with tz-naive
+        ('2026-01-05') in the constraint resolver previously raised
+        TypeError outside the try/except.  Both forms should now
+        normalise to UTC and resolve cleanly."""
+        nodes, links = self._chain()
+        # Should not raise; max_makespan should resolve to a positive
+        # working-hour bound.
+        result = run_optimize(nodes, links, {"max_iterations": 20}, {}, {
+            "start_date": "2026-01-05",  # naive
+            "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5]},
+            "constraints": {"max_end_date": "2026-12-31T00:00:00Z"},  # aware
+        })
+        assert result["constraints"] is not None
+        assert result["constraints"]["max_makespan"]["bound"] > 0
 
     def test_invalid_max_budget_silently_ignored(self):
         nodes, links = self._chain()

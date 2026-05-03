@@ -378,6 +378,31 @@ class TestEarnedSchedule:
         assert 'SPI_t' in es
         assert 'TEAC_date' in es
 
+    def test_vectorised_pv_curve_handles_milestones(self):
+        """Activities with finish == start (milestones) and degenerate
+        finish < start data must match the scalar reference, which
+        gives full credit when sd_time >= f.  The vectorised path's
+        step branch handles this; without it, milestones contributed 0
+        at the milestone date instead of planned_hrs.
+        """
+        from evm.metrics import _vectorised_pv_curve
+        from datetime import datetime, timezone
+        # Milestone activity: finish == start.  Use Duration=1 day so
+        # it isn't filtered out by the "Duration in (0, '0')" guard.
+        nodes = [{
+            'ID': 'M', 'Duration': 1, 'TimeUnits': 'days',
+            'Start': '2025-01-15', 'Finish': '2025-01-15',
+        }]
+        dates = [
+            datetime(2025, 1, 14, tzinfo=timezone.utc),  # before
+            datetime(2025, 1, 15, tzinfo=timezone.utc),  # at boundary
+            datetime(2025, 1, 16, tzinfo=timezone.utc),  # after
+        ]
+        pv = _vectorised_pv_curve(nodes, dates, 8.0, 5.0)
+        assert pv[0] == 0.0           # before milestone -> 0
+        assert pv[1] == pytest.approx(8.0)  # at milestone -> full credit
+        assert pv[2] == pytest.approx(8.0)  # after -> still full credit
+
     def test_vectorised_pv_curve_matches_scalar(self):
         """The vectorised PV curve must produce numerically identical
         results to the scalar compute_bcws_hours called per date.

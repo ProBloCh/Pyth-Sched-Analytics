@@ -81,11 +81,16 @@ def _dominant_time_units(nodes):
     'Days' activity in a project of 99 untagged activities would
     incorrectly dominate the conversion.
 
-    Comparison is case-insensitive (mode counts use the normalised
-    lower-cased form) so 'Hours' / 'hours' / 'h' don't falsely
-    trigger ``mixed_time_units``.  ``convert_to_hours`` handles the
-    full alias table downstream, so any of those resolves to the
-    same hour count.
+    Comparison is **case-insensitive** (mode counts use the lower-cased
+    form), so 'Hours' / 'hours' / 'HOURS' coalesce and don't falsely
+    trigger ``mixed_time_units``.  Cross-alias mixing
+    (e.g. 'Hours' vs 'h' vs 'hr') is **not** coalesced -- the keys
+    stay distinct and ``mixed_time_units`` fires.  This is intentional:
+    alias-aware coalescing would require probing
+    ``evm.helpers.convert_to_hours`` per pair and is out of scope
+    here.  ``convert_to_hours`` itself handles the full alias table
+    downstream, so the conversion result is still correct -- only the
+    flag is conservative.
     """
     if not nodes:
         return _DEFAULT_TIME_UNITS, False

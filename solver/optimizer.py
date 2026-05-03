@@ -197,7 +197,7 @@ def optimize(dag_state, params, project_ctx, config, deadline=None,
 
     constraints_report = None
     if constraints_active:
-        constraints_report = _constraints_report(
+        constraints_report = build_constraints_report(
             dag_state, params, final, max_makespan, max_budget)
 
     return {
@@ -297,8 +297,15 @@ def _constraint_penalty(dag_state, params, project_ctx, objs,
     return pen, dur_g, res_g
 
 
-def _constraints_report(dag_state, params, final_objs, max_makespan, max_budget):
-    """Per-constraint feasibility status for the response."""
+def build_constraints_report(dag_state, params, final_objs,
+                             max_makespan, max_budget):
+    """Per-constraint feasibility status for the response.
+
+    Reused by both /solver/optimize (which reports the post-
+    optimisation state) and /solver/sensitivity (which reports the
+    current-baseline state without applying any penalty -- useful as a
+    pre-flight feasibility check before kicking off the optimiser).
+    """
     out = {}
     if max_makespan is not None:
         violation = max(0.0, dag_state.makespan - max_makespan)

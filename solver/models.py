@@ -183,11 +183,19 @@ def _resolve_max_makespan(max_makespan_raw, max_end_date_raw, start_date_raw,
     if max_end_date_raw is None or start_date_raw is None:
         return None
     try:
-        from datetime import datetime
+        from datetime import datetime, timezone
         end = datetime.fromisoformat(
             str(max_end_date_raw).replace('Z', '+00:00'))
         start = datetime.fromisoformat(
             str(start_date_raw).replace('Z', '+00:00'))
+        # Normalise to UTC: naive -> assume UTC, aware -> convert.
+        # Without this, mixing tz-aware ('2026-12-31Z') with naive
+        # ('2026-01-05') would raise outside the try/except via
+        # `end - start`.  Matches evm.helpers.safe_date convention.
+        end = (end if end.tzinfo is not None
+               else end.replace(tzinfo=timezone.utc))
+        start = (start if start.tzinfo is not None
+                 else start.replace(tzinfo=timezone.utc))
     except (TypeError, ValueError):
         return None
     cal_days = (end - start).total_seconds() / 86400.0

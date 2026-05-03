@@ -14,7 +14,7 @@ from .dag import build_dag, get_critical_path_indices
 from .objectives import compute_objectives
 from .adjoints import compute_gradients
 from .stochastic import run_ensemble
-from .optimizer import optimize
+from .optimizer import optimize, build_constraints_report
 from .pareto import run_pareto as _run_pareto
 from .analysis import compute_analysis
 from .calendar_map import map_makespan_to_date
@@ -68,12 +68,26 @@ def run_sensitivity(nodes, links, solver_config_dict,
         dag_state.makespan, project_ctx,
         project_ctx_dict=project_context_dict, nodes=nodes)
 
+    # Sensitivity is a single-pass analysis (no optimisation), so the
+    # constraints report describes the current-baseline feasibility:
+    # how far the unmodified schedule sits from the supplied bounds.
+    # Useful as a pre-flight check before kicking off /solver/optimize.
+    constraints_report = None
+    if (project_ctx.max_makespan is not None
+            or project_ctx.max_budget is not None):
+        constraints_report = build_constraints_report(
+            dag_state, params, objectives,
+            project_ctx.max_makespan, project_ctx.max_budget)
+    warnings = _resolve_constraint_warnings(
+        project_ctx, project_context_dict)
+
     result = {
         'objectives':     {d: float(v) for d, v in objectives.items()},
         'makespan':       dag_state.makespan,
         'critical_path':  cp_ids,
         'sensitivity':    sensitivity_table,
         'analysis':       analysis,
+        'constraints':    constraints_report,
         'config': {
             'disciplines': config.disciplines,
             'weights':     config.weights,
@@ -82,6 +96,8 @@ def run_sensitivity(nodes, links, solver_config_dict,
     }
     if calendar_mapping is not None:
         result['calendar'] = calendar_mapping
+    if warnings:
+        result['warnings'] = warnings
 
     if stochastic:
         result['stochastic'] = {
@@ -171,20 +187,16 @@ def run_optimize(nodes, links, solver_config_dict,
         result['calendar'] = calendar_mapping
 
     # Surface a warning when callers supplied a constraint that we
-    # couldn't resolve to a numeric bound (e.g. ISO max_end_date with
-    # no project start_date) so they don't silently get an
-    # unconstrained run.
-    if (project_ctx.max_end_date is not None
-            and project_ctx.max_makespan is None):
-        result.setdefault('warnings', []).append({
-            'code':    'unresolved_max_end_date',
-            'message': ('max_end_date supplied as a non-numeric value '
-                        'but no project start_date was given; the '
-                        'constraint was ignored.  Pass either '
-                        'constraints.max_makespan (numeric) or both '
-                        'constraints.max_end_date + start_date as ISO '
-                        'dates.'),
-        })
+    # couldn't resolve to a numeric bound so they don't silently get
+    # an unconstrained run.  The helper inspects the raw input to
+    # tailor the warning code/message to the actual failure mode --
+    # e.g. ISO date with no start_date, malformed string, end-before-
+    # start -- rather than emitting a single generic warning that
+    # implies the wrong cause.
+    optimize_warnings = _resolve_constraint_warnings(
+        project_ctx, project_context_dict)
+    if optimize_warnings:
+        result.setdefault('warnings', []).extend(optimize_warnings)
 
     if stochastic:
         result['stochastic'] = {
@@ -296,3 +308,102 @@ def _empty_optimize(disciplines, t0):
         'config': {'disciplines': disciplines, 'weights': {}},
         'computation_ms': round((time.time() - t0) * 1000, 1),
     }
+
+
+def _looks_like_iso_date(value):
+    """Heuristic: caller intended ISO when the value is non-numeric and
+    parses as a datetime."""
+    if value is None:
+        return False
+    try:
+        float(value)
+        return False  # numeric -> not ISO intent
+    except (TypeError, ValueError):
+        pass
+    try:
+        from datetime import datetime
+        datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _resolve_constraint_warnings(project_ctx, project_context_dict):
+    """Tailor warnings to the *actual* failure mode of constraint
+    resolution rather than emitting a single generic message.
+
+    Cases:
+      - ISO max_end_date supplied AND start_date missing:
+            -> ``unresolved_max_end_date_no_start``
+      - ISO max_end_date supplied AND start_date present but unparseable:
+            -> ``unresolved_max_end_date_bad_start``
+      - max_end_date supplied but neither numeric nor ISO-parseable:
+            -> ``malformed_max_end_date``
+      - Both ISO but end <= start:
+            -> ``max_end_date_before_start``
+      - Anything else (max_makespan resolved cleanly): no warning.
+    """
+    # Only emit warnings when max_makespan failed to resolve.  If
+    # resolution succeeded, the caller has the bound they wanted.
+    if project_ctx.max_makespan is not None:
+        return []
+    raw = project_ctx.max_end_date
+    if raw is None:
+        return []
+
+    cdict = project_context_dict or {}
+    constraints = cdict.get('constraints') or {}
+    raw = constraints.get('max_end_date', raw)
+    start_raw = (cdict.get('start_date')
+                 or (cdict.get('calendar') or {}).get('start_date')
+                 or (cdict.get('project') or {}).get('start_date'))
+
+    iso_intent = _looks_like_iso_date(raw)
+
+    # max_end_date is non-numeric, non-ISO -> caller passed a malformed value.
+    if not iso_intent:
+        try:
+            float(raw)
+            # Numeric but non-positive (filtered earlier as None).
+            return [{
+                'code': 'malformed_max_end_date',
+                'message': ('constraints.max_end_date is numeric but '
+                            'non-positive; the constraint was ignored.'),
+            }]
+        except (TypeError, ValueError):
+            return [{
+                'code': 'malformed_max_end_date',
+                'message': ('constraints.max_end_date is neither numeric '
+                            'nor a parseable ISO date; the constraint was '
+                            'ignored.  Use a positive number (in solver time '
+                            'units) or an ISO 8601 date string with a '
+                            'project start_date.'),
+            }]
+
+    # ISO max_end_date but no start_date -> can't compute the difference.
+    if start_raw is None:
+        return [{
+            'code': 'unresolved_max_end_date_no_start',
+            'message': ('constraints.max_end_date is an ISO date but no '
+                        'project start_date was supplied; the constraint '
+                        'was ignored.  Pass either '
+                        'constraints.max_makespan (numeric) or both '
+                        'constraints.max_end_date and start_date as ISO '
+                        'dates.'),
+        }]
+
+    # Start_date supplied but unparseable.
+    if not _looks_like_iso_date(start_raw):
+        return [{
+            'code': 'unresolved_max_end_date_bad_start',
+            'message': ('constraints.max_end_date is an ISO date but '
+                        'project start_date is not parseable as ISO; '
+                        'the constraint was ignored.'),
+        }]
+
+    # Both ISO but the dates result in a non-positive span.
+    return [{
+        'code': 'max_end_date_before_start',
+        'message': ('constraints.max_end_date is on or before project '
+                    'start_date; the constraint was ignored.'),
+    }]

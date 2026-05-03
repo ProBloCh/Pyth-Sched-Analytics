@@ -208,9 +208,18 @@ def _vectorised_pv_curve(nodes, dates, hours_per_day, working_days_per_week):
 
     Each activity contributes a linearly-ramped slab between its Start
     and Finish dates: ``planned_hrs * clip((d - start) / (finish - start),
-    0, 1)``.  We stack activity arrays once, broadcast against the
-    (D,) date grid, and reduce along the activity axis -- replacing the
-    O(N*D) Python loop the scalar version did when called per date.
+    0, 1)``.  Degenerate spans (``finish <= start``, including
+    milestones with ``finish == start``) are handled as a step
+    function -- the scalar reference ``compute_bcws_hours`` gives full
+    credit when ``sd_time >= f``, and the vectorised path matches by
+    using ``(d >= f).astype(float)`` for those activities.
+
+    We stack activity arrays once, broadcast against the (D,) date
+    grid, and reduce along the activity axis -- replacing the O(N*D)
+    Python loop the scalar version did when called per date.  Memory
+    is **O(N*D)** during the broadcast (D is capped to 500 by
+    ``_significant_evm_dates``, keeping the array bounded in
+    practice), with output O(D).
 
     Returns an (D,) numpy array of cumulative hours, aligned with the
     input ``dates`` list.
@@ -240,14 +249,22 @@ def _vectorised_pv_curve(nodes, dates, hours_per_day, working_days_per_week):
     s_arr = np.asarray(starts_ms, dtype=np.float64)         # (N,)
     f_arr = np.asarray(finishes_ms, dtype=np.float64)       # (N,)
     p_arr = np.asarray(planned_hrs, dtype=np.float64)       # (N,)
-    span = np.where(f_arr > s_arr, f_arr - s_arr, 1.0)      # (N,) avoid /0
     d_arr = np.array(
         [d.timestamp() * 1000.0 for d in dates], dtype=np.float64)  # (D,)
 
-    # Broadcast (N, 1) - (1, D) -> (N, D), then clip to [0, 1] and scale
-    # by the per-activity planned hours.  Sum along the activity axis.
-    frac = (d_arr[None, :] - s_arr[:, None]) / span[:, None]
-    np.clip(frac, 0.0, 1.0, out=frac)
+    # Linear ramp for activities with positive duration.  span_safe
+    # avoids /0 for milestones; the result is overwritten where
+    # span <= 0 below.
+    span = f_arr - s_arr
+    span_safe = np.where(span > 0, span, 1.0)
+    linear = np.clip(
+        (d_arr[None, :] - s_arr[:, None]) / span_safe[:, None], 0.0, 1.0)
+
+    # Step function for finish <= start (milestones and degenerate
+    # f == s data): match the scalar `sd_time >= f` semantic.
+    step = (d_arr[None, :] >= f_arr[:, None]).astype(np.float64)
+    frac = np.where((span > 0)[:, None], linear, step)
+
     pv = (frac * p_arr[:, None]).sum(axis=0)
     return pv
 
@@ -306,9 +323,12 @@ def compute_earned_schedule(nodes, status_date, hours_per_day: float = 8.0,
         nodes, hours_per_day, working_days_per_week)
 
     # Sample cumulative PV at every breakpoint via a single vectorised
-    # numpy pass -- O(N + D) memory, ~one sweep through the activity
-    # array.  Replaces the previous O(N*D) Python loop that called
-    # compute_bcws_hours per date and hit a wall on 10K-activity projects.
+    # numpy pass.  The broadcast materialises an (N, D) frac array
+    # (so memory is O(N*D)), but D is capped to _ES_MAX_DATES = 500
+    # by _significant_evm_dates so the array stays bounded; for
+    # N=10K that's an 80 MB peak, well within the per-request budget.
+    # Replaces the previous loop that called compute_bcws_hours per
+    # date in pure Python and hit a wall on 10K-activity projects.
     pv_arr = _vectorised_pv_curve(
         nodes, significant, hours_per_day, working_days_per_week)
     pv_curve = list(zip(significant, pv_arr.tolist()))
