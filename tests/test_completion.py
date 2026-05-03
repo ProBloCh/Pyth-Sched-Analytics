@@ -1913,9 +1913,11 @@ class TestStochasticTEAC:
         assert r['teac']['deterministic']['teac_date'] == r['expected_finish']
 
     def test_spi_t_model_clamped_to_bounds(self):
-        # Construct a heavy-overrun case: PD=35d, but force a long
+        # Construct a heavy-overrun case: PD~5d, but force a long
         # ExpectedStart so the deterministic finish is far past status.
-        # SPI(t) = PD / TEAC will become very small -> clamped to 0.1.
+        # SPI(t) = PD / TEAC will become very small -> clamped to
+        # evm.helpers.Bounds.MIN_SPI.
+        from evm.helpers import Bounds
         nodes = [
             {'ID': 'A', 'Duration': 5, 'TimeUnits': 'days',
              'Start': '2025-01-01T00:00:00Z',
@@ -1926,7 +1928,36 @@ class TestStochasticTEAC:
                               config={'iterations': 50,
                                       'enable_risk': False})
         spi_model = r['teac']['percentiles']['p50']['spi_t_model']
-        assert 0.1 <= spi_model <= 5.0
+        assert Bounds.MIN_SPI <= spi_model <= Bounds.MAX_SPI
+
+    def test_spi_clamp_uses_evm_bounds(self):
+        """Imported _TEAC_MIN_SPI / _TEAC_MAX_SPI must equal evm Bounds
+        so the stochastic and deterministic TEAC SPI(t)_model values
+        clamp identically.  Catches a future divergence if either side
+        moves.
+        """
+        from completion.monte_carlo import _TEAC_MIN_SPI, _TEAC_MAX_SPI
+        from evm.helpers import Bounds
+        assert _TEAC_MIN_SPI == Bounds.MIN_SPI
+        assert _TEAC_MAX_SPI == Bounds.MAX_SPI
+
+    def test_deterministic_carries_source_and_note(self):
+        """The deterministic block must label itself as the MC CPM
+        midpoint and document the divergence from /evm/analyze.  An
+        earlier draft claimed equivalence, which is wrong: EVM uses
+        max(AT, PD/SPI_t_model) on the EV/PV intersection while the MC
+        uses a CPM forward pass through remaining work.
+        """
+        nodes, links = self._baseline_nodes()
+        r = run_completion_mc(nodes, links, '2025-01-01T00:00:00Z',
+                              config={'iterations': 50,
+                                      'enable_risk': False})
+        det = r['teac']['deterministic']
+        assert det['source'] == 'mc_no_risk_cpm'
+        assert 'note' in det
+        # The note should call out the EVM divergence so consumers
+        # don't silently treat it as an equivalent value.
+        assert '/evm/analyze' in det['note']
 
     def test_endpoint_returns_teac_block(self, client):
         nodes, links = self._baseline_nodes()

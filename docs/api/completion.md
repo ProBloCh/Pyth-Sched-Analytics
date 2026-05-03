@@ -152,14 +152,16 @@ activity.
               "spi_t": 0.783,  "spi_t_model": 0.783,  "impact_days": 24.0},
       "p95": {"...": "..."}
     },
-    "deterministic": {              // Lipke TEAC anchored at expected_finish
-                                    //   (no risk multipliers).  Mirrors what
-                                    //   /evm/analyze.actual.earnedSchedule
-                                    //   produces in the deterministic case.
+    "deterministic": {              // No-risk-multiplier CPM midpoint of
+                                    //   the MC band.  NOT the same number
+                                    //   as /evm/analyze.actual.earnedSchedule
+                                    //   .TEAC_date -- see `note` field.
       "teac_days":   100.0,
       "teac_date":   "2025-03-11T00:00:00+00:00",
       "spi_t":       0.900,
-      "spi_t_model": 0.900
+      "spi_t_model": 0.900,
+      "source":      "mc_no_risk_cpm",
+      "note":        "..."
     },
     "flags": {                      // Optional; absent fields are false.
       "no_baseline":         false, // True when no Start/Finish anywhere.
@@ -187,7 +189,10 @@ The `teac` block recasts the per-percentile finish dates as Lipke
 ```
 TEAC_p_days   = (finish_p_date - projectStartDate) calendar days
 SPI(t)_p      = plannedDurationDays / TEAC_p_days
-                  (clamped to evm Bounds [0.1, 5.0] for spi_t_model)
+                  (spi_t_model clamps to evm Bounds.MIN_SPI..MAX_SPI;
+                   imported from evm.helpers.Bounds, currently 0.05..10.0,
+                   so the clamp matches /evm/analyze atomically if the
+                   bounds ever change)
 impact_days_p = (finish_p_date - expected_finish) days
 ```
 
@@ -198,6 +203,19 @@ Reuses the same sorted MC samples that drive `p20_finish` /
 **(b)** surfacing the band as Lipke Earned Schedule, which lets a
 consumer plot it next to the deterministic
 `/evm/analyze.actual.earnedSchedule.TEAC_date`.
+
+##### `deterministic` is NOT the same as `/evm/analyze`'s TEAC
+
+`response.teac.deterministic.teac_date` is the **MC remaining-work
+midpoint**: the CPM forward pass with all risk multipliers set to 1.
+That is not the same number as `/evm/analyze.actual.earnedSchedule.
+TEAC_date`, which is `max(AT, PD / SPI_t_model)` derived from the
+cost-side EV vs PV intersection.  The two agree when no progress has
+been recorded and `ExpectedStart == Start`, but diverge for in-progress,
+out-of-sequence, or status-after-completion projects because they are
+different computations.  `/evm/analyze` remains the authoritative
+deterministic TEAC; this block's deterministic field exists so the
+percentile band has a natural midpoint readable in one response.
 
 This closes the loop on the codebase's research identity: instead of
 a single deterministic SPI(t) clamped through evm Bounds, the customer

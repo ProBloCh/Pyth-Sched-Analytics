@@ -889,11 +889,16 @@ def _maybe_build_calendar(nodes, dag_state, id_to_idx, status_ms,
 # implied SPI(t) so consumers reading evmMetrics.actual.earnedSchedule
 # can see the uncertainty band around its single deterministic SPI(t).
 
-# Mirrors evm.helpers.Bounds.MIN_SPI / MAX_SPI.  Inlined to avoid an
-# evm import for two constants -- keeps completion's dependency surface
-# at solver only.  If Bounds ever changes, update both sites.
-_TEAC_MIN_SPI = 0.1
-_TEAC_MAX_SPI = 5.0
+# Mirror evm.helpers.Bounds.MIN_SPI / MAX_SPI so the clamped SPI(t)_model
+# emitted here matches what /evm/analyze emits for the same SPI(t).  An
+# earlier draft hardcoded 0.1 / 5.0, which silently diverged once
+# Bounds was widened to 0.05 / 10.0 -- making /evm/analyze.actual.
+# earnedSchedule.SPI_t_model and response.teac.percentiles.*.spi_t_model
+# disagree on the same project.  Importing from the canonical source
+# means a future Bounds change updates both endpoints atomically.
+from evm.helpers import Bounds as _EVM_BOUNDS
+_TEAC_MIN_SPI = _EVM_BOUNDS.MIN_SPI
+_TEAC_MAX_SPI = _EVM_BOUNDS.MAX_SPI
 
 
 def _baseline_project_start_ms(nodes, fallback_ms):
@@ -1032,11 +1037,19 @@ def _compose_teac_block(nodes, status_ms, expected_finish_ms,
                                 expected_finish_ms, pd_days),
     }
 
-    # Deterministic baseline: TEAC anchored at expected_finish (no risk
-    # multipliers).  This is what evm/metrics.compute_earned_schedule
-    # would produce if EV/PV both came from the deterministic forward
-    # pass; surfacing it here lets a consumer see the deterministic
-    # midpoint relative to the stochastic band without a second call.
+    # MC deterministic midpoint: the no-risk-multiplier CPM forward pass
+    # finish, in TEAC form.  This is NOT the same number as
+    # /evm/analyze.actual.earnedSchedule.TEAC_date.  EVM's TEAC is
+    # `max(AT, PD / SPI_t_model)` where SPI(t) comes from the EV/PV
+    # intersection (cost-side Earned Schedule).  This block's deterministic
+    # value comes from a CPM forward pass through the remaining-work DAG.
+    # The two agree when no progress has been recorded and ExpectedStart
+    # equals Start, but diverge under in-progress / out-of-sequence /
+    # status-after-completion conditions because they are different
+    # computations.  Surfacing it here gives consumers the natural
+    # midpoint of the MC band so the percentile spread can be read in
+    # one response; the EVM endpoint remains the authoritative deterministic
+    # ES TEAC.
     det_teac_days = max(0.0, (expected_finish_ms - project_start_ms)
                         / _MS_PER_DAY)
     det_spi_t, det_spi_t_model = _spi_t_from_pd_and_teac(
@@ -1055,16 +1068,27 @@ def _compose_teac_block(nodes, status_ms, expected_finish_ms,
             'spi_t':       (None if not np.isfinite(det_spi_t)
                             else round(det_spi_t, 4)),
             'spi_t_model': round(det_spi_t_model, 4),
+            'source':      'mc_no_risk_cpm',
+            'note':        ('No-risk-multiplier CPM midpoint of the MC '
+                            'band.  Differs from /evm/analyze.actual.'
+                            'earnedSchedule.TEAC_date, which uses '
+                            'max(AT, PD / SPI_t_model) on the cost-side '
+                            'EV/PV intersection.'),
         },
         'flags':                flags,
         'method':               'lipke_2003_stochastic',
         'crossReference': {
             'evm_endpoint':  '/evm/analyze',
             'evm_field':     'actual.earnedSchedule',
-            'note':          ('Deterministic Lipke ES/SPI(t)/TEAC live on '
-                              '/evm/analyze; this block provides the '
-                              'five-tier risk-model uncertainty band '
-                              'around them.'),
+            'note':          ('Authoritative deterministic Lipke ES / '
+                              'SPI(t) / TEAC live on /evm/analyze (cost-'
+                              'side EV vs PV intersection).  This block '
+                              'provides the five-tier risk-model '
+                              'uncertainty band around the MC '
+                              'remaining-work midpoint, which uses the '
+                              'CPM forward pass and may diverge from '
+                              'the EVM TEAC under in-progress / out-of-'
+                              'sequence / status-after-completion data.'),
         },
     }
 

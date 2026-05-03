@@ -208,13 +208,24 @@ activity and each date:
 >
 > For uncertainty bands on finish dates, call
 > `/completion/monte-carlo` and read **`response.teac`** -- which
-> composes Earned Schedule with the same five-tier risk model
-> (triangular → normal → Birnbaum-Saunders → Pareto) used elsewhere
-> in the codebase, and returns `TEAC_p10` / `TEAC_p20` / `TEAC_p50`
-> / `TEAC_p80` / `TEAC_p95` plus the implied `SPI(t)` per percentile.
-> The deterministic `TEAC_date` here is also surfaced as
-> `response.teac.deterministic.teac_date` for an apples-to-apples
-> comparison.  See `docs/api/completion.md` for the full block schema.
+> composes the same five-tier risk model (triangular → normal →
+> Birnbaum-Saunders → Pareto) used elsewhere in the codebase, and
+> returns `TEAC_p10` / `TEAC_p20` / `TEAC_p50` / `TEAC_p80` /
+> `TEAC_p95` plus the implied `SPI(t)` per percentile.
+>
+> Note: the `response.teac.deterministic` companion in that endpoint
+> is the **MC remaining-work CPM midpoint** (no risk multipliers), not
+> the same number as the deterministic `TEAC_date` returned here.
+> `/evm/analyze` computes `max(AT, PD / SPI_t_model)` from the cost-
+> side EV vs PV intersection; `/completion/monte-carlo` runs a CPM
+> forward pass through the remaining-work DAG.  The two agree when no
+> progress has been recorded and `ExpectedStart == Start`, but diverge
+> under in-progress / out-of-sequence / status-after-completion data
+> because they are different computations.  `/evm/analyze` remains
+> the authoritative deterministic TEAC; the MC's deterministic field
+> exists so the percentile band has a natural midpoint readable in
+> one response.  See `docs/api/completion.md` for the full block
+> schema.
 
 The cost-based `SPI = EV / PV` collapses to 1.0 at completion regardless
 of how late the project actually finished, because once all work is
