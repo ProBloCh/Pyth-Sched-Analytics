@@ -429,6 +429,40 @@ class TestEarnedSchedule:
         assert 'SPI_t' in es
         assert 'TEAC_date' in es
 
+    def test_es_ev_pv_units_consistent_camelcase(self):
+        """compute_earned_schedule must use matching TimeUnits keys for
+        EV (compute_bcwp_hours) and PV (_vectorised_pv_curve).  Pre-fix
+        compute_bcwp_hours read only TimeUnits (PascalCase), while the
+        round-16 PV fix added timeUnits (camelCase) fallback -- so a
+        camelCase-tagged schedule got EV in Hours and PV in Days,
+        producing a nonsensical ES.
+
+        Two equivalent schedules (one tagged with TimeUnits, one with
+        timeUnits) must produce the same SPI_t.
+        """
+        nodes_pascal = [
+            {'ID': '1', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '2025-01-01', 'Finish': '2025-01-11',
+             'PercentComplete': 100},
+            {'ID': '2', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '2025-01-12', 'Finish': '2025-01-22',
+             'PercentComplete': 50},
+        ]
+        nodes_camel = [
+            {'ID': '1', 'Duration': 10, 'timeUnits': 'days',
+             'Start': '2025-01-01', 'Finish': '2025-01-11',
+             'PercentComplete': 100},
+            {'ID': '2', 'Duration': 10, 'timeUnits': 'days',
+             'Start': '2025-01-12', 'Finish': '2025-01-22',
+             'PercentComplete': 50},
+        ]
+        r_pascal = compute_earned_schedule(nodes_pascal, '2025-01-17')
+        r_camel = compute_earned_schedule(nodes_camel, '2025-01-17')
+        assert r_pascal['SPI_t_model'] == pytest.approx(
+            r_camel['SPI_t_model'], rel=1e-9)
+        assert r_pascal['earnedScheduleDays'] == pytest.approx(
+            r_camel['earnedScheduleDays'], rel=1e-9)
+
     def test_vectorised_pv_curve_handles_camelcase_timeunits(self):
         """Mirror the dual-key fallback used by compute_duration_weighted:
         a node carrying ``timeUnits`` (camelCase) must convert with the

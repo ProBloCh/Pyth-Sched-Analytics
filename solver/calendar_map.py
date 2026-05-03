@@ -281,7 +281,17 @@ def map_makespan_to_date(makespan, project_ctx, project_ctx_dict=None,
         start_intraday = 0.0
     target_hours = (float(cal.work_hours_before[start_day_idx])
                     + start_intraday + float(makespan_hours))
-    horizon_exhausted = target_hours > float(cal.work_hours_before[-1])
+    # Use >= here, not >: when target_hours lands exactly on the
+    # last cumulative boundary, advance_working_ms's
+    # ``searchsorted(..., side='right') - 1`` can yield end_idx == K
+    # which then gets clipped to K-1.  The end date is then
+    # boundary-limited (and may be the start of the last day rather
+    # than the end of work) rather than reflecting the true finish.
+    # Treating the equality case as exhausted keeps the flag
+    # conservative -- a small false-positive risk on exact-fit
+    # makespans that actually landed correctly is much better than
+    # a silent miss when a non-working last day shifts the result.
+    horizon_exhausted = target_hours >= float(cal.work_hours_before[-1])
 
     end_ms = float(advance_working_ms(start_ms, float(makespan_hours), cal))
     end_dt = datetime.fromtimestamp(end_ms / 1000.0, tz=timezone.utc)

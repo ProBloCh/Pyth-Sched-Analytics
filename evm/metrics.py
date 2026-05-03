@@ -620,6 +620,14 @@ def compute_bcwp_hours(nodes, hours_per_day: float = 8.0,
     """Port of calculateBCWP_Hours (EVM.js 1053-1062).
 
     Simple daily snapshot: EV = sum(BAC_i * pct_i).
+
+    Reads TimeUnits with the same dual-key fallback that
+    ``_vectorised_pv_curve`` (PV side) and ``compute_duration_weighted``
+    use, so EV and PV compute in matching units when the input mixes
+    PascalCase / camelCase ``TimeUnits`` keys.  Without this,
+    compute_earned_schedule could end up with EV-in-Hours and
+    PV-in-Days for a camelCase-tagged schedule, producing a
+    nonsensical ES interpolation.
     """
     s = 0.0
     for n in nodes or []:
@@ -627,8 +635,10 @@ def compute_bcwp_hours(nodes, hours_per_day: float = 8.0,
         if dur_raw in (0, '0'):
             continue
         pct = normalize_percent_complete(n.get('PercentComplete'))
+        time_units = (n.get('TimeUnits')
+                      or n.get('timeUnits') or 'Hours')
         s += convert_to_hours(
-            dur_raw, n.get('TimeUnits', 'Hours'),
+            dur_raw, time_units,
             hours_per_day, working_days_per_week) * pct
     return s
 
