@@ -135,10 +135,75 @@ activity.
                                     //   rounded to even count).
   "seed":           42,
   "config":         { "...": "..." },  // Echo of resolved config.
+  "teac": {                         // Stochastic Earned Schedule (Lipke 2003).
+    "projectStartDate":    "2024-12-01T00:00:00+00:00",   // min(node.Start)
+    "projectFinishDate":   "2025-03-01T00:00:00+00:00",   // max(node.Finish)
+    "plannedDurationDays": 90.0,    // PD = baseline finish - baseline start.
+    "statusDate":          "2025-01-15T00:00:00+00:00",
+    "actualTimeDays":      45.0,    // AT = max(0, status - project_start).
+    "percentiles": {                // TEAC band per percentile, anchored at
+                                    //   projectStartDate (NOT status_date).
+      "p10": {"label": "P10",  "teac_days": 92.5,  "teac_date": "...",
+              "spi_t": 0.973,  "spi_t_model": 0.973,  "impact_days": -3.5},
+      "p20": {"...": "..."},
+      "p50": {"label": "P50",  "teac_days": 102.3, "teac_date": "...",
+              "spi_t": 0.880,  "spi_t_model": 0.880,  "impact_days": 11.3},
+      "p80": {"label": "P80",  "teac_days": 115.0, "teac_date": "...",
+              "spi_t": 0.783,  "spi_t_model": 0.783,  "impact_days": 24.0},
+      "p95": {"...": "..."}
+    },
+    "deterministic": {              // Lipke TEAC anchored at expected_finish
+                                    //   (no risk multipliers).  Mirrors what
+                                    //   /evm/analyze.actual.earnedSchedule
+                                    //   produces in the deterministic case.
+      "teac_days":   100.0,
+      "teac_date":   "2025-03-11T00:00:00+00:00",
+      "spi_t":       0.900,
+      "spi_t_model": 0.900
+    },
+    "flags": {                      // Optional; absent fields are false.
+      "no_baseline":         false, // True when no Start/Finish anywhere.
+      "status_before_start": false, // True when status < project_start.
+      "all_completed":       false  // True when nothing is in MC scope.
+    },
+    "method": "lipke_2003_stochastic",
+    "crossReference": {             // Pointer back to the deterministic
+                                    //   Lipke TEAC on the EVM endpoint.
+      "evm_endpoint": "/evm/analyze",
+      "evm_field":    "actual.earnedSchedule",
+      "note":         "..."
+    }
+  },
   "computation_ms": 180.3,
   "cache_hit":      false
 }
 ```
+
+#### Stochastic TEAC composition
+
+The `teac` block recasts the per-percentile finish dates as Lipke
+(2003) time-based Estimate at Completion values:
+
+```
+TEAC_p_days   = (finish_p_date - projectStartDate) calendar days
+SPI(t)_p      = plannedDurationDays / TEAC_p_days
+                  (clamped to evm Bounds [0.1, 5.0] for spi_t_model)
+impact_days_p = (finish_p_date - expected_finish) days
+```
+
+Reuses the same sorted MC samples that drive `p20_finish` /
+`p50_finish` / `p80_finish` — no second pass.  The contribution is
+**(a)** anchoring the percentiles at a baseline `projectStartDate`
+(so duration is meaningful and an implied SPI(t) is computable) and
+**(b)** surfacing the band as Lipke Earned Schedule, which lets a
+consumer plot it next to the deterministic
+`/evm/analyze.actual.earnedSchedule.TEAC_date`.
+
+This closes the loop on the codebase's research identity: instead of
+a single deterministic SPI(t) clamped through evm Bounds, the customer
+sees the five-tier-risk-model uncertainty band around it.  All the
+existing fields (`p20_finish`, `expected_finish`, `spread_days`, ...)
+stay byte-identical so the contract is purely additive.
 
 ### Response (400)
 

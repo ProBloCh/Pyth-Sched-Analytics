@@ -129,8 +129,13 @@ so no key conversion is required on the JS side.
       "TEAC_date":           "2025-02-15",    // project_start + TEAC_days
       "projectStartDate":    "2025-01-01",
       "projectFinishDate":   "2025-02-02",
-      "flags":               {}               // not_started, completed,
+      "flags":               {},              // not_started, completed,
                                               //   no_baseline, status_before_start
+      "uncertaintyHint": {                    // Pointer to stochastic TEAC bands
+        "endpoint": "/completion/monte-carlo",
+        "field":    "teac",                   // -> response.teac.percentiles.{p10,p20,p50,p80,p95}
+        "note":     "TEAC_date here is deterministic; ..."
+      }
     },
     "sectorScheduleOverrun":    0.25,        // From project.sector lookup
     "scheduleMultiplier":       1.0,
@@ -199,13 +204,17 @@ activity and each date:
 > **deterministic point estimates**.  This sits awkwardly in a system
 > whose research foundation (Natarajan PMJ 2022, Flyvbjerg JMIS 2022)
 > emphasises fat-tailed overruns -- a single `TEAC_date` value should
-> not be read as a forecast.  For uncertainty bands on finish dates
-> use `/completion/monte-carlo`'s P10/P50/P80 percentiles, which
-> compose the same five-tier risk model
+> not be read as a forecast.
+>
+> For uncertainty bands on finish dates, call
+> `/completion/monte-carlo` and read **`response.teac`** -- which
+> composes Earned Schedule with the same five-tier risk model
 > (triangular → normal → Birnbaum-Saunders → Pareto) used elsewhere
-> in the codebase.  Composing ES with that ensemble to produce
-> `TEAC_p10` / `TEAC_p50` / `TEAC_p80` is a meaningful follow-up but
-> not yet implemented.
+> in the codebase, and returns `TEAC_p10` / `TEAC_p20` / `TEAC_p50`
+> / `TEAC_p80` / `TEAC_p95` plus the implied `SPI(t)` per percentile.
+> The deterministic `TEAC_date` here is also surfaced as
+> `response.teac.deterministic.teac_date` for an apples-to-apples
+> comparison.  See `docs/api/completion.md` for the full block schema.
 
 The cost-based `SPI = EV / PV` collapses to 1.0 at completion regardless
 of how late the project actually finished, because once all work is

@@ -1736,3 +1736,247 @@ class TestRecoveryConfig:
         })
         assert c.max_recovery_options == 5
         assert c.lag_compression_factor == 0.25
+
+
+# =====================================================================
+# Stochastic TEAC composition (Lipke ES + five-tier risk model)
+# =====================================================================
+#
+# Composes /completion/monte-carlo's per-percentile finish dates with a
+# baseline project_start anchor to produce Lipke-style time-based EAC
+# values per percentile.  Closes the loop between the deterministic
+# /evm/analyze.actual.earnedSchedule.TEAC_date and the stochastic finish-
+# date distribution from /completion/monte-carlo.
+
+class TestStochasticTEAC:
+
+    def _baseline_nodes(self):
+        """Linear chain with explicit Start/Finish for project anchoring.
+
+        A(10d) -> B(20d) -> C(5d), baseline 2025-01-01 -> 2025-02-05 = 35d.
+        """
+        return [
+            {'ID': 'A', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '2025-01-01T00:00:00Z',
+             'Finish': '2025-01-11T00:00:00Z'},
+            {'ID': 'B', 'Duration': 20, 'TimeUnits': 'days',
+             'Start': '2025-01-11T00:00:00Z',
+             'Finish': '2025-01-31T00:00:00Z'},
+            {'ID': 'C', 'Duration': 5, 'TimeUnits': 'days',
+             'Start': '2025-01-31T00:00:00Z',
+             'Finish': '2025-02-05T00:00:00Z'},
+        ], [
+            {'source': 'A', 'target': 'B'},
+            {'source': 'B', 'target': 'C'},
+        ]
+
+    def test_block_present_with_required_fields(self):
+        nodes, links = self._baseline_nodes()
+        r = run_completion_mc(nodes, links, '2025-01-01T00:00:00Z',
+                              config={'iterations': 50,
+                                      'enable_risk': False})
+        teac = r.get('teac')
+        assert teac is not None
+        for k in ('projectStartDate', 'projectFinishDate',
+                  'plannedDurationDays', 'statusDate', 'actualTimeDays',
+                  'percentiles', 'deterministic', 'flags',
+                  'method', 'crossReference'):
+            assert k in teac, f'missing teac field: {k}'
+        for p in ('p10', 'p20', 'p50', 'p80', 'p95'):
+            assert p in teac['percentiles']
+            for k in ('label', 'teac_days', 'teac_date',
+                      'spi_t', 'spi_t_model', 'impact_days'):
+                assert k in teac['percentiles'][p]
+
+    def test_pd_matches_baseline_span(self):
+        nodes, links = self._baseline_nodes()
+        r = run_completion_mc(nodes, links, '2025-01-01T00:00:00Z',
+                              config={'iterations': 50,
+                                      'enable_risk': False})
+        # 2025-01-01 to 2025-02-05 = 35 calendar days
+        assert r['teac']['plannedDurationDays'] == 35.0
+        assert r['teac']['projectStartDate'].startswith('2025-01-01')
+        assert r['teac']['projectFinishDate'].startswith('2025-02-05')
+
+    def test_at_days_clamped_at_kickoff(self):
+        nodes, links = self._baseline_nodes()
+        r = run_completion_mc(nodes, links, '2025-01-01T00:00:00Z',
+                              config={'iterations': 50,
+                                      'enable_risk': False})
+        # status == project_start -> AT == 0, no status_before_start flag
+        assert r['teac']['actualTimeDays'] == 0.0
+        assert 'status_before_start' not in r['teac']['flags']
+
+    def test_status_before_start_flag(self):
+        nodes, links = self._baseline_nodes()
+        r = run_completion_mc(nodes, links, '2024-12-01T00:00:00Z',
+                              config={'iterations': 50,
+                                      'enable_risk': False})
+        # status < project_start -> AT clamped to 0, flag set
+        assert r['teac']['actualTimeDays'] == 0.0
+        assert r['teac']['flags'].get('status_before_start') is True
+
+    def test_percentile_monotonicity(self):
+        nodes, links = self._baseline_nodes()
+        # Need risk on to actually spread the distribution
+        for n in nodes:
+            n['riskScore'] = 0.7
+        r = run_completion_mc(nodes, links, '2025-01-01T00:00:00Z',
+                              config={'iterations': 500,
+                                      'enable_risk': True})
+        pcts = r['teac']['percentiles']
+        days = [pcts[p]['teac_days'] for p in
+                ('p10', 'p20', 'p50', 'p80', 'p95')]
+        for a, b in zip(days, days[1:]):
+            assert a <= b, f'TEAC days not monotonic: {days}'
+
+    def test_p50_implied_spi_inverse_of_teac_ratio(self):
+        nodes, links = self._baseline_nodes()
+        r = run_completion_mc(nodes, links, '2025-01-01T00:00:00Z',
+                              config={'iterations': 50,
+                                      'enable_risk': False})
+        pd_days = r['teac']['plannedDurationDays']
+        p50 = r['teac']['percentiles']['p50']
+        # SPI(t) = PD / TEAC -> TEAC * SPI = PD (or inverse)
+        if p50['teac_days'] > 0 and p50['spi_t'] is not None:
+            expected_spi = pd_days / p50['teac_days']
+            # Within 1% tolerance (rounding)
+            assert abs(p50['spi_t'] - expected_spi) <= 0.01 * max(
+                expected_spi, 0.01)
+
+    def test_teac_date_aligns_with_finish_percentile(self):
+        nodes, links = self._baseline_nodes()
+        r = run_completion_mc(nodes, links, '2025-01-01T00:00:00Z',
+                              config={'iterations': 50,
+                                      'enable_risk': False})
+        # With risk off, P50 finish date and P50 teac_date should match
+        # (both come from the same sorted-samples array index).
+        p50_finish = r['p50_finish']
+        p50_teac = r['teac']['percentiles']['p50']['teac_date']
+        assert p50_finish == p50_teac
+
+    def test_teac_days_match_finish_minus_start(self):
+        nodes, links = self._baseline_nodes()
+        r = run_completion_mc(nodes, links, '2025-01-01T00:00:00Z',
+                              config={'iterations': 50,
+                                      'enable_risk': False})
+        # P80 teac_days = (P80 finish - project_start) calendar days
+        ps = _parse_iso_to_ms(r['teac']['projectStartDate'])
+        p80_ms = _parse_iso_to_ms(r['p80_finish'])
+        expected_days = (p80_ms - ps) / _MS_PER_DAY
+        actual = r['teac']['percentiles']['p80']['teac_days']
+        assert abs(actual - expected_days) < 0.05
+
+    def test_no_baseline_flag_when_no_start_finish(self):
+        # No Start/Finish anywhere -> no_baseline flag, project_start
+        # falls back to status_ms.
+        nodes = [
+            {'ID': 'A', 'Duration': 10, 'TimeUnits': 'days'},
+            {'ID': 'B', 'Duration': 20, 'TimeUnits': 'days'},
+        ]
+        links = [{'source': 'A', 'target': 'B'}]
+        r = run_completion_mc(nodes, links, '2025-01-01T00:00:00Z',
+                              config={'iterations': 50,
+                                      'enable_risk': False})
+        assert r['teac']['flags'].get('no_baseline') is True
+        # Fallback start = status -> AT = 0
+        assert r['teac']['actualTimeDays'] == 0.0
+
+    def test_all_completed_flag(self):
+        nodes = [
+            {'ID': 'A', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '2024-01-01T00:00:00Z',
+             'Finish': '2024-01-11T00:00:00Z',
+             'ActualFinish': '2024-01-12T00:00:00Z'},
+        ]
+        r = run_completion_mc(nodes, [], '2025-01-01T00:00:00Z',
+                              config={'iterations': 50,
+                                      'enable_risk': False})
+        assert r['teac']['flags'].get('all_completed') is True
+        # Even on the all-completed path the block is present
+        assert 'percentiles' in r['teac']
+
+    def test_empty_result_carries_teac_block(self):
+        # Zero nodes -> _empty_result path should still have teac
+        r = run_completion_mc([], [], '2025-01-01T00:00:00Z',
+                              config={'iterations': 50})
+        assert 'teac' in r
+        assert r['teac']['plannedDurationDays'] == 0.0
+        assert r['teac']['flags'].get('no_baseline') is True
+
+    def test_deterministic_block_matches_expected_finish(self):
+        nodes, links = self._baseline_nodes()
+        r = run_completion_mc(nodes, links, '2025-01-01T00:00:00Z',
+                              config={'iterations': 50,
+                                      'enable_risk': False})
+        # deterministic.teac_date should be expected_finish
+        assert r['teac']['deterministic']['teac_date'] == r['expected_finish']
+
+    def test_spi_t_model_clamped_to_bounds(self):
+        # Construct a heavy-overrun case: PD=35d, but force a long
+        # ExpectedStart so the deterministic finish is far past status.
+        # SPI(t) = PD / TEAC will become very small -> clamped to 0.1.
+        nodes = [
+            {'ID': 'A', 'Duration': 5, 'TimeUnits': 'days',
+             'Start': '2025-01-01T00:00:00Z',
+             'Finish': '2025-01-06T00:00:00Z',
+             'ExpectedStart': '2026-01-01T00:00:00Z'},  # year-long delay
+        ]
+        r = run_completion_mc(nodes, [], '2025-01-01T00:00:00Z',
+                              config={'iterations': 50,
+                                      'enable_risk': False})
+        spi_model = r['teac']['percentiles']['p50']['spi_t_model']
+        assert 0.1 <= spi_model <= 5.0
+
+    def test_endpoint_returns_teac_block(self, client):
+        nodes, links = self._baseline_nodes()
+        resp = client.post('/completion/monte-carlo', json={
+            'nodes': nodes, 'links': links,
+            'status_date': '2025-01-01T00:00:00Z',
+            'config': {'iterations': 50, 'enable_risk': False},
+        })
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert 'teac' in body
+        assert body['teac']['plannedDurationDays'] == 35.0
+        # Cross-reference present and points at evm
+        assert body['teac']['crossReference']['evm_endpoint'] == '/evm/analyze'
+
+    def test_cross_reference_block_populated(self):
+        nodes, links = self._baseline_nodes()
+        r = run_completion_mc(nodes, links, '2025-01-01T00:00:00Z',
+                              config={'iterations': 50,
+                                      'enable_risk': False})
+        cr = r['teac']['crossReference']
+        assert cr['evm_endpoint'] == '/evm/analyze'
+        assert cr['evm_field'] == 'actual.earnedSchedule'
+        assert 'note' in cr
+        assert r['teac']['method'] == 'lipke_2003_stochastic'
+
+
+class TestEVMUncertaintyHint:
+    """The /evm/analyze.actual.earnedSchedule block should carry a
+    uncertaintyHint pointing at /completion/monte-carlo so consumers
+    finding the deterministic TEAC_date can discover the stochastic
+    bands without reading the docs.
+    """
+
+    def test_hint_present_on_populated_path(self):
+        from evm.metrics import compute_earned_schedule
+        nodes = [
+            {'ID': 'A', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '2025-01-01T00:00:00Z',
+             'Finish': '2025-01-11T00:00:00Z',
+             'PercentComplete': 0.5},
+        ]
+        es = compute_earned_schedule(nodes, '2025-01-06T00:00:00Z')
+        assert 'uncertaintyHint' in es
+        assert es['uncertaintyHint']['endpoint'] == '/completion/monte-carlo'
+        assert es['uncertaintyHint']['field'] == 'teac'
+
+    def test_hint_present_on_empty_path(self):
+        from evm.metrics import compute_earned_schedule
+        # No baseline -> _empty_es path
+        es = compute_earned_schedule([], '2025-01-01T00:00:00Z')
+        assert 'uncertaintyHint' in es
+        assert es['uncertaintyHint']['endpoint'] == '/completion/monte-carlo'

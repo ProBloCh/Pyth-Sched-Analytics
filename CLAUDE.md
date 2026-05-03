@@ -475,23 +475,33 @@ Pushes to `main` trigger automatic deployment to Azure production. Treat
 
 ### Medium priority (extend existing capabilities)
 
-- **Earned Value Management (EVM) — Earned Schedule (DONE; uncertainty
-  bands deferred):** `/evm/analyze` now returns an
-  `actual.earnedSchedule` block with the Lipke (2003) `ES`, `SPI(t) =
-  ES / AT`, and `TEAC(t) = max(AT, PD / SPI_t_model)`, alongside the
-  existing cost-based SPI/CPI/EAC.  `compute_earned_schedule` in
-  `evm/metrics.py` samples cumulative PV at every activity Start/Finish
-  boundary (BCWS is piecewise-linear, so linear interpolation between
-  samples is exact) and returns flags for the `not_started`,
-  `completed`, `no_baseline`, and `status_before_start` edge cases.
-  The cost-based SPI fields are unchanged (additive only).
-  **Note:** the returned ES / SPI(t) / TEAC are **deterministic point
-  estimates**, which sits awkwardly in a codebase whose identity is
-  fat-tailed overruns (Birnbaum-Saunders, Pareto, dragon kings).
-  For uncertainty bands on finish dates use
-  `/completion/monte-carlo`'s P10/P50/P80 percentiles.  Composing ES
-  with the five-tier risk model to produce `TEAC_p10` / `TEAC_p50` /
-  `TEAC_p80` is a meaningful follow-up but not in this PR.
+- **Earned Value Management (EVM) — Earned Schedule (DONE):**
+  `/evm/analyze` returns an `actual.earnedSchedule` block with the
+  Lipke (2003) `ES`, `SPI(t) = ES / AT`, and `TEAC(t) = max(AT, PD /
+  SPI_t_model)`, alongside the existing cost-based SPI/CPI/EAC.
+  `compute_earned_schedule` in `evm/metrics.py` samples cumulative PV
+  at every activity Start/Finish boundary (BCWS is piecewise-linear,
+  so linear interpolation between samples is exact) and returns flags
+  for the `not_started`, `completed`, `no_baseline`, and
+  `status_before_start` edge cases.  The cost-based SPI fields are
+  unchanged (additive only).  The block carries an `uncertaintyHint`
+  pointer to `/completion/monte-carlo` for the stochastic counterpart.
+- **Stochastic TEAC composition (DONE):**
+  `/completion/monte-carlo` returns a `teac` block that composes the
+  per-percentile MC finish dates with a baseline `projectStartDate`
+  anchor to produce Lipke-style time-based EAC values per percentile
+  (`P10` / `P20` / `P50` / `P80` / `P95`), each with `teac_days`,
+  `teac_date`, raw and clamped `SPI(t)`, and `impact_days` vs the
+  deterministic baseline.  `_compose_teac_block` in
+  `completion/monte_carlo.py` reuses the already-sorted samples (no
+  second pass) and surfaces a `deterministic.teac_date` companion
+  matching what `/evm/analyze.actual.earnedSchedule.TEAC_date` would
+  give on the same project, plus a `crossReference` block back to
+  the EVM endpoint.  Closes the deterministic-vs-stochastic loop the
+  research foundation (Natarajan PMJ 2022, Flyvbjerg JMIS 2022)
+  demands: Earned Schedule is no longer a single number a customer
+  could mistake for a forecast — it's a five-tier-risk-model band
+  around the deterministic midpoint.
 - **Reference class integration:** The user's PMJ paper demonstrates RCF
   uplifts for O&G offshore projects (P10: 89% cost, 72% schedule).  The
   reference class dataset lives in a separate app; the solver should

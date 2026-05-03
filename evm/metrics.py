@@ -475,6 +475,20 @@ def compute_earned_schedule(nodes, status_date, hours_per_day: float = 8.0,
         'projectStartDate':    project_start.strftime('%Y-%m-%d'),
         'projectFinishDate':   project_finish.strftime('%Y-%m-%d'),
         'flags':               flags,
+        # The TEAC_date here is a deterministic point estimate, computed
+        # from the cost-side EV/PV sweep with SPI(t) clamped to evm
+        # Bounds.  Consumers wanting the five-tier risk-model uncertainty
+        # band around it (TEAC_p10 / TEAC_p50 / TEAC_p80 / TEAC_p95)
+        # should call /completion/monte-carlo and read response.teac.
+        'uncertaintyHint': {
+            'endpoint':   '/completion/monte-carlo',
+            'field':      'teac',
+            'note':       ('TEAC_date here is deterministic; '
+                           '/completion/monte-carlo composes Earned '
+                           'Schedule with the five-tier risk model '
+                           '(triangular -> normal -> Birnbaum-Saunders '
+                           '-> Pareto) for percentile-based bands.'),
+        },
     }
 
 
@@ -491,6 +505,14 @@ def _empty_es(flags):
         'projectStartDate':    None,
         'projectFinishDate':   None,
         'flags':               flags,
+        'uncertaintyHint': {
+            'endpoint': '/completion/monte-carlo',
+            'field':    'teac',
+            'note':     ('TEAC_date here is deterministic; '
+                         '/completion/monte-carlo composes Earned '
+                         'Schedule with the five-tier risk model '
+                         'for percentile-based bands.'),
+        },
     }
 
 
