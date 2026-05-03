@@ -1102,10 +1102,14 @@ def _compose_teac_block(nodes, status_ms, expected_finish_ms,
                             else round(det_spi_t_model, 4)),
             'source':      'mc_no_risk_cpm',
             'note':        ('No-risk-multiplier CPM midpoint of the MC '
-                            'band.  Differs from /evm/analyze.actual.'
-                            'earnedSchedule.TEAC_date, which uses '
-                            'max(AT, PD / SPI_t_model) on the cost-side '
-                            'EV/PV intersection.'),
+                            'band.  Equals top-level expected_finish on '
+                            'the regular MC path; clamps forward to '
+                            'statusDate on the all-completed stale-status '
+                            'edge case so TEAC >= AT (Lipke).  Differs '
+                            'from /evm/analyze.actual.earnedSchedule.'
+                            'TEAC_date, which uses max(AT, PD / '
+                            'SPI_t_model) on the cost-side EV/PV '
+                            'intersection.'),
         },
         'flags':                flags,
         'method':               'lipke_2003_stochastic',
