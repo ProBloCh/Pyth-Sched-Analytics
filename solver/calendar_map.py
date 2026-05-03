@@ -264,9 +264,39 @@ def map_makespan_to_date(makespan, project_ctx, project_ctx_dict=None,
         horizon_days=horizon_days,
     )
 
+    # Detect horizon exhaustion BEFORE calling advance_working_ms.
+    # advance_working_ms only logs a rate-limited warning when it
+    # clips at the end of the calendar; without an explicit signal in
+    # the response, callers would get an incorrect end date with no
+    # way to know the mapping was clipped.  Replicate the same
+    # cumulative-hours target check the advance does internally
+    # (start_intraday + makespan_hours vs cal.work_hours_before[-1])
+    # so we can surface a horizon_exhausted flag.
+    start_day_idx = 0  # cal floors start_ms to its UTC midnight
+    if cal.K > 0 and bool(cal.is_working[start_day_idx]):
+        start_intraday_ms = start_ms - cal.epoch_start_ms
+        start_intraday = max(0.0, min(
+            start_intraday_ms / 3_600_000.0, hours_per_day))
+    else:
+        start_intraday = 0.0
+    target_hours = (float(cal.work_hours_before[start_day_idx])
+                    + start_intraday + float(makespan_hours))
+    horizon_exhausted = target_hours > float(cal.work_hours_before[-1])
+
     end_ms = float(advance_working_ms(start_ms, float(makespan_hours), cal))
     end_dt = datetime.fromtimestamp(end_ms / 1000.0, tz=timezone.utc)
     start_dt = datetime.fromtimestamp(start_ms / 1000.0, tz=timezone.utc)
+
+    if horizon_exhausted:
+        # The 7/wd_count scaling on safety_factor above is supposed
+        # to make this branch unreachable for any reasonable input;
+        # log loudly when it does happen so operators can investigate.
+        logger.warning(
+            "calendar mapping clipped: makespan_hours=%.1f exceeded "
+            "calendar horizon (max %.1fh).  end_date is at the calendar "
+            "boundary, not the true finish; horizon_exhausted=True flag "
+            "emitted in the response.",
+            makespan_hours, float(cal.work_hours_before[-1]))
 
     return {
         'makespan_end_date_ms':   end_ms,
@@ -282,4 +312,12 @@ def map_makespan_to_date(makespan, project_ctx, project_ctx_dict=None,
         # activities (case-insensitive, after coalescing missing /
         # empty values to the default 'Hours').
         'mixed_time_units':       mixed_units,
+        # True when the working-hour target exceeded the precomputed
+        # calendar horizon; in that case ``makespan_end_date`` is the
+        # calendar boundary, NOT the true finish.  Consumers should
+        # treat the date as a lower bound and rerun with a wider
+        # calendar configuration if the horizon-scaling heuristic
+        # underestimated.  Should be unreachable for any reasonable
+        # input given the 7/wd_count safety scaling above.
+        'horizon_exhausted':      horizon_exhausted,
     }

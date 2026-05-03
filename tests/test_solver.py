@@ -1191,6 +1191,52 @@ class TestCalendarMapping:
         delta_days = (end - start).days
         assert 40 <= delta_days <= 55
 
+    def test_horizon_exhausted_flag_present(self):
+        """Sanity: the calendar block always includes
+        horizon_exhausted (boolean) so consumers can read it without
+        an ``in`` guard.  False on the happy path."""
+        nodes, links = self._chain()
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5]},
+        })
+        cal = result["calendar"]
+        assert "horizon_exhausted" in cal
+        assert cal["horizon_exhausted"] is False
+
+    def test_horizon_exhausted_when_clipped(self):
+        """When the precomputed calendar horizon is too short to fit
+        the makespan, advance_working_ms silently clips at the
+        boundary -- the new horizon_exhausted flag must surface that
+        so callers don't silently consume a wrong end date.
+
+        Forces the case by calling map_makespan_to_date directly with
+        a tiny synthetic calendar via a project_ctx whose
+        hours_per_day / working_days drive a horizon that won't fit.
+        Because the resolver's 7/wd_count scaling normally prevents
+        this, we synthesise it by passing a makespan larger than what
+        ``estimate_horizon_days(_, _, max_days=3650)`` can cover.
+        """
+        from solver.calendar_map import map_makespan_to_date
+        from solver.models import ProjectContext
+        # 3650 day horizon at 8 hpd Mon-Fri = 3650 * 5/7 * 8 ~= 20857h.
+        # Pass a makespan well beyond that so even after the safety
+        # scaling the calendar can't fit.
+        ctx = ProjectContext(start_date="2026-01-05",
+                             hours_per_day=8.0,
+                             working_days=[1, 2, 3, 4, 5])
+        result = map_makespan_to_date(
+            500_000,  # 500k working hours -- ~250 years
+            ctx,
+            project_ctx_dict={"calendar": {"hours_per_day": 8.0}},
+            nodes=[{"ID": "1", "Duration": 1, "TimeUnits": "Hours"}],
+        )
+        # The mapping still returns a date (clipped to the calendar
+        # boundary), but flags horizon_exhausted=True so callers can
+        # treat the date as a lower bound.
+        assert result is not None
+        assert result["horizon_exhausted"] is True
+
     def test_three_day_week_horizon_does_not_clip(self):
         """For working_days=[1,3,5] (3 wd/wk), the calendar horizon
         must scale by 7/3 to fit the working-hour budget; otherwise

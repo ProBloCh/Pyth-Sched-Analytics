@@ -542,9 +542,18 @@ mapping.
   "holidays_count":         2,
   "makespan_working_hours": 264.0,           // makespan converted to hours
   "time_units":             "Hours",         // dominant TimeUnits across nodes
-  "mixed_time_units":       false            // always present (boolean);
+  "mixed_time_units":       false,           // always present (boolean);
                                              //   true when activities carry
                                              //   heterogeneous TimeUnits
+  "horizon_exhausted":      false            // always present (boolean);
+                                             //   true when the working-hour
+                                             //   target exceeded the
+                                             //   precomputed calendar
+                                             //   horizon and the end_date
+                                             //   was clipped at the
+                                             //   boundary (consumers
+                                             //   should treat the date as
+                                             //   a lower bound).
 }
 ```
 
