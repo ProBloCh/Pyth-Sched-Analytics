@@ -111,7 +111,11 @@ def _dominant_time_units(nodes):
         # Coerce to float so any zero-equivalent representation
         # (0, 0.0, '0', '0.0', '0.00', etc.) is caught -- the static
         # sentinel set used elsewhere in the codebase misses '0.0'.
-        dur_raw = n.get('Duration', n.get('duration', 0))
+        # Default to 1.0 (NOT 0) when Duration is absent: matches
+        # solver/dag.build_dag's default_duration=1.0 for solver
+        # endpoints, so a node the CPM treats as a real activity is
+        # also counted in the unit vote here.
+        dur_raw = n.get('Duration', n.get('duration', 1.0))
         if dur_raw in ('', None):
             continue
         try:

@@ -1474,6 +1474,38 @@ class TestCalendarMapping:
         assert cal["time_units"] == "Hours"
         assert cal["mixed_time_units"] is False
 
+    def test_missing_duration_defaults_to_unit_voter(self):
+        """build_dag defaults missing Duration to 1.0 (a real
+        activity, not a milestone), so _dominant_time_units must do
+        the same -- otherwise a node the CPM treats as a real
+        activity is silently excluded from the TimeUnits vote and the
+        dominant pick / mixed_units flag can disagree with the
+        schedule the solver actually optimised."""
+        nodes = [
+            {"ID": "0", "Duration": 0},
+            # Two activities with TimeUnits but NO Duration field.
+            # Pre-fix: dur_raw defaulted to 0, treated as milestones,
+            # excluded from the vote -- so a single Hours activity
+            # below would dominate.  Post-fix: they default to 1.0,
+            # vote for Days, and Days dominates 2-to-1.
+            {"ID": "1", "TimeUnits": "Days"},
+            {"ID": "2", "TimeUnits": "Days"},
+            {"ID": "3", "Duration": 80, "TimeUnits": "Hours"},
+        ]
+        links = [
+            {"source": "0", "target": "1"}, {"source": "1", "target": "2"},
+            {"source": "2", "target": "3"},
+        ]
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0,
+                         "working_days": [1, 2, 3, 4, 5]},
+        })
+        cal = result["calendar"]
+        # Days wins 2-to-1 (the missing-Duration nodes now vote).
+        assert cal["time_units"] == "Days"
+        assert cal["mixed_time_units"] is True
+
     def test_missing_time_units_votes_default_hours(self):
         """An activity without an explicit TimeUnits field votes for
         the default 'Hours' (matching evm.helpers.convert_to_hours
