@@ -448,11 +448,12 @@ Pushes to `main` trigger automatic deployment to Azure production. Treat
   adjoints (no extra CPM evaluation).  Both `/solver/sensitivity` and
   `/solver/optimize` surface a `constraints` report with `{bound,
   final_value, violation, satisfied}` per active constraint, plus a
-  `warnings` array using one of five specific codes when an
+  `warnings` array using one of six specific codes when an
   `max_end_date` can't be resolved: `unresolved_max_end_date_no_start`,
   `unresolved_max_end_date_bad_start`, `malformed_max_end_date`,
-  `max_end_date_before_start`, `malformed_calendar_config`.  See
-  `docs/api/solver.md` for the full code semantics.
+  `max_end_date_before_start`, `max_end_date_too_far_in_future`,
+  `malformed_calendar_config`.  See `docs/api/solver.md` for the full
+  code semantics.
 - **Link type awareness in app.py graph construction:** `build_nx_graph`
   stores `type` and `lag` as edge attributes, and `calculate_critical_path`
   now uses them via solver.dag.  But other analytics (dependency grouping,

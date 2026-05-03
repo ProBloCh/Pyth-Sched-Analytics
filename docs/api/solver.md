@@ -129,7 +129,8 @@ entry with one of these specific codes:
 | `unresolved_max_end_date_bad_start` | `start_date` is not parseable as ISO |
 | `malformed_max_end_date` | Value is neither numeric nor ISO-parseable, or is numeric but non-positive |
 | `max_end_date_before_start` | Both dates parse but `end <= start` |
-| `malformed_calendar_config` | Both dates parse and `end > start`, but the calendar (`hours_per_day` / `working_days`) yields a non-positive working-hour bound |
+| `max_end_date_too_far_in_future` | Span between `start_date` and `max_end_date` exceeds 10 years (3650 calendar days); rejected to bound `WorkingCalendar` allocation. Pass `constraints.max_makespan` numerically for longer horizons. |
+| `malformed_calendar_config` | Both dates parse and `end > start`, but `hours_per_day` is non-numeric / non-finite / non-positive, or every day in the span is non-working |
 
 This matches the historic "parsed-but-not-enforced" semantics for
 legacy callers that pass an unresolvable constraint.

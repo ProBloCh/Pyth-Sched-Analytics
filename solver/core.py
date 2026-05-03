@@ -393,6 +393,14 @@ def _resolve_constraint_warnings(project_ctx, project_context_dict):
             -> ``malformed_max_end_date``
       - Both ISO but end <= start:
             -> ``max_end_date_before_start``
+      - Both ISO and end > start, but the span exceeds
+        ``MAX_ISO_HORIZON_DAYS`` (10 years) -- the resolver hard-caps
+        WorkingCalendar allocation as a DoS guard:
+            -> ``max_end_date_too_far_in_future``
+      - Both ISO, end > start, span within cap, but the calendar
+        config (hours_per_day, working_days) yields a non-positive
+        bound:
+            -> ``malformed_calendar_config``
       - Anything else (max_makespan resolved cleanly): no warning.
     """
     # Only emit warnings when max_makespan failed to resolve.  If

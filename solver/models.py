@@ -217,10 +217,14 @@ def _resolve_max_makespan(max_makespan_raw, max_end_date_raw, start_date_raw,
         # Normalise to UTC: naive -> assume UTC, aware -> convert.
         # Without this, mixing tz-aware ('2026-12-31Z') with naive
         # ('2026-01-05') would raise outside the try/except via
-        # `end - start`.  Matches evm.helpers.safe_date convention.
-        end = (end if end.tzinfo is not None
+        # `end - start`.  Matches evm.helpers.safe_date convention
+        # exactly: naive values are treated as UTC, tz-aware values
+        # are explicitly converted via .astimezone(timezone.utc) so
+        # the resulting UTC instant is unambiguous regardless of the
+        # caller's input offset.
+        end = (end.astimezone(timezone.utc) if end.tzinfo is not None
                else end.replace(tzinfo=timezone.utc))
-        start = (start if start.tzinfo is not None
+        start = (start.astimezone(timezone.utc) if start.tzinfo is not None
                  else start.replace(tzinfo=timezone.utc))
     except (TypeError, ValueError):
         return None, None
