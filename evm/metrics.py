@@ -294,10 +294,10 @@ def _vectorised_pv_curve(nodes, dates, hours_per_day, working_days_per_week):
         [d.timestamp() * 1000.0 for d in dates], dtype=np.float64)  # (D,)
 
     # Build the per-activity contribution matrix in a single (N, D)
-    # buffer to keep peak memory at one such array (~80 MB at N=10K,
-    # D=500).  An earlier draft built `linear`, `step`, and `frac` as
-    # three independent (N, D) arrays plus the boolean intermediate,
-    # tripling the peak.
+    # buffer to keep peak memory at one such array (~40 MB at N=10K,
+    # D=500: 10_000 * 500 * 8 bytes = 40_000_000).  An earlier draft
+    # built ``linear``, ``step``, and ``frac`` as three independent
+    # (N, D) arrays plus the boolean intermediate, tripling the peak.
     span = f_arr - s_arr
     span_safe = np.where(span > 0, span, 1.0)
     frac = (d_arr[None, :] - s_arr[:, None]) / span_safe[:, None]
@@ -375,10 +375,11 @@ def compute_earned_schedule(nodes, status_date, hours_per_day: float = 8.0,
     # numpy pass.  Builds one (N, D) frac matrix in place (clip +
     # scatter), so peak memory is bounded by a single (N*D*8) byte
     # array; D is capped to _ES_MAX_DATES = 500 by
-    # _significant_evm_dates so for N=10K that's an 80 MB peak,
-    # well within the per-request budget.  Replaces the previous
-    # scalar loop that called compute_bcws_hours per date in pure
-    # Python and hit a wall on 10K-activity projects.
+    # _significant_evm_dates so for N=10K that's a ~40 MB peak
+    # (10_000 * 500 * 8 = 40_000_000 bytes), well within the per-
+    # request budget.  Replaces the previous scalar loop that called
+    # compute_bcws_hours per date in pure Python and hit a wall on
+    # 10K-activity projects.
     pv_arr = _vectorised_pv_curve(
         nodes, significant, hours_per_day, working_days_per_week)
     pv_curve = list(zip(significant, pv_arr.tolist()))

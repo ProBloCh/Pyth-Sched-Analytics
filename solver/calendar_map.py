@@ -244,7 +244,12 @@ def map_makespan_to_date(makespan, project_ctx, project_ctx_dict=None,
         # use a moderate 2x safety factor (covers MC P80 inflation in
         # realistic ranges).  Fat-tailed sectors using
         # /completion/monte-carlo derive their own larger horizon.
-        safety_factor=2.0,
+        # Scale by 7 / wd_count so non-5-day calendars
+        # (e.g. working_days=[1,3,5] = 3 wd/wk, or [1] = 1 wd/wk) get
+        # enough calendar days to fit the working-hour budget.
+        # Without this scaling, advance_working_ms would clip past
+        # the precomputed horizon and return an incorrect end date.
+        safety_factor=2.0 * (7.0 / max(wd_count, 1)),
     )
 
     cal = WorkingCalendar.build(

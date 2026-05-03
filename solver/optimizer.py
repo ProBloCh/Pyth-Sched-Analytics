@@ -138,13 +138,14 @@ def optimize(dag_state, params, project_ctx, config, deadline=None,
                     res_g += coeff * grads[d]['resources']
 
         # ---- Constraint penalties (added on top of the scalarised obj) --
+        # The penalty writes its gradient contribution directly into
+        # dur_g / res_g (in-place) so we don't allocate two extra
+        # O(n) temporaries on every L-BFGS-B evaluation.
         if constraints_active:
-            pen, pen_dur, pen_res = _constraint_penalty(
+            w_obj += _constraint_penalty(
                 dag_state, params, project_ctx, objs,
-                max_makespan, max_budget, grads)
-            w_obj += pen
-            dur_g += pen_dur
-            res_g += pen_res
+                max_makespan, max_budget, grads,
+                dur_g, res_g)
 
         history.append({
             'iteration': len(history),
@@ -238,10 +239,16 @@ def _empty(disciplines):
 
 
 def _constraint_penalty(dag_state, params, project_ctx, objs,
-                        max_makespan, max_budget, grads):
+                        max_makespan, max_budget, grads,
+                        out_dur_g, out_res_g):
     """Quadratic-penalty contribution from hard constraints.
 
-    Returns (penalty_value, dur_grad_addition, res_grad_addition).
+    Adds the penalty's gradient contribution **in place** to the
+    caller's ``out_dur_g`` / ``out_res_g`` buffers (which already
+    hold the discipline-objective gradients), and returns just the
+    scalar penalty value.  This avoids two fresh ``np.zeros(n)``
+    allocations per L-BFGS-B evaluation -- on a 10K-activity project
+    with 50 iterations, that's 100 wasted O(n) allocations otherwise.
 
     Each constraint contributes
         L * max(0, val - bound)^2 / bound^2
@@ -250,10 +257,7 @@ def _constraint_penalty(dag_state, params, project_ctx, objs,
     and cost gradients already in ``grads`` -- no additional CPM
     evaluations needed.
     """
-    n = dag_state.n
     pen = 0.0
-    dur_g = np.zeros(n, dtype=np.float64)
-    res_g = np.zeros(n, dtype=np.float64)
     L = CONSTRAINT_PENALTY_LAMBDA
 
     if max_makespan is not None and max_makespan > 0:
@@ -264,12 +268,12 @@ def _constraint_penalty(dag_state, params, project_ctx, objs,
             coeff = 2.0 * L * violation * inv_b2
             sched = grads.get('schedule')
             if sched is not None:
-                dur_g += coeff * sched['duration']
-                res_g += coeff * sched['resources']
+                out_dur_g += coeff * sched['duration']
+                out_res_g += coeff * sched['resources']
             else:
                 # Fallback: schedule not in disciplines.  Use the
                 # critical mask directly (dMakespan/dd_i = 1 on CP).
-                dur_g[dag_state.critical_mask] += coeff
+                out_dur_g[dag_state.critical_mask] += coeff
 
     if max_budget is not None and max_budget > 0:
         cost = float(objs.get('cost', 0.0))
@@ -285,16 +289,16 @@ def _constraint_penalty(dag_state, params, project_ctx, objs,
             coeff = 2.0 * L * violation * inv_b2
             cost_g = grads.get('cost')
             if cost_g is not None:
-                dur_g += coeff * cost_g['duration']
-                res_g += coeff * cost_g['resources']
+                out_dur_g += coeff * cost_g['duration']
+                out_res_g += coeff * cost_g['resources']
             else:
                 # Analytic cost gradients (reproduce adjoints.cost_adj_*).
-                dur_g += coeff * (params.resource_rates
-                                  * params.resource_counts)
-                res_g += coeff * (params.resource_rates
-                                  * params.durations)
+                out_dur_g += coeff * (params.resource_rates
+                                      * params.resource_counts)
+                out_res_g += coeff * (params.resource_rates
+                                      * params.durations)
 
-    return pen, dur_g, res_g
+    return pen
 
 
 def build_constraints_report(dag_state, params, final_objs,

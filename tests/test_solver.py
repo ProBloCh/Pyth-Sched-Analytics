@@ -1191,6 +1191,39 @@ class TestCalendarMapping:
         delta_days = (end - start).days
         assert 40 <= delta_days <= 55
 
+    def test_three_day_week_horizon_does_not_clip(self):
+        """For working_days=[1,3,5] (3 wd/wk), the calendar horizon
+        must scale by 7/3 to fit the working-hour budget; otherwise
+        advance_working_ms clips past the precomputed horizon and
+        emits a warning instead of an end date.  Pre-fix the horizon
+        was sized as if every day were a working day, undershooting
+        on sparse calendars."""
+        nodes = [
+            {"ID": "0", "Duration": 0},
+            # 200 working hours = 25 working days; under [1,3,5] (3
+            # working days per week) that's ~58 calendar days.  The
+            # horizon helper would otherwise size only ~50 days
+            # before the safety factor.
+            {"ID": "1", "Duration": 200, "TimeUnits": "Hours"},
+        ]
+        links = [{"source": "0", "target": "1"}]
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0,
+                         "working_days": [1, 3, 5]},  # Mon, Wed, Fri
+        })
+        cal = result["calendar"]
+        # End date must be far enough in the future that the
+        # advance didn't clip; for a 3 wd/wk calendar starting Mon
+        # Jan 5, 25 working days needs ~58 calendar days.
+        from datetime import datetime
+        end = datetime.strptime(cal["makespan_end_date"], "%Y-%m-%d")
+        start = datetime.strptime(cal["project_start_date"], "%Y-%m-%d")
+        delta = (end - start).days
+        assert 50 <= delta <= 70, (
+            f"end_date ({delta} cal days) suggests horizon clipped "
+            "for the [1,3,5] (3 wd/wk) calendar")
+
     def test_holidays_push_end_date_later(self):
         nodes, links = self._chain()
         ctx_no = {
