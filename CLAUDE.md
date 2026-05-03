@@ -495,13 +495,22 @@ Pushes to `main` trigger automatic deployment to Azure production. Treat
   deterministic baseline.  `_compose_teac_block` in
   `completion/monte_carlo.py` reuses the already-sorted samples (no
   second pass) and surfaces a `deterministic.teac_date` companion
-  matching what `/evm/analyze.actual.earnedSchedule.TEAC_date` would
-  give on the same project, plus a `crossReference` block back to
-  the EVM endpoint.  Closes the deterministic-vs-stochastic loop the
-  research foundation (Natarajan PMJ 2022, Flyvbjerg JMIS 2022)
-  demands: Earned Schedule is no longer a single number a customer
-  could mistake for a forecast — it's a five-tier-risk-model band
-  around the deterministic midpoint.
+  representing the **MC remaining-work CPM midpoint** (no risk
+  multipliers).  This is intentionally NOT the same number as
+  `/evm/analyze.actual.earnedSchedule.TEAC_date`, which uses
+  `max(AT, PD / SPI_t_model)` from the cost-side EV vs PV
+  intersection; the two agree at no-progress baseline but diverge
+  for in-progress, out-of-sequence, or status-after-completion
+  projects because they're different computations.  `/evm/analyze`
+  remains the authoritative deterministic TEAC; the MC's
+  deterministic field exists so the percentile band has a natural
+  midpoint readable in one response.  A `crossReference` block points
+  back to the EVM endpoint and the divergence is documented in
+  `response.teac.deterministic.note`.  Closes the deterministic-vs-
+  stochastic loop the research foundation (Natarajan PMJ 2022,
+  Flyvbjerg JMIS 2022) demands: Earned Schedule is no longer a single
+  number a customer could mistake for a forecast — it's a five-tier-
+  risk-model band around the deterministic midpoint.
 - **Reference class integration:** The user's PMJ paper demonstrates RCF
   uplifts for O&G offshore projects (P10: 89% cost, 72% schedule).  The
   reference class dataset lives in a separate app; the solver should

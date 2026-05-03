@@ -1897,11 +1897,13 @@ class TestStochasticTEAC:
         assert 'percentiles' in r['teac']
 
     def test_empty_result_carries_teac_block(self):
-        # Zero nodes -> _empty_result path should still have teac
+        # Zero nodes -> _empty_result path should still have teac.
+        # Without any nodes, no baseline is recorded, so PD is None
+        # (explicitly missing) rather than a fabricated 0.0.
         r = run_completion_mc([], [], '2025-01-01T00:00:00Z',
                               config={'iterations': 50})
         assert 'teac' in r
-        assert r['teac']['plannedDurationDays'] == 0.0
+        assert r['teac']['plannedDurationDays'] is None
         assert r['teac']['flags'].get('no_baseline') is True
 
     def test_deterministic_block_matches_expected_finish(self):
@@ -1940,6 +1942,73 @@ class TestStochasticTEAC:
         from evm.helpers import Bounds
         assert _TEAC_MIN_SPI == Bounds.MIN_SPI
         assert _TEAC_MAX_SPI == Bounds.MAX_SPI
+
+    def test_partial_baseline_emits_null_pd_and_spi(self):
+        """If only Start (or only Finish) is recorded, PD has no defined
+        value -- falling back to a forecast date for the missing anchor
+        would lock SPI(t) to a synthetic 1.0.  Treat partial baseline
+        as no-baseline for PD/SPI purposes; emit None instead of
+        fabricating a baseline.  Caught by Copilot review round 2.
+        """
+        # Start present, Finish absent
+        nodes = [
+            {'ID': 'A', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '2025-01-01T00:00:00Z'},
+        ]
+        r = run_completion_mc(nodes, [], '2025-01-01T00:00:00Z',
+                              config={'iterations': 50,
+                                      'enable_risk': False})
+        teac = r['teac']
+        assert teac['plannedDurationDays'] is None
+        assert teac['projectFinishDate'] is None
+        assert teac['flags'].get('no_baseline') is True
+        # Deterministic SPI should be None too -- no PD to compare.
+        assert teac['deterministic']['spi_t'] is None
+        assert teac['deterministic']['spi_t_model'] is None
+        # And every percentile entry should report SPI = None.
+        for p in ('p10', 'p20', 'p50', 'p80', 'p95'):
+            assert teac['percentiles'][p]['spi_t'] is None
+            assert teac['percentiles'][p]['spi_t_model'] is None
+
+    def test_partial_baseline_finish_only(self):
+        # Finish present, Start absent: same outcome.
+        nodes = [
+            {'ID': 'A', 'Duration': 10, 'TimeUnits': 'days',
+             'Finish': '2025-01-11T00:00:00Z'},
+        ]
+        r = run_completion_mc(nodes, [], '2025-01-01T00:00:00Z',
+                              config={'iterations': 50,
+                                      'enable_risk': False})
+        teac = r['teac']
+        assert teac['plannedDurationDays'] is None
+        assert teac['projectStartDate'] is None
+        assert teac['flags'].get('no_baseline') is True
+
+    def test_all_completed_clamps_to_status(self):
+        """When the project has all-actual finishes earlier than the
+        caller's status_date, the reported teac_date must clamp to
+        status_ms -- otherwise teac_days < at_days, which inverts the
+        Lipke semantic (would imply the project ran "ahead of itself
+        by elapsed time").  Mirrors evm.metrics's
+        `teac_days = max(at_days, ...)` clamp.  Caught by Copilot
+        review round 2.
+        """
+        nodes = [
+            {'ID': 'A', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '2024-01-01T00:00:00Z',
+             'Finish': '2024-01-11T00:00:00Z',
+             'ActualFinish': '2024-01-12T00:00:00Z'},
+        ]
+        # Status date 6 months later
+        r = run_completion_mc(nodes, [], '2024-07-01T00:00:00Z',
+                              config={'iterations': 50,
+                                      'enable_risk': False})
+        teac = r['teac']
+        assert teac['flags'].get('all_completed') is True
+        # AT >= 0, TEAC >= AT (Lipke clamp)
+        assert teac['actualTimeDays'] >= 0
+        assert (teac['percentiles']['p50']['teac_days']
+                >= teac['actualTimeDays'])
 
     def test_deterministic_carries_source_and_note(self):
         """The deterministic block must label itself as the MC CPM

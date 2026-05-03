@@ -932,17 +932,22 @@ def _baseline_project_finish_ms(nodes, fallback_ms):
 def _spi_t_from_pd_and_teac(pd_days, teac_days):
     """Implied SPI(t) = PD / TEAC, with raw + clamped variants.
 
-    Raw is preserved (Inf when teac_days == 0 with pd_days > 0; 1.0 when
-    both are 0 -- neutral).  Model is clamped to [_TEAC_MIN_SPI,
-    _TEAC_MAX_SPI] for use in downstream EAC arithmetic; matches the
-    convention in evm.metrics.compute_earned_schedule.
+    Returns ``(None, None)`` when ``pd_days <= 0`` -- the most common
+    cause is partial baseline (Start without Finish, or vice versa),
+    where PD has no defined value and reporting any SPI(t) would imply
+    a baseline comparison the data doesn't support.
+
+    Raw is preserved (Inf when teac_days == 0 with pd_days > 0).  Model
+    is clamped to [_TEAC_MIN_SPI, _TEAC_MAX_SPI] for use in downstream
+    EAC arithmetic; matches the convention in
+    evm.metrics.compute_earned_schedule.
     """
+    if pd_days <= 0:
+        return None, None
     if teac_days > 0:
         raw = pd_days / teac_days
-    elif pd_days > 0:
-        raw = float('inf')
     else:
-        raw = 1.0
+        raw = float('inf')
     if not np.isfinite(raw):
         model = 1.0
     else:
@@ -967,8 +972,10 @@ def _teac_percentile(label, finish_ms, project_start_ms, expected_finish_ms,
         'label':       label,
         'teac_days':   round(teac_days, 2),
         'teac_date':   _ms_to_iso(finish_ms),
-        'spi_t':       (None if not np.isfinite(spi_t) else round(spi_t, 4)),
-        'spi_t_model': round(spi_t_model, 4),
+        'spi_t':       (None if (spi_t is None or not np.isfinite(spi_t))
+                        else round(spi_t, 4)),
+        'spi_t_model': (None if spi_t_model is None
+                        else round(spi_t_model, 4)),
         'impact_days': round(impact_days, 2),
     }
 
@@ -982,26 +989,39 @@ def _compose_teac_block(nodes, status_ms, expected_finish_ms,
     time-based EAC values.  Reuses the sorted samples computed for
     p20/p50/p80 -- no extra MC pass.
     """
-    project_start_ms = _baseline_project_start_ms(nodes, fallback_ms=status_ms)
-    project_finish_ms = _baseline_project_finish_ms(
-        nodes, fallback_ms=expected_finish_ms)
-
-    pd_days = max(0.0, (project_finish_ms - project_start_ms) / _MS_PER_DAY)
-    raw_at_days = (status_ms - project_start_ms) / _MS_PER_DAY
-    at_days = max(0.0, raw_at_days)
-
-    flags = {}
-    # Distinguish "no Start fields anywhere" (no_baseline) from
-    # "baseline matches status exactly" (kickoff day).  A caller posting
-    # a project that hasn't broken ground yet would hit the second; we
-    # surface neither flag because PD and AT are both 0 by definition.
     has_baseline_start = any(
         _parse_iso_to_ms(n.get('Start') or n.get('start')) is not None
         for n in nodes or [])
     has_baseline_finish = any(
         _parse_iso_to_ms(n.get('Finish') or n.get('finish')) is not None
         for n in nodes or [])
-    if not (has_baseline_start and has_baseline_finish):
+    has_full_baseline = has_baseline_start and has_baseline_finish
+
+    project_start_ms = _baseline_project_start_ms(nodes, fallback_ms=status_ms)
+    project_finish_ms = _baseline_project_finish_ms(
+        nodes, fallback_ms=expected_finish_ms)
+
+    # PD = baseline_finish - baseline_start.  Only well-defined when BOTH
+    # sides are recorded.  If only one is present, the missing anchor
+    # falls back to a forecast date (status_ms / expected_finish_ms),
+    # which would make PD a synthetic number compared against itself --
+    # the deterministic SPI(t) would lock to 1.0 even for a project with
+    # no baseline duration to compare against.  Treat partial baseline
+    # as "no baseline" for the purposes of PD / SPI(t) reporting.
+    if has_full_baseline:
+        pd_days = max(0.0, (project_finish_ms - project_start_ms)
+                      / _MS_PER_DAY)
+    else:
+        pd_days = 0.0
+
+    raw_at_days = (status_ms - project_start_ms) / _MS_PER_DAY
+    at_days = max(0.0, raw_at_days)
+
+    flags = {}
+    # `no_baseline` fires when EITHER Start or Finish is absent project-
+    # wide (not just both).  Partial baselines are not enough to anchor
+    # PD / SPI(t).
+    if not has_full_baseline:
         flags['no_baseline'] = True
     if raw_at_days < 0:
         flags['status_before_start'] = True
@@ -1055,19 +1075,31 @@ def _compose_teac_block(nodes, status_ms, expected_finish_ms,
     det_spi_t, det_spi_t_model = _spi_t_from_pd_and_teac(
         pd_days, det_teac_days)
 
+    # When the baseline is partial / absent, projectFinishDate falls back
+    # to expected_finish_ms (a forecast date).  Don't echo that synthetic
+    # value as if it were a recorded baseline; emit None so consumers see
+    # the missing data rather than treating a forecast as a baseline.
+    project_finish_emit = (_ms_to_iso(project_finish_ms)
+                           if has_full_baseline else None)
+    project_start_emit = (_ms_to_iso(project_start_ms)
+                          if has_baseline_start else None)
+
     return {
-        'projectStartDate':    _ms_to_iso(project_start_ms),
-        'projectFinishDate':   _ms_to_iso(project_finish_ms),
-        'plannedDurationDays': round(pd_days, 2),
+        'projectStartDate':    project_start_emit,
+        'projectFinishDate':   project_finish_emit,
+        'plannedDurationDays': (round(pd_days, 2) if has_full_baseline
+                                else None),
         'statusDate':          _ms_to_iso(status_ms),
         'actualTimeDays':      round(at_days, 2),
         'percentiles':         percentiles,
         'deterministic': {
             'teac_days':   round(det_teac_days, 2),
             'teac_date':   _ms_to_iso(expected_finish_ms),
-            'spi_t':       (None if not np.isfinite(det_spi_t)
+            'spi_t':       (None if (det_spi_t is None
+                                     or not np.isfinite(det_spi_t))
                             else round(det_spi_t, 4)),
-            'spi_t_model': round(det_spi_t_model, 4),
+            'spi_t_model': (None if det_spi_t_model is None
+                            else round(det_spi_t_model, 4)),
             'source':      'mc_no_risk_cpm',
             'note':        ('No-risk-multiplier CPM midpoint of the MC '
                             'band.  Differs from /evm/analyze.actual.'
@@ -1158,14 +1190,22 @@ def run_completion_mc(nodes, links, status_date,
         calendar)
 
     if not np.any(in_scope):
-        # Nothing left to simulate -- all activities have ActualFinish
-        latest = float(np.nanmax(actual_finish_ms)) if np.any(
+        # Nothing left to simulate -- all activities have ActualFinish.
+        # Clamp the reported completion date to status_ms: a project
+        # finished BEFORE the caller's status_date hasn't somehow
+        # un-spent the elapsed time, so reporting an earlier teac_date
+        # would yield AT > TEAC and SPI(t) > 1 (a "finished early"
+        # signal) for what is actually just a stale status_date.
+        # Mirrors evm.metrics.compute_earned_schedule's
+        # `teac_days = max(at_days, ...)` clamp.
+        latest_actual = float(np.nanmax(actual_finish_ms)) if np.any(
             np.isfinite(actual_finish_ms)) else status_ms
+        latest = max(latest_actual, status_ms)
         iso = _ms_to_iso(latest)
         # All-finished projects still get a TEAC block so the response
         # contract stays uniform; every percentile collapses to the
-        # latest ActualFinish (or status_ms when none was recorded) and
-        # `flags.all_completed` makes the degeneracy explicit.
+        # clamped completion date and `flags.all_completed` makes the
+        # degeneracy explicit.
         teac_block = _compose_teac_block(
             nodes=nodes,
             status_ms=status_ms,

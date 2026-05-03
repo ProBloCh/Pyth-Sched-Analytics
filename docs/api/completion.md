@@ -136,15 +136,19 @@ activity.
   "seed":           42,
   "config":         { "...": "..." },  // Echo of resolved config.
   "teac": {                         // Stochastic Earned Schedule (Lipke 2003).
-    "projectStartDate":    "2024-12-01T00:00:00+00:00",   // min(node.Start)
-    "projectFinishDate":   "2025-03-01T00:00:00+00:00",   // max(node.Finish)
+    "projectStartDate":    "2024-12-01T00:00:00+00:00",   // min(node.Start), null if absent
+    "projectFinishDate":   "2025-03-01T00:00:00+00:00",   // max(node.Finish), null if absent
     "plannedDurationDays": 90.0,    // PD = baseline finish - baseline start.
+                                    //   null when EITHER side missing
+                                    //   (no synthesized PD from forecasts).
     "statusDate":          "2025-01-15T00:00:00+00:00",
     "actualTimeDays":      45.0,    // AT = max(0, status - project_start).
     "percentiles": {                // TEAC band per percentile, anchored at
                                     //   projectStartDate (NOT status_date).
       "p10": {"label": "P10",  "teac_days": 92.5,  "teac_date": "...",
               "spi_t": 0.973,  "spi_t_model": 0.973,  "impact_days": -3.5},
+      // spi_t / spi_t_model are null when plannedDurationDays is null
+      // (no baseline to compare against).
       "p20": {"...": "..."},
       "p50": {"label": "P50",  "teac_days": 102.3, "teac_date": "...",
               "spi_t": 0.880,  "spi_t_model": 0.880,  "impact_days": 11.3},
