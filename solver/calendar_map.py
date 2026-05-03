@@ -101,6 +101,15 @@ def _dominant_time_units(nodes):
     canon_for = {}
     counts = Counter()
     for n in nodes:
+        # Zero-Duration milestones don't carry meaningful unit
+        # information (a milestone is a point in time, unit-agnostic),
+        # so they're excluded from the unit vote.  Without this, a
+        # project of mostly Days-units activities plus a single
+        # milestone would tie at (Hours-via-default, Days-explicit) and
+        # pick Hours by insertion order, skewing the calendar mapping.
+        dur_raw = n.get('Duration', n.get('duration', 0))
+        if dur_raw in ('', None, 0, 0.0, '0'):
+            continue
         u = n.get('TimeUnits') or n.get('timeUnits')
         if u is None or u == '':
             key = _DEFAULT_TIME_UNITS.lower()
@@ -159,16 +168,32 @@ def map_makespan_to_date(makespan, project_ctx, project_ctx_dict=None,
     if not has_calendar_fields:
         return None
 
-    hours_per_day = float(getattr(project_ctx, 'hours_per_day', 8.0) or 8.0)
+    # Defensive parsing of hours_per_day: a non-numeric value
+    # ('"eight"') would raise inside ``float()`` and crash the solver
+    # endpoint, and NaN would propagate through advance_working_ms to
+    # produce nonsense epoch ms.  Reject either case by skipping the
+    # mapping (returning None) -- consistent with the unparseable
+    # start_date path above.
+    raw_hpd = getattr(project_ctx, 'hours_per_day', 8.0)
+    try:
+        hours_per_day = float(raw_hpd) if raw_hpd is not None else 8.0
+    except (TypeError, ValueError):
+        return None
+    if not (hours_per_day > 0) or hours_per_day != hours_per_day:  # finite + > 0
+        return None
+
     working_days = getattr(project_ctx, 'working_days', None) or [1, 2, 3, 4, 5]
     holidays = getattr(project_ctx, 'holidays', None) or []
 
-    # Convert makespan to working hours using the dominant TimeUnits.
-    # Without this step a project whose Durations are in days would map
-    # day-counts straight into ``advance_working_ms`` (which expects
-    # hours), producing end dates many factors off from reality.
-    wd_count = sum(1 for d in working_days
-                   if isinstance(d, (int, float)) and 1 <= int(d) <= 7) or 5
+    # Match completion.calendar.WorkingCalendar.build's filtering: clamp
+    # to ISO weekdays 1..7 and deduplicate so ``[1,1,2,8]`` doesn't
+    # over-count.  Also use the same canonical list in the response so
+    # ``calendar_working_days`` reflects what the calendar actually
+    # used, not the raw caller input.
+    canonical_wd = sorted({int(d) for d in working_days
+                           if isinstance(d, (int, float))
+                           and 1 <= int(d) <= 7}) or [1, 2, 3, 4, 5]
+    wd_count = len(canonical_wd)
     units, mixed_units = _dominant_time_units(nodes)
     makespan_hours = convert_to_hours(
         float(makespan), units, hours_per_day, wd_count)
@@ -186,7 +211,7 @@ def map_makespan_to_date(makespan, project_ctx, project_ctx_dict=None,
 
     cal = WorkingCalendar.build(
         hours_per_day=hours_per_day,
-        working_days=working_days,
+        working_days=canonical_wd,
         holidays=holidays,
         start_ms=start_ms,
         horizon_days=horizon_days,
@@ -201,7 +226,7 @@ def map_makespan_to_date(makespan, project_ctx, project_ctx_dict=None,
         'makespan_end_date':      end_dt.strftime('%Y-%m-%d'),
         'project_start_date':     start_dt.strftime('%Y-%m-%d'),
         'calendar_hours_per_day': hours_per_day,
-        'calendar_working_days':  list(working_days),
+        'calendar_working_days':  list(canonical_wd),
         'holidays_count':         len(holidays or []),
         'makespan_working_hours': float(makespan_hours),
         'time_units':             units,

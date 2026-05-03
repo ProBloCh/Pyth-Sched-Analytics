@@ -17,7 +17,8 @@ from .stochastic import run_ensemble
 from .optimizer import optimize, build_constraints_report
 from .pareto import run_pareto as _run_pareto
 from .analysis import compute_analysis
-from .calendar_map import map_makespan_to_date
+from .calendar_map import map_makespan_to_date, _dominant_time_units
+from evm.helpers import working_hours_to_unit
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ def run_sensitivity(nodes, links, solver_config_dict,
     t0 = time.time()
 
     project_ctx = ProjectContext.from_dict(project_context_dict)
+    _harmonise_makespan_units(project_ctx, nodes)
     config = SolverConfig.from_dict(solver_config_dict, phase=project_ctx.phase)
 
     logger.info("Sensitivity: %d nodes, %d links, disciplines=%s, "
@@ -123,6 +125,7 @@ def run_optimize(nodes, links, solver_config_dict,
     t0 = time.time()
 
     project_ctx = ProjectContext.from_dict(project_context_dict)
+    _harmonise_makespan_units(project_ctx, nodes)
     config = SolverConfig.from_dict(solver_config_dict, phase=project_ctx.phase)
 
     logger.info("Optimize: %d nodes, %d links, disciplines=%s, "
@@ -316,6 +319,42 @@ def _empty_optimize(disciplines, t0):
         'config': {'disciplines': disciplines, 'weights': {}},
         'computation_ms': round((time.time() - t0) * 1000, 1),
     }
+
+
+def _harmonise_makespan_units(project_ctx, nodes):
+    """Convert an ISO-resolved max_makespan from working hours into the
+    schedule's dominant TimeUnits so it matches dag_state.makespan.
+
+    The solver runs CPM on raw Duration numbers without unit
+    normalisation, so ``dag_state.makespan`` is in whatever
+    ``TimeUnits`` the schedule's activities use (typically Hours, but
+    Days / Weeks are valid too).  Numeric ``max_makespan`` /
+    ``max_end_date`` are taken at face value (caller's units), but the
+    ISO ``max_end_date`` resolution path always produces working
+    hours -- which only matches the schedule when activities are in
+    Hours.  Without this harmonisation step, a Days-units schedule
+    with an ISO max_end_date would be checked against a working-hour
+    bound, off by a factor of ``hours_per_day`` × working-day fraction.
+
+    Mutates ``project_ctx.max_makespan`` in place.  No-op when no
+    bound is set, when the source is already 'numeric', or when the
+    schedule's dominant TimeUnits resolve to Hours.
+    """
+    if (project_ctx.max_makespan is None
+            or getattr(project_ctx, 'max_makespan_source', None)
+                != 'iso_working_hours'):
+        return
+    units, _mixed = _dominant_time_units(nodes)
+    if units.strip().lower() in ('h', 'hr', 'hrs', 'hour', 'hours'):
+        # Bound is already in working hours and the schedule is too -- no
+        # conversion needed.
+        return
+    wd_count = sum(1 for d in (project_ctx.working_days or [])
+                   if isinstance(d, (int, float))
+                   and 1 <= int(d) <= 7) or 5
+    project_ctx.max_makespan = working_hours_to_unit(
+        project_ctx.max_makespan, units,
+        project_ctx.hours_per_day, wd_count)
 
 
 def _looks_like_iso_date(value):

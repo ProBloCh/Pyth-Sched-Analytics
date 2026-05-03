@@ -186,7 +186,7 @@ Content-Type: application/json
 | `critical_path` | `array<string>` | Always | Activity IDs on the critical path. |
 | `sensitivity` | `array<object>` | Always | Per-activity sensitivity rankings (see [Sensitivity Entry](#sensitivity-entry)). Sorted by `composite_sensitivity` descending. |
 | `analysis` | `object` | Always | Conflict/synergy analysis (see [Analysis](#analysis)). |
-| `constraints` | `object \| null` | Always | Per-constraint feasibility report at the **current baseline** (no optimisation has been performed).  `null` when no `max_makespan` / `max_budget` was supplied; otherwise see [Constraints Report](#constraints-report). |
+| `constraints` | `object \| null` | Always | Per-constraint feasibility report at the **current baseline** (no optimisation has been performed).  `null` when no `max_makespan` / `max_budget` was supplied or the bound couldn't be resolved; otherwise see [Constraints Report](#constraints-report). |
 | `config` | `object` | Always | Echo of active config: `{disciplines, weights}`. |
 | `computation_ms` | `float` | Always | Wall-clock milliseconds. |
 | `cache_hit` | `boolean` | Always | `true` if served from cache. |
@@ -292,7 +292,7 @@ Content-Type: application/json
 | `computation_ms` | `float` | Always | Wall-clock milliseconds. |
 | `cache_hit` | `boolean` | Always | `true` if served from cache. |
 | `stochastic` | `object` | Conditional | Monte Carlo results on optimized state. **Present only when** `stochastic: true`. See [Stochastic](#stochastic). |
-| `constraints` | `object \| null` | Conditional | Per-constraint feasibility report.  Present (non-null) when at least one of `max_makespan` / resolvable `max_end_date` / `max_budget` was supplied.  See [Constraints Report](#constraints-report). |
+| `constraints` | `object \| null` | Always | Per-constraint feasibility report at the **post-optimisation** state.  `null` when no `max_makespan` / `max_budget` was supplied or the bound couldn't be resolved; otherwise see [Constraints Report](#constraints-report). |
 | `calendar` | `object` | Conditional | Calendar mapping from final `makespan` to a real end date.  Same shape as the sensitivity-endpoint `calendar`.  See [Calendar Mapping](#calendar-mapping). |
 | `warnings` | `array<object>` | Conditional | Non-fatal advisory messages.  See [Hard Constraints](#hard-constraints) for the full list of warning codes. |
 

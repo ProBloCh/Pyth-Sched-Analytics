@@ -176,6 +176,64 @@ def convert_to_hours(duration, time_units, hours_per_day: float = 8.0,
     return d
 
 
+def working_hours_to_unit(hours, time_units, hours_per_day: float = 8.0,
+                          working_days_per_week: float = 5.0) -> float:
+    """Inverse of :func:`convert_to_hours`.
+
+    Convert a working-hour scalar back into the named unit -- useful
+    when a value resolved in working hours (e.g. an ISO max_end_date
+    span) needs to be expressed in the same TimeUnits the schedule is
+    authored in.  Mirrors the unit table in ``convert_to_hours``
+    one-for-one, including the ``m`` = minutes vs ``mo`` = months
+    distinction.
+
+    Returns 0.0 when ``hours`` is non-finite or non-positive.
+    """
+    try:
+        h = float(hours)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(h) or h <= 0:
+        return 0.0
+    hpd = max(float(hours_per_day or 8.0), 1e-9)
+    dpw = max(float(working_days_per_week or 5.0), 1e-9)
+
+    u_raw = str(time_units if time_units is not None else 'Hours').strip().lower()
+    if not u_raw:
+        return h
+
+    if u_raw in ('h', 'hr', 'hrs', 'hour', 'hours'):
+        return h
+    if u_raw in ('s', 'sec', 'secs', 'second', 'seconds'):
+        return h * 3600.0
+    if u_raw in ('min', 'mins', 'minute', 'minutes', 'm'):
+        return h * 60.0
+    if u_raw in ('d', 'day', 'days'):
+        return h / hpd
+    if u_raw in ('w', 'wk', 'wks', 'week', 'weeks'):
+        return h / (dpw * hpd)
+    if u_raw in ('mo', 'mon', 'mons', 'month', 'months'):
+        return h / (_WEEKS_PER_MONTH * dpw * hpd)
+    if u_raw in ('y', 'yr', 'yrs', 'year', 'years'):
+        return h / (_WEEKS_PER_YEAR * dpw * hpd)
+
+    c0 = u_raw[0]
+    if c0 == 'h':
+        return h
+    if c0 == 'd':
+        return h / hpd
+    if c0 == 'w':
+        return h / (dpw * hpd)
+    if c0 == 'y':
+        return h / (_WEEKS_PER_YEAR * dpw * hpd)
+    if c0 == 'm':
+        if (u_raw.startswith('mo') or u_raw.startswith('mon')
+                or u_raw.startswith('month')):
+            return h / (_WEEKS_PER_MONTH * dpw * hpd)
+        return h * 60.0
+    return h
+
+
 # ---------------------------------------------------------------------------
 # Percent complete (matches EVM.js normalizePercentComplete, lines 152-168)
 # ---------------------------------------------------------------------------

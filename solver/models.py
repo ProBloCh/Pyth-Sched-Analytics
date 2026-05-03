@@ -112,6 +112,17 @@ class ProjectContext:
     # Populated by from_dict via _resolve_max_makespan; None means the
     # constraint either wasn't supplied or couldn't be parsed.
     max_makespan: float = None
+    # How max_makespan was resolved.  None when no bound was supplied.
+    # 'numeric'           -- caller passed an explicit numeric value
+    #                        (max_makespan or numeric max_end_date),
+    #                        already in the solver's time units.
+    # 'iso_working_hours' -- resolved from an ISO max_end_date + ISO
+    #                        start_date, expressed in working hours.
+    #                        Callers must convert this to the schedule's
+    #                        dominant TimeUnits before comparing to
+    #                        dag_state.makespan; run_sensitivity /
+    #                        run_optimize do this in solver/core.py.
+    max_makespan_source: str = None
     start_date: str = None
     holidays: list = field(default_factory=list)
 
@@ -124,7 +135,7 @@ class ProjectContext:
         start_date = (d.get('start_date')
                       or calendar.get('start_date')
                       or (d.get('project') or {}).get('start_date'))
-        max_makespan = _resolve_max_makespan(
+        max_makespan, max_makespan_source = _resolve_max_makespan(
             constraints.get('max_makespan'),
             constraints.get('max_end_date'),
             start_date,
@@ -139,6 +150,7 @@ class ProjectContext:
             max_end_date=constraints.get('max_end_date'),
             max_budget=_safe_constraint(constraints.get('max_budget')),
             max_makespan=max_makespan,
+            max_makespan_source=max_makespan_source,
             start_date=start_date,
             holidays=calendar.get('holidays') or [],
         )
@@ -159,29 +171,34 @@ def _safe_constraint(value):
 
 def _resolve_max_makespan(max_makespan_raw, max_end_date_raw, start_date_raw,
                           hours_per_day, working_days):
-    """Resolve a numeric max_makespan in the solver's time units.
+    """Resolve a numeric max_makespan plus its source-tag.
 
-    Priority:
+    Priority (returns ``(value, source)`` -- ``(None, None)`` when
+    unresolved):
       1. Explicit numeric ``constraints.max_makespan`` (already in solver
-         time units; the unambiguous form).
+         time units; the unambiguous form).         -> ('numeric')
       2. Numeric ``constraints.max_end_date`` (treated as time units;
          backward-compatible with callers that passed a number here).
-      3. ISO ``constraints.max_end_date`` plus an ISO project ``start_date``:
-         convert the calendar-day difference to working hours using the
-         supplied hours_per_day and working_days_per_week.
+                                                    -> ('numeric')
+      3. ISO ``constraints.max_end_date`` plus an ISO project
+         ``start_date``: convert the calendar-day difference to working
+         hours using the supplied hours_per_day and
+         working_days_per_week.                     -> ('iso_working_hours')
 
-    Returns None when no resolution is possible -- the optimizer then
-    skips that constraint silently (the analysis layer surfaces
-    unresolved constraints separately so callers can detect mis-config).
+    The source tag distinguishes the two unit conventions: numeric
+    values are already in the solver's time units (whatever the
+    request's Duration fields are in), while ISO-derived values are
+    always in working hours and must be converted before being
+    compared against ``dag_state.makespan``.
     """
     direct = _safe_constraint(max_makespan_raw)
     if direct is not None:
-        return direct
+        return direct, 'numeric'
     direct = _safe_constraint(max_end_date_raw)
     if direct is not None:
-        return direct
+        return direct, 'numeric'
     if max_end_date_raw is None or start_date_raw is None:
-        return None
+        return None, None
     try:
         from datetime import datetime, timezone
         end = datetime.fromisoformat(
@@ -197,10 +214,10 @@ def _resolve_max_makespan(max_makespan_raw, max_end_date_raw, start_date_raw,
         start = (start if start.tzinfo is not None
                  else start.replace(tzinfo=timezone.utc))
     except (TypeError, ValueError):
-        return None
+        return None, None
     cal_days = (end - start).total_seconds() / 86400.0
     if cal_days <= 0:
-        return None
+        return None, None
     # Match completion.calendar.WorkingCalendar.build's filtering
     # exactly: clamp to ISO weekdays 1..7 and deduplicate via a set.
     # Without this, malformed/duplicated working_days lists (e.g.
@@ -216,11 +233,13 @@ def _resolve_max_makespan(max_makespan_raw, max_end_date_raw, start_date_raw,
     try:
         hpd = float(hours_per_day) if hours_per_day is not None else 8.0
     except (TypeError, ValueError):
-        return None
+        return None, None
     if not np.isfinite(hpd) or hpd <= 0:
-        return None
+        return None, None
     working_hours = cal_days * (wd_count / 7.0) * hpd
-    return working_hours if working_hours > 0 else None
+    if working_hours > 0:
+        return working_hours, 'iso_working_hours'
+    return None, None
 
 
 def _safe_float(value, default, lo=0.0, hi=1e12):

@@ -693,10 +693,18 @@ class TestHardConstraints:
         ]
         return nodes, links
 
-    def test_unconstrained_response_omits_constraints(self):
+    def test_unconstrained_response_constraints_is_null(self):
+        """Wire contract: ``constraints`` is **always present** in the
+        optimize/sensitivity response (per docs/api/solver.md), and
+        explicitly null when no bound was supplied.  ``.get(...) is
+        None`` would pass even if the key were absent, so assert
+        presence + nullity separately to avoid silently locking the
+        wrong contract.
+        """
         nodes, links = self._chain()
         result = run_optimize(nodes, links, {"max_iterations": 20}, {}, {})
-        assert result.get("constraints") is None
+        assert "constraints" in result
+        assert result["constraints"] is None
 
     def test_max_makespan_active_reports_violation(self):
         nodes, links = self._chain()
@@ -888,6 +896,63 @@ class TestHardConstraints:
         assert (result_dup["constraints"]["max_makespan"]["bound"]
                 == result_clean["constraints"]["max_makespan"]["bound"])
 
+    def test_iso_bound_converted_to_solver_units(self):
+        """When the schedule's dominant TimeUnits is Days but the
+        constraint is supplied as an ISO max_end_date (resolved in
+        working hours), the bound must be converted to Days before
+        being compared against dag_state.makespan -- otherwise the
+        constraint enforcement mis-judges feasibility by a factor of
+        hours_per_day * working-day-fraction.
+        """
+        # 3 sequential 10-day activities -> baseline makespan = 30 days.
+        nodes = [
+            {"ID": "0", "Duration": 0},
+            {"ID": "1", "Duration": 10, "TimeUnits": "Days"},
+            {"ID": "2", "Duration": 10, "TimeUnits": "Days"},
+            {"ID": "3", "Duration": 10, "TimeUnits": "Days"},
+        ]
+        links = [
+            {"source": "0", "target": "1"},
+            {"source": "1", "target": "2"},
+            {"source": "2", "target": "3"},
+        ]
+        # ISO end_date 60 calendar days after start.  ~43 working days
+        # at Mon-Fri.  Converted from working hours = 43*8 = 344 hrs
+        # back to Days = 43.  Bound (43 days) > makespan (30 days)
+        # -> satisfied.  Without the conversion, the bound would be
+        # 344 (in hours) and makespan 30 (in days) -- still trivially
+        # satisfied, but for completely the wrong reason.
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5]},
+            "constraints": {"max_end_date": "2026-03-06"},
+        })
+        c = result["constraints"]["max_makespan"]
+        # Bound should be ~43 days, NOT ~344 hours.
+        assert 35 <= c["bound"] <= 50, (
+            f"ISO bound not converted to Days: bound={c['bound']}")
+        assert c["satisfied"] is True
+
+    def test_iso_bound_in_days_can_be_violated(self):
+        """Symmetry check: a tight ISO bound on a Days-units schedule
+        must be reported as violated when the makespan exceeds it,
+        proving the conversion lands the bound in comparable units."""
+        nodes = [
+            {"ID": "0", "Duration": 0},
+            {"ID": "1", "Duration": 50, "TimeUnits": "Days"},
+        ]
+        links = [{"source": "0", "target": "1"}]
+        # ISO span ~14 working days; bound = 14, makespan = 50 -> violation.
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5]},
+            "constraints": {"max_end_date": "2026-01-25"},
+        })
+        c = result["constraints"]["max_makespan"]
+        assert c["bound"] < 20  # in days, not hours
+        assert c["violation"] > 0
+        assert c["satisfied"] is False
+
     def test_empty_dag_returns_constraints_none(self):
         """The empty-DAG fast path must include constraints=None so
         consumers see a stable shape regardless of input size."""
@@ -1014,6 +1079,48 @@ class TestCalendarMapping:
             "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5]},
         })
         assert "calendar" not in result
+
+    def test_non_numeric_hours_per_day_skips_mapping(self):
+        """A non-numeric ``hours_per_day`` (e.g. \"eight\") used to crash
+        the calendar mapping inside ``float()``.  It must now be
+        rejected defensively -- the mapping is skipped, the rest of
+        the response succeeds normally.
+        """
+        nodes, links = self._chain()
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": "eight",
+                         "working_days": [1, 2, 3, 4, 5]},
+        })
+        assert "calendar" not in result
+        assert result["makespan"] >= 0  # the rest of the response works
+
+    def test_zero_hours_per_day_skips_mapping(self):
+        nodes, links = self._chain()
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 0,
+                         "working_days": [1, 2, 3, 4, 5]},
+        })
+        assert "calendar" not in result
+
+    def test_duplicate_working_days_dont_inflate_calendar(self):
+        """Same dedupe/clamp behaviour as _resolve_max_makespan, but
+        on the calendar-mapping side: duplicates and out-of-range
+        weekdays in working_days must be normalised so
+        calendar_working_days reflects what WorkingCalendar.build
+        actually used."""
+        nodes, links = self._chain()
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {
+                "hours_per_day": 8.0,
+                "working_days": [1, 1, 2, 2, 3, 8, 0],  # dups + OOR
+            },
+        })
+        cal = result["calendar"]
+        # Reported working days are deduped + clamped to ISO 1..7.
+        assert cal["calendar_working_days"] == [1, 2, 3]
 
     def test_start_date_alone_does_not_trigger(self):
         """Gating consistency with completion/monte_carlo: start_date
