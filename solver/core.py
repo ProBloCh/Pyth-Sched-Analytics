@@ -230,6 +230,15 @@ def run_pareto_endpoint(nodes, links, solver_config_dict,
     t0 = time.time()
 
     project_ctx = ProjectContext.from_dict(project_context_dict)
+    # Pareto runs ``optimizer.optimize`` per weight vector, so the
+    # hard-constraint penalty fires on every sub-call.  Without the
+    # same TimeUnits harmonisation that run_sensitivity / run_optimize
+    # apply, an ISO-resolved bound (``max_makespan_source ==
+    # 'iso_working_hours'``) would be compared against a non-Hours
+    # makespan in days/weeks units, mis-judging feasibility on every
+    # frontier point.  Mirror the same call here so all three
+    # endpoints make the same constraint-unit decision.
+    _harmonise_makespan_units(project_ctx, nodes)
     config = SolverConfig.from_dict(solver_config_dict, phase=project_ctx.phase)
     n_vec = int((solver_config_dict or {}).get('pareto_vectors', 30))
 
