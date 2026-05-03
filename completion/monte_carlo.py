@@ -1191,26 +1191,30 @@ def run_completion_mc(nodes, links, status_date,
 
     if not np.any(in_scope):
         # Nothing left to simulate -- all activities have ActualFinish.
-        # Clamp the reported completion date to status_ms: a project
-        # finished BEFORE the caller's status_date hasn't somehow
-        # un-spent the elapsed time, so reporting an earlier teac_date
-        # would yield AT > TEAC and SPI(t) > 1 (a "finished early"
-        # signal) for what is actually just a stale status_date.
-        # Mirrors evm.metrics.compute_earned_schedule's
-        # `teac_days = max(at_days, ...)` clamp.
-        latest_actual = float(np.nanmax(actual_finish_ms)) if np.any(
+        # Pre-existing finish-date fields (expected_finish, p20/p50/p80)
+        # report the actual completion date as-is, regardless of where
+        # status_date is.  This preserves the historical contract:
+        # consumers reading p80_finish for a closed-out project must
+        # still see the recorded completion, not the caller's status.
+        # Only the new `teac` block clamps to status_ms (via
+        # `teac_completion_ms` below), mirroring evm.metrics's
+        # `teac_days = max(at_days, ...)` so AT > TEAC > SPI(t) > 1
+        # can't fire on a stale-status report.
+        latest = float(np.nanmax(actual_finish_ms)) if np.any(
             np.isfinite(actual_finish_ms)) else status_ms
-        latest = max(latest_actual, status_ms)
         iso = _ms_to_iso(latest)
-        # All-finished projects still get a TEAC block so the response
-        # contract stays uniform; every percentile collapses to the
-        # clamped completion date and `flags.all_completed` makes the
-        # degeneracy explicit.
+        # TEAC-internal clamp: the new teac block's percentiles, the
+        # deterministic midpoint, and AT all reference status_ms; if
+        # the project actually finished earlier, the TEAC view is
+        # "you've spent at least AT, so TEAC >= AT".  Doesn't touch
+        # the public iso fields above.
+        teac_completion_ms = max(latest, status_ms)
         teac_block = _compose_teac_block(
             nodes=nodes,
             status_ms=status_ms,
-            expected_finish_ms=latest,
-            proj_finish_sorted=np.array([latest], dtype=np.float64),
+            expected_finish_ms=teac_completion_ms,
+            proj_finish_sorted=np.array(
+                [teac_completion_ms], dtype=np.float64),
             M_actual=1,
             in_scope_count=0)
         return {

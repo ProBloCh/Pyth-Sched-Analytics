@@ -1984,14 +1984,18 @@ class TestStochasticTEAC:
         assert teac['projectStartDate'] is None
         assert teac['flags'].get('no_baseline') is True
 
-    def test_all_completed_clamps_to_status(self):
-        """When the project has all-actual finishes earlier than the
-        caller's status_date, the reported teac_date must clamp to
-        status_ms -- otherwise teac_days < at_days, which inverts the
-        Lipke semantic (would imply the project ran "ahead of itself
-        by elapsed time").  Mirrors evm.metrics's
-        `teac_days = max(at_days, ...)` clamp.  Caught by Copilot
-        review round 2.
+    def test_all_completed_clamps_teac_only_not_public_fields(self):
+        """When all activities have ActualFinish earlier than the
+        caller's status_date:
+          - Inside the new `teac` block, teac_date clamps to status_ms
+            so AT > TEAC > SPI(t) > 1 can't fire on a stale-status
+            report (mirrors evm.metrics's max(at_days, ...) clamp).
+          - The PRE-EXISTING public fields (expected_finish, p20/p50/p80)
+            must keep reporting the actual completion date as-is, so
+            consumers reading p80_finish for a closed-out project still
+            see the recorded completion -- not the caller's status.
+        Caught across two rounds of Copilot review (round 2: clamp
+        needed; round 3: clamp must not leak into public contract).
         """
         nodes = [
             {'ID': 'A', 'Duration': 10, 'TimeUnits': 'days',
@@ -1999,16 +2003,27 @@ class TestStochasticTEAC:
              'Finish': '2024-01-11T00:00:00Z',
              'ActualFinish': '2024-01-12T00:00:00Z'},
         ]
-        # Status date 6 months later
+        # Status date 6 months later than the actual completion
         r = run_completion_mc(nodes, [], '2024-07-01T00:00:00Z',
                               config={'iterations': 50,
                                       'enable_risk': False})
+
+        # PRE-EXISTING fields preserve actual completion (NOT clamped)
+        assert r['expected_finish'].startswith('2024-01-12')
+        assert r['p20_finish'].startswith('2024-01-12')
+        assert r['p50_finish'].startswith('2024-01-12')
+        assert r['p80_finish'].startswith('2024-01-12')
+
+        # NEW `teac` block clamps to status_ms (Lipke TEAC >= AT)
         teac = r['teac']
         assert teac['flags'].get('all_completed') is True
-        # AT >= 0, TEAC >= AT (Lipke clamp)
         assert teac['actualTimeDays'] >= 0
         assert (teac['percentiles']['p50']['teac_days']
                 >= teac['actualTimeDays'])
+        # The clamped teac_date is at status_ms, not the actual
+        # completion.
+        assert teac['percentiles']['p50']['teac_date'].startswith(
+            '2024-07-01')
 
     def test_deterministic_carries_source_and_note(self):
         """The deterministic block must label itself as the MC CPM

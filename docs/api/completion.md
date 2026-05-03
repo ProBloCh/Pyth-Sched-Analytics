@@ -145,25 +145,34 @@ activity.
     "actualTimeDays":      45.0,    // AT = max(0, status - project_start).
     "percentiles": {                // TEAC band per percentile, anchored at
                                     //   projectStartDate (NOT status_date).
-      "p10": {"label": "P10",  "teac_days": 92.5,  "teac_date": "...",
-              "spi_t": 0.973,  "spi_t_model": 0.973,  "impact_days": -3.5},
+                                    //   teac_date == p{20,50,80}_finish above;
+                                    //   teac_days = teac_date - projectStartDate;
+                                    //   impact_days = teac_date - expected_finish.
+      "p10": {"label": "P10",  "teac_days":  87.0, "teac_date": "2025-02-26T00:00:00+00:00",
+              "spi_t": 1.034,  "spi_t_model": 1.034,  "impact_days": -3.0},
       // spi_t / spi_t_model are null when plannedDurationDays is null
       // (no baseline to compare against).
-      "p20": {"...": "..."},
-      "p50": {"label": "P50",  "teac_days": 102.3, "teac_date": "...",
-              "spi_t": 0.880,  "spi_t_model": 0.880,  "impact_days": 11.3},
-      "p80": {"label": "P80",  "teac_days": 115.0, "teac_date": "...",
-              "spi_t": 0.783,  "spi_t_model": 0.783,  "impact_days": 24.0},
-      "p95": {"...": "..."}
+      "p20": {"label": "P20",  "teac_days":  93.5, "teac_date": "2025-03-04T12:00:00+00:00",
+              "spi_t": 0.963,  "spi_t_model": 0.963,  "impact_days":  3.5},
+      "p50": {"label": "P50",  "teac_days": 101.3, "teac_date": "2025-03-12T08:00:00+00:00",
+              "spi_t": 0.888,  "spi_t_model": 0.888,  "impact_days": 11.3},
+      "p80": {"label": "P80",  "teac_days": 114.0, "teac_date": "2025-03-25T00:00:00+00:00",
+              "spi_t": 0.789,  "spi_t_model": 0.789,  "impact_days": 24.0},
+      "p95": {"label": "P95",  "teac_days": 121.0, "teac_date": "2025-04-01T00:00:00+00:00",
+              "spi_t": 0.744,  "spi_t_model": 0.744,  "impact_days": 31.0}
     },
     "deterministic": {              // No-risk-multiplier CPM midpoint of
-                                    //   the MC band.  NOT the same number
+                                    //   the MC band.  ALWAYS equal to the
+                                    //   top-level `expected_finish` above
+                                    //   (this block exposes it in TEAC form
+                                    //   so percentile spread can be read in
+                                    //   one response).  NOT the same number
                                     //   as /evm/analyze.actual.earnedSchedule
                                     //   .TEAC_date -- see `note` field.
-      "teac_days":   100.0,
-      "teac_date":   "2025-03-11T00:00:00+00:00",
-      "spi_t":       0.900,
-      "spi_t_model": 0.900,
+      "teac_days":   90.0,                                  // = expected_finish - projectStartDate
+      "teac_date":   "2025-03-01T00:00:00+00:00",           // = expected_finish (always)
+      "spi_t":       1.0,                                   // = PD / teac_days
+      "spi_t_model": 1.0,
       "source":      "mc_no_risk_cpm",
       "note":        "..."
     },
