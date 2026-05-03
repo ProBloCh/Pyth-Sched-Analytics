@@ -961,6 +961,45 @@ class TestHardConstraints:
         # of Jan 9 = 32 working hours.  Approximation would have given ~28.57.
         assert c["bound"] == pytest.approx(32.0, abs=0.5)
 
+    def test_iso_bound_handles_start_intraday(self):
+        """When start_date carries a time-of-day (or tz-aware input
+        converts to a non-UTC-midnight UTC time), the resolver must
+        subtract the intraday working portion already accrued before
+        start_ms.  Without this, the bound is overstated by up to
+        hours_per_day -- WorkingCalendar.build floors start_ms to
+        midnight, so the cumulative array starts counting from
+        midnight not from start_ms.
+        """
+        nodes = [
+            {"ID": "0", "Duration": 0},
+            {"ID": "1", "Duration": 1, "TimeUnits": "Hours"},
+        ]
+        links = [{"source": "0", "target": "1"}]
+        # Same span (4 working days), one with midnight start, one
+        # with a tz offset that places the UTC start at +5h.
+        midnight = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05T00:00:00+00:00",  # Mon midnight UTC
+            "calendar": {"hours_per_day": 8.0,
+                         "working_days": [1, 2, 3, 4, 5]},
+            "constraints": {"max_end_date": "2026-01-09T00:00:00+00:00"},
+        })
+        intraday = run_sensitivity(nodes, links, {}, {}, {
+            # Mon midnight EST = Mon 05:00 UTC -> 5h of accrued
+            # working time before start that must be subtracted.
+            "start_date": "2026-01-05T00:00:00-05:00",
+            "calendar": {"hours_per_day": 8.0,
+                         "working_days": [1, 2, 3, 4, 5]},
+            # Use a matching tz-aware end so both spans cover the same
+            # absolute interval; differs only in start-of-day intraday.
+            "constraints": {"max_end_date": "2026-01-09T00:00:00-05:00"},
+        })
+        # Both intervals span exactly 4 calendar days (Mon->Fri midnight),
+        # which is 4 whole working days = 32h regardless of UTC offset.
+        # The pre-fix code overstated the tz-aware case by 5h (the
+        # accrued intraday before the offset start).
+        assert midnight["constraints"]["max_makespan"]["bound"] == pytest.approx(
+            intraday["constraints"]["max_makespan"]["bound"], abs=0.5)
+
     def test_iso_bound_honors_holidays(self):
         """Holidays in the span must reduce the resolved bound, just
         like they would in the calendar mapping side."""

@@ -251,15 +251,38 @@ def _resolve_max_makespan(max_makespan_raw, max_end_date_raw, start_date_raw,
         start_ms=start_ms,
         horizon_days=horizon_days,
     )
-    # Find the day index where end_ms falls; cumulative working hours
-    # *up to the start of that day* + intraday working portion.
+    # WorkingCalendar.build floors start_ms to UTC midnight, so the
+    # cumulative `work_hours_before` array starts counting from
+    # midnight of start_day -- not from start_ms itself.  When
+    # start_ms has a time-of-day (e.g. tz-aware '2026-01-05T00:00:00-05:00'
+    # converts to '2026-01-05T05:00:00Z'), we must subtract the
+    # intraday working portion already accrued before start_ms,
+    # otherwise the resolved bound is overstated by up to hours_per_day.
+    # Mirrors the (work_before + intraday) accrual that
+    # advance_working_ms uses internally.
+    def _intraday_hours(epoch_offset_ms, day_idx):
+        if day_idx < 0 or day_idx >= cal.K:
+            return 0.0
+        if not bool(cal.is_working[day_idx]):
+            return 0.0
+        if epoch_offset_ms <= 0:
+            return 0.0
+        return min(epoch_offset_ms / 3_600_000.0, hpd)
+
     end_day_idx = int((end_ms - cal.epoch_start_ms) // 86_400_000)
     end_day_idx = max(0, min(end_day_idx, cal.K))
-    working_hours = float(cal.work_hours_before[end_day_idx])
-    intraday_ms = end_ms - (cal.epoch_start_ms + end_day_idx * 86_400_000)
-    if (end_day_idx < cal.K and intraday_ms > 0
-            and bool(cal.is_working[end_day_idx])):
-        working_hours += min(intraday_ms / 3_600_000.0, hpd)
+    end_intraday = _intraday_hours(
+        end_ms - (cal.epoch_start_ms + end_day_idx * 86_400_000),
+        end_day_idx)
+
+    start_day_idx = 0  # calendar built so epoch_start_ms == midnight of start_day
+    start_intraday = _intraday_hours(
+        start_ms - cal.epoch_start_ms, start_day_idx)
+
+    accrued_to_end = float(cal.work_hours_before[end_day_idx]) + end_intraday
+    accrued_to_start = (float(cal.work_hours_before[start_day_idx])
+                        + start_intraday)
+    working_hours = accrued_to_end - accrued_to_start
     if working_hours > 0:
         return working_hours, 'iso_working_hours'
     return None, None
