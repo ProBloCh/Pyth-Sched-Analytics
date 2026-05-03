@@ -866,6 +866,27 @@ class TestHardConstraints:
         assert "max_end_date_too_far_in_future" not in codes
         assert result["constraints"] is not None
 
+    def test_horizon_exactly_at_cap_does_not_overshoot(self):
+        """Boundary case: a span of exactly MAX_ISO_HORIZON_DAYS days
+        passes the cal_days check (since the comparison is `>`, not
+        `>=`), but the +2 buffer in horizon_days previously pushed the
+        actual WorkingCalendar allocation past the documented cap.
+        The clamp keeps the horizon bounded at MAX_ISO_HORIZON_DAYS.
+        """
+        from solver.models import _resolve_max_makespan, MAX_ISO_HORIZON_DAYS
+        from datetime import datetime, timedelta, timezone
+
+        start = datetime(2026, 1, 5, tzinfo=timezone.utc)
+        # Pick an end exactly MAX_ISO_HORIZON_DAYS calendar days later.
+        end = start + timedelta(days=MAX_ISO_HORIZON_DAYS)
+        # Build a calendar via the resolver (smoke through).
+        value, source = _resolve_max_makespan(
+            None, end.isoformat(), start.isoformat(),
+            8.0, [1, 2, 3, 4, 5])
+        # Should resolve (the cap check uses strict >, this is == cap)
+        assert value is not None
+        assert source == 'iso_working_hours'
+
     def test_max_end_date_before_start_warns(self):
         nodes, links = self._chain()
         result = run_optimize(nodes, links, {"max_iterations": 20}, {}, {

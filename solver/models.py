@@ -267,7 +267,12 @@ def _resolve_max_makespan(max_makespan_raw, max_end_date_raw, start_date_raw,
         return None, None
     # Horizon: cover the full span plus a one-day buffer so day-index
     # math doesn't fall off the end on exact-boundary alignments.
-    horizon_days = int(cal_days) + 2
+    # Clamp to MAX_ISO_HORIZON_DAYS so the actual WorkingCalendar
+    # allocation never exceeds the documented cap (the cal_days
+    # check above bounds the input span; the clamp here bounds the
+    # output horizon, accounting for the +2 buffer at boundary
+    # cases like cal_days == 3650).
+    horizon_days = min(int(cal_days) + 2, MAX_ISO_HORIZON_DAYS)
     cal = WorkingCalendar.build(
         hours_per_day=hpd,
         working_days=working_days,
