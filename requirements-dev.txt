@@ -1,0 +1,23 @@
+# Development-only dependencies.  Not installed in the production
+# Docker image -- requirements.txt is the runtime contract.
+#
+# Install with:  pip install -r requirements-dev.txt
+#
+# Currently scoped to two safe, additive tools that unblock the
+# library-upgrade backlog in REMAINING_WORK.md section 6 without
+# changing runtime behaviour or the deployed image.
+
+# Sampling profiler.  Attaches to a running gunicorn worker without
+# modifying its code; produces a flame graph or speedscope trace.
+# Used to gate the orjson / flask-compress / numba decisions
+# (REMAINING_WORK 6.1) -- ship those only when py-spy confirms the
+# corresponding hot path.
+#
+# Usage:  py-spy record -o trace.svg --pid <gunicorn-worker-pid>
+py-spy==0.4.0
+
+# Property-based test generator.  Augments the JS-vs-Py diff
+# harnesses (tests/diff_harness/) with random FS/SS/FF/SF + lag DAG
+# fixtures so structural invariants are exercised beyond the curated
+# fixtures.  See REMAINING_WORK 6.2.
+hypothesis==6.115.5
