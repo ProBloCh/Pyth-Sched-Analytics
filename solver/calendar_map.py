@@ -108,9 +108,20 @@ def _dominant_time_units(nodes):
         # project of mostly Days-units activities plus a single
         # milestone would tie at (Hours-via-default, Days-explicit) and
         # pick Hours by insertion order, skewing the calendar mapping.
+        # Coerce to float so any zero-equivalent representation
+        # (0, 0.0, '0', '0.0', '0.00', etc.) is caught -- the static
+        # sentinel set used elsewhere in the codebase misses '0.0'.
         dur_raw = n.get('Duration', n.get('duration', 0))
-        if dur_raw in ('', None, 0, 0.0, '0'):
+        if dur_raw in ('', None):
             continue
+        try:
+            if float(dur_raw) <= 0:
+                continue
+        except (TypeError, ValueError):
+            # Non-numeric Duration: keep voting (the activity still
+            # has TimeUnits intent), conversion-side handles the bad
+            # value.
+            pass
         u = n.get('TimeUnits') or n.get('timeUnits')
         if u is None or u == '':
             key = _DEFAULT_TIME_UNITS.lower()

@@ -476,12 +476,31 @@ def _resolve_constraint_warnings(project_ctx, project_context_dict):
                         'to parse as ISO 8601; the constraint was '
                         'ignored.'),
         }]
-    if (end - start).total_seconds() <= 0:
+    span_seconds = (end - start).total_seconds()
+    if span_seconds <= 0:
         return [{
             'code': 'max_end_date_before_start',
             'message': ('constraints.max_end_date is on or before '
                         'project start_date; the constraint was '
                         'ignored.'),
+        }]
+    # Reject spans beyond the resolver's horizon cap with a specific
+    # code rather than letting the user think the calendar config is
+    # at fault.  Cap value imported from the resolver so the two stay
+    # in sync; default fallback keeps tests stable on import failure.
+    try:
+        from .models import MAX_ISO_HORIZON_DAYS as _CAP
+    except ImportError:
+        _CAP = 3650
+    if span_seconds / 86400.0 > _CAP:
+        return [{
+            'code': 'max_end_date_too_far_in_future',
+            'message': (
+                f'constraints.max_end_date is more than {_CAP} days '
+                f'after start_date; the constraint was ignored to '
+                f'avoid allocating an unbounded WorkingCalendar.  '
+                f'Tighten the bound or pass constraints.max_makespan '
+                f'as a numeric value in solver time units.'),
         }]
     # _resolve_max_makespan now resolves ISO bounds via WorkingCalendar
     # rather than the old average-week approximation, so failure modes

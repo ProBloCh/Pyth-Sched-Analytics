@@ -215,17 +215,31 @@ def _significant_evm_dates(nodes, must_include=None):
         idx = np.linspace(0, len(sorted_dates) - 1,
                           _ES_MAX_DATES).astype(int)
         kept = {sorted_dates[i] for i in idx}
+        # Project first/last must survive the swap below: ES uses them
+        # to compute project_start, project_finish, and PD; dropping
+        # either would corrupt all downstream calculations on large
+        # capped projects.  ``linspace(0, N-1, K)`` always includes
+        # index 0 and N-1 so they're in ``kept`` initially -- we just
+        # have to refuse to drop them in the swap.
+        protected = set(must)
+        if sorted_dates:
+            protected.add(sorted_dates[0])
+            protected.add(sorted_dates[-1])
         # Guarantee the must-include dates survive the subsample by
-        # swapping them in for an arbitrary kept neighbour.  This
-        # preserves len(result) <= _ES_MAX_DATES exactly.
+        # swapping them in for an arbitrary kept neighbour (chosen
+        # deterministically from the sorted interior to keep behaviour
+        # reproducible across runs).
         for m in must:
             if m in kept:
                 continue
-            # Drop a kept date that's NOT a must-include and add ``m``.
-            droppable = next((k for k in kept if k not in must), None)
+            droppable = next(
+                (k for k in sorted(kept) if k not in protected), None)
             if droppable is not None:
                 kept.discard(droppable)
                 kept.add(m)
+                # Once swapped in, ``m`` itself becomes protected so
+                # it isn't picked as a droppable on a later iteration.
+                protected.add(m)
         sorted_dates = sorted(kept)
     return sorted_dates
 

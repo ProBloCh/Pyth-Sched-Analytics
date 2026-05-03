@@ -834,6 +834,38 @@ class TestHardConstraints:
         codes = [w.get("code") for w in result.get("warnings", [])]
         assert "malformed_max_end_date" in codes
 
+    def test_max_end_date_too_far_in_future_warns(self):
+        """An untrusted ``max_end_date`` arbitrarily far in the future
+        would cause WorkingCalendar to allocate huge numpy arrays;
+        the resolver caps at MAX_ISO_HORIZON_DAYS (10 years) and the
+        warning resolver names the cause specifically rather than
+        letting it slip through as malformed_calendar_config."""
+        nodes, links = self._chain()
+        result = run_optimize(nodes, links, {"max_iterations": 20}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0,
+                         "working_days": [1, 2, 3, 4, 5]},
+            # 50 years in the future -> well over the 3650-day cap.
+            "constraints": {"max_end_date": "2076-01-05"},
+        })
+        codes = [w.get("code") for w in result.get("warnings", [])]
+        assert "max_end_date_too_far_in_future" in codes
+        assert result.get("constraints") is None
+
+    def test_max_end_date_within_cap_resolves(self):
+        """Sanity: a 9-year-out bound is just under the 10-year cap and
+        must resolve cleanly (not trigger the new warning)."""
+        nodes, links = self._chain()
+        result = run_optimize(nodes, links, {"max_iterations": 20}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0,
+                         "working_days": [1, 2, 3, 4, 5]},
+            "constraints": {"max_end_date": "2035-01-05"},
+        })
+        codes = [w.get("code") for w in result.get("warnings", [])]
+        assert "max_end_date_too_far_in_future" not in codes
+        assert result["constraints"] is not None
+
     def test_max_end_date_before_start_warns(self):
         nodes, links = self._chain()
         result = run_optimize(nodes, links, {"max_iterations": 20}, {}, {
@@ -1360,6 +1392,33 @@ class TestCalendarMapping:
         assert result["calendar"]["mixed_time_units"] is False
         # Canonical representative is the first-seen casing.
         assert result["calendar"]["time_units"] == "Hours"
+
+    def test_string_zero_duration_milestone_excluded_from_unit_vote(self):
+        """The static sentinel set ('', None, 0, 0.0, '0') used to
+        miss '0.0' (and '0.00' etc.), which let those-encoded
+        milestones vote on TimeUnits.  Float coercion catches every
+        zero-equivalent representation."""
+        nodes = [
+            # Milestones encoded as common variants of zero.
+            {"ID": "0", "Duration": "0.0"},
+            {"ID": "0b", "Duration": "0.00", "TimeUnits": "Days"},
+            # The actual schedule -- units must come from this row.
+            {"ID": "1", "Duration": 80, "TimeUnits": "Hours"},
+        ]
+        links = [
+            {"source": "0", "target": "0b"}, {"source": "0b", "target": "1"},
+        ]
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0,
+                         "working_days": [1, 2, 3, 4, 5]},
+        })
+        # '0.0' / '0.00' milestones must NOT vote -- the only voting
+        # activity is the 80-hour task, so units = Hours and the
+        # mixed flag stays False.
+        cal = result["calendar"]
+        assert cal["time_units"] == "Hours"
+        assert cal["mixed_time_units"] is False
 
     def test_missing_time_units_votes_default_hours(self):
         """An activity without an explicit TimeUnits field votes for

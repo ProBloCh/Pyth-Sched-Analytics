@@ -157,6 +157,13 @@ class ProjectContext:
         )
 
 
+# Hard cap on the number of calendar days the WorkingCalendar in
+# _resolve_max_makespan will allocate.  Mirrors completion.calendar's
+# estimate_horizon_days ceiling.  Exposed for the warning resolver
+# (solver/core.py::_resolve_constraint_warnings) and for tests.
+MAX_ISO_HORIZON_DAYS = 3650
+
+
 def _safe_constraint(value):
     """Coerce a constraint value to a positive float, else None."""
     if value is None:
@@ -241,6 +248,19 @@ def _resolve_max_makespan(max_makespan_raw, max_end_date_raw, start_date_raw,
         return None, None
     start_ms = start.timestamp() * 1000.0
     end_ms = end.timestamp() * 1000.0
+    # Hard-cap horizon_days at 10 years (3650).  WorkingCalendar
+    # allocates several O(K) numpy arrays of shape (K,), so an
+    # untrusted ``max_end_date`` arbitrarily far in the future would
+    # otherwise be a DoS / memory-spike vector on the API
+    # (e.g. max_end_date='9999-12-31' -> ~3M days = ~24 MB per array
+    # times multiple arrays).  Spans beyond the cap are unrealistic
+    # for any project that the solver could meaningfully optimise;
+    # the warning resolver detects this via an independent re-check
+    # of cal_days and emits the ``max_end_date_too_far_in_future``
+    # warning.  The 3650 ceiling matches
+    # completion.calendar.estimate_horizon_days's max_days.
+    if cal_days > MAX_ISO_HORIZON_DAYS:
+        return None, None
     # Horizon: cover the full span plus a one-day buffer so day-index
     # math doesn't fall off the end on exact-boundary alignments.
     horizon_days = int(cal_days) + 2

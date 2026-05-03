@@ -444,6 +444,48 @@ class TestEarnedSchedule:
                 f'Vectorised PV mismatch at date {d.date()}: '
                 f'vec={vec[k]} scalar={scalar}')
 
+    def test_cap_swap_preserves_first_and_last(self):
+        """The cap's must-include swap must NOT drop the project's
+        first/last breakpoints -- ES uses them to compute project_start,
+        project_finish, and PD.  Pre-fix the swap could pick either
+        end-date as 'droppable' because ``kept`` is a set (unordered).
+        """
+        from datetime import datetime, timedelta, timezone
+        from evm.metrics import _significant_evm_dates, _ES_MAX_DATES
+
+        nodes = []
+        base = datetime(2020, 1, 1)
+        for i in range(_ES_MAX_DATES * 2):
+            s = base + timedelta(days=i)
+            nodes.append({
+                'ID': str(i),
+                'Duration': 1, 'TimeUnits': 'days',
+                'Start': s.strftime('%Y-%m-%d'),
+                'Finish': (s + timedelta(days=1)).strftime('%Y-%m-%d'),
+            })
+        # Pick several must-include dates that aren't natural
+        # breakpoints; the swap loop must keep the project first/last
+        # AND the must-includes.
+        must_dates = [
+            '2021-03-15', '2021-06-15', '2021-09-15', '2021-12-15',
+            '2022-03-15', '2022-06-15',
+        ]
+        result = _significant_evm_dates(nodes, must_include=must_dates)
+        assert len(result) <= _ES_MAX_DATES
+
+        # Project first/last must survive (they drive PD).
+        first_expected = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        # Last activity has Finish = base + (N-1+1) days
+        last_expected = (base + timedelta(days=_ES_MAX_DATES * 2)
+                         ).replace(tzinfo=timezone.utc)
+        assert first_expected in result
+        assert last_expected in result
+
+        # All must-include dates must survive too.
+        for d in must_dates:
+            assert datetime.strptime(d, '%Y-%m-%d').replace(
+                tzinfo=timezone.utc) in result
+
     def test_significant_dates_cap_preserved_with_status_date(self):
         """Inserting status_date into the date grid must NOT push the
         post-cap count past _ES_MAX_DATES.  Round 5 fix: must_include
