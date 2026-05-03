@@ -933,6 +933,60 @@ class TestHardConstraints:
             f"ISO bound not converted to Days: bound={c['bound']}")
         assert c["satisfied"] is True
 
+    def test_iso_bound_uses_exact_workingcalendar(self):
+        """The resolver must compute ISO bounds via the same
+        WorkingCalendar that drives the response mapping -- not the
+        average-week ``cal_days * (wd/7) * hpd`` approximation, which
+        is off by 5-15% on short spans (e.g. Mon -> Fri under a 5x8
+        calendar resolves to ~5.7 wd not 5).
+        """
+        # Mon Jan 5 2026 -> Fri Jan 9 2026 = 5 calendar days, but only
+        # 4 working days strictly between them under Mon-Fri.  The
+        # cumulative-hours array gives ``work_hours_before[end_day]``
+        # = 4 * 8 = 32h (whole working days from start through start
+        # of end day).  The old approximation gave
+        # 5 * (5/7) * 8 ~= 28.57h.
+        nodes = [
+            {"ID": "0", "Duration": 0},
+            {"ID": "1", "Duration": 1, "TimeUnits": "Hours"},
+        ]
+        links = [{"source": "0", "target": "1"}]
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5]},
+            "constraints": {"max_end_date": "2026-01-09"},
+        })
+        c = result["constraints"]["max_makespan"]
+        # Exact: 4 whole working days from start of Jan 5 through start
+        # of Jan 9 = 32 working hours.  Approximation would have given ~28.57.
+        assert c["bound"] == pytest.approx(32.0, abs=0.5)
+
+    def test_iso_bound_honors_holidays(self):
+        """Holidays in the span must reduce the resolved bound, just
+        like they would in the calendar mapping side."""
+        nodes = [
+            {"ID": "0", "Duration": 0},
+            {"ID": "1", "Duration": 1, "TimeUnits": "Hours"},
+        ]
+        links = [{"source": "0", "target": "1"}]
+        no_hol = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",  # Mon
+            "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5]},
+            "constraints": {"max_end_date": "2026-01-23"},  # Fri (3 weeks later)
+        })
+        with_hol = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {
+                "hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5],
+                "holidays": ["2026-01-19"],  # MLK Day, Mon
+            },
+            "constraints": {"max_end_date": "2026-01-23"},
+        })
+        # One holiday in the span -> exactly 8 fewer working hours.
+        assert (no_hol["constraints"]["max_makespan"]["bound"]
+                - with_hol["constraints"]["max_makespan"]["bound"]
+                == pytest.approx(8.0, abs=0.5))
+
     def test_iso_bound_in_days_can_be_violated(self):
         """Symmetry check: a tight ISO bound on a Days-units schedule
         must be reported as violated when the makespan exceeds it,

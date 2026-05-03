@@ -141,6 +141,7 @@ class ProjectContext:
             start_date,
             calendar.get('hours_per_day', 8.0),
             calendar.get('working_days', [1, 2, 3, 4, 5]),
+            calendar.get('holidays') or [],
         )
         return cls(
             hours_per_day=calendar.get('hours_per_day', 8.0),
@@ -170,7 +171,7 @@ def _safe_constraint(value):
 
 
 def _resolve_max_makespan(max_makespan_raw, max_end_date_raw, start_date_raw,
-                          hours_per_day, working_days):
+                          hours_per_day, working_days, holidays=None):
     """Resolve a numeric max_makespan plus its source-tag.
 
     Priority (returns ``(value, source)`` -- ``(None, None)`` when
@@ -181,9 +182,10 @@ def _resolve_max_makespan(max_makespan_raw, max_end_date_raw, start_date_raw,
          backward-compatible with callers that passed a number here).
                                                     -> ('numeric')
       3. ISO ``constraints.max_end_date`` plus an ISO project
-         ``start_date``: convert the calendar-day difference to working
-         hours using the supplied hours_per_day and
-         working_days_per_week.                     -> ('iso_working_hours')
+         ``start_date``: working hours from start to end computed
+         **exactly** via the same ``WorkingCalendar`` that backs the
+         calendar mapping (honours weekends and holidays, no
+         average-week approximation).              -> ('iso_working_hours')
 
     The source tag distinguishes the two unit conventions: numeric
     values are already in the solver's time units (whatever the
@@ -218,15 +220,6 @@ def _resolve_max_makespan(max_makespan_raw, max_end_date_raw, start_date_raw,
     cal_days = (end - start).total_seconds() / 86400.0
     if cal_days <= 0:
         return None, None
-    # Match completion.calendar.WorkingCalendar.build's filtering
-    # exactly: clamp to ISO weekdays 1..7 and deduplicate via a set.
-    # Without this, malformed/duplicated working_days lists (e.g.
-    # [1, 1, 2, 8] or [0, 1, 2, 3, 4, 5]) would inflate wd_count
-    # past 5 and disagree with the calendar that actually drives the
-    # response mapping.
-    wd_count = len({int(d) for d in (working_days or [])
-                    if isinstance(d, (int, float))
-                    and 1 <= int(d) <= 7}) or 5
     # Validate hours_per_day explicitly rather than relying on
     # ``or 8.0``: that idiom silently swaps 0 for 8.0, which masks
     # genuinely malformed calendar configs (NaN, "0", negative).
@@ -236,7 +229,37 @@ def _resolve_max_makespan(max_makespan_raw, max_end_date_raw, start_date_raw,
         return None, None
     if not np.isfinite(hpd) or hpd <= 0:
         return None, None
-    working_hours = cal_days * (wd_count / 7.0) * hpd
+    # Resolve via the exact WorkingCalendar (matches calendar_map's
+    # mapping in the same response, honours holidays + weekday
+    # alignment).  The previous `cal_days * (wd_count/7) * hpd`
+    # approximation was off by 5-15% on short spans where weekday
+    # alignment matters (e.g. Mon -> Tue under a 5x8 calendar resolved
+    # to ~5.7h instead of 8h).
+    try:
+        from completion.calendar import WorkingCalendar
+    except ImportError:
+        return None, None
+    start_ms = start.timestamp() * 1000.0
+    end_ms = end.timestamp() * 1000.0
+    # Horizon: cover the full span plus a one-day buffer so day-index
+    # math doesn't fall off the end on exact-boundary alignments.
+    horizon_days = int(cal_days) + 2
+    cal = WorkingCalendar.build(
+        hours_per_day=hpd,
+        working_days=working_days,
+        holidays=holidays or [],
+        start_ms=start_ms,
+        horizon_days=horizon_days,
+    )
+    # Find the day index where end_ms falls; cumulative working hours
+    # *up to the start of that day* + intraday working portion.
+    end_day_idx = int((end_ms - cal.epoch_start_ms) // 86_400_000)
+    end_day_idx = max(0, min(end_day_idx, cal.K))
+    working_hours = float(cal.work_hours_before[end_day_idx])
+    intraday_ms = end_ms - (cal.epoch_start_ms + end_day_idx * 86_400_000)
+    if (end_day_idx < cal.K and intraday_ms > 0
+            and bool(cal.is_working[end_day_idx])):
+        working_hours += min(intraday_ms / 3_600_000.0, hpd)
     if working_hours > 0:
         return working_hours, 'iso_working_hours'
     return None, None

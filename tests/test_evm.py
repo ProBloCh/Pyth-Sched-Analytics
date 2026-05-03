@@ -444,6 +444,36 @@ class TestEarnedSchedule:
                 f'Vectorised PV mismatch at date {d.date()}: '
                 f'vec={vec[k]} scalar={scalar}')
 
+    def test_significant_dates_cap_preserved_with_status_date(self):
+        """Inserting status_date into the date grid must NOT push the
+        post-cap count past _ES_MAX_DATES.  Round 5 fix: must_include
+        is applied BEFORE capping so the broadcast in
+        _vectorised_pv_curve respects the documented size ceiling.
+        """
+        from datetime import datetime, timedelta, timezone
+        from evm.metrics import _significant_evm_dates, _ES_MAX_DATES
+
+        # Build a project with many more breakpoints than the cap.
+        nodes = []
+        base = datetime(2020, 1, 1)
+        for i in range(_ES_MAX_DATES * 3):  # 1500 -> well over the 500 cap
+            s = base + timedelta(days=i)
+            nodes.append({
+                'ID': str(i),
+                'Duration': 1, 'TimeUnits': 'days',
+                'Start': s.strftime('%Y-%m-%d'),
+                'Finish': (s + timedelta(days=1)).strftime('%Y-%m-%d'),
+            })
+
+        # Status date must round-trip through safe_date to land
+        # tz-aware UTC at midnight, matching what _significant_evm_dates
+        # stores internally.
+        sd_iso = '2021-07-15'
+        result = _significant_evm_dates(nodes, must_include=[sd_iso])
+        assert len(result) <= _ES_MAX_DATES
+        expected_sd = datetime(2021, 7, 15, tzinfo=timezone.utc)
+        assert expected_sd in result
+
     def test_large_project_performance(self):
         """ES on 5K activities must complete in well under a second.
 

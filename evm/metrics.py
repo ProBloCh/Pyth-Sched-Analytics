@@ -177,7 +177,7 @@ def compute_eac(bac: float, cpi: float, spi: float = 1.0,
 _ES_MAX_DATES = 500
 
 
-def _significant_evm_dates(nodes):
+def _significant_evm_dates(nodes, must_include=None):
     """Sorted unique list of activity Start / Finish dates, capped.
 
     BCWS is piecewise-linear in time: each activity contributes a linear
@@ -186,6 +186,14 @@ def _significant_evm_dates(nodes):
     samples is exact for projects up to ``_ES_MAX_DATES`` activities.
     Larger projects subsample the grid uniformly, accepting a small
     interpolation error in exchange for bounded compute.
+
+    ``must_include`` is an optional iterable of dates (e.g. the EVM
+    status_date) that the caller needs preserved in the grid even if
+    capping would otherwise drop them.  Including them here -- before
+    the cap -- guarantees ``len(result) <= _ES_MAX_DATES`` while still
+    letting AT readings line up with a sample.  Without this, a
+    later insertion would push the count to ``_ES_MAX_DATES + 1``
+    and break the broadcast-size ceiling in ``_vectorised_pv_curve``.
     """
     out = set()
     for n in nodes or []:
@@ -195,11 +203,30 @@ def _significant_evm_dates(nodes):
             out.add(s.replace(hour=0, minute=0, second=0, microsecond=0))
         if f is not None:
             out.add(f.replace(hour=0, minute=0, second=0, microsecond=0))
+    must = set()
+    for d in (must_include or []):
+        dt = safe_date(d)
+        if dt is not None:
+            must.add(dt.replace(hour=0, minute=0, second=0, microsecond=0))
+    out |= must
+
     sorted_dates = sorted(out)
     if len(sorted_dates) > _ES_MAX_DATES:
         idx = np.linspace(0, len(sorted_dates) - 1,
                           _ES_MAX_DATES).astype(int)
-        sorted_dates = [sorted_dates[i] for i in sorted(set(idx))]
+        kept = {sorted_dates[i] for i in idx}
+        # Guarantee the must-include dates survive the subsample by
+        # swapping them in for an arbitrary kept neighbour.  This
+        # preserves len(result) <= _ES_MAX_DATES exactly.
+        for m in must:
+            if m in kept:
+                continue
+            # Drop a kept date that's NOT a must-include and add ``m``.
+            droppable = next((k for k in kept if k not in must), None)
+            if droppable is not None:
+                kept.discard(droppable)
+                kept.add(m)
+        sorted_dates = sorted(kept)
     return sorted_dates
 
 
@@ -292,15 +319,17 @@ def compute_earned_schedule(nodes, status_date, hours_per_day: float = 8.0,
     use, so the curves are dimensionally consistent for interpolation.
     """
     sd = safe_date(status_date)
-    significant = _significant_evm_dates(nodes)
 
     flags = {}
-    if not significant:
+    # Preliminary scan for project start/finish to feed must_include.
+    # _significant_evm_dates is cheap (single pass over nodes) but we
+    # only need its first/last elements at this point.
+    bare = _significant_evm_dates(nodes)
+    if not bare:
         flags['no_baseline'] = True
         return _empty_es(flags)
-
-    project_start = significant[0]
-    project_finish = significant[-1]
+    project_start = bare[0]
+    project_finish = bare[-1]
     pd_days = max(
         difference_in_calendar_days(project_finish, project_start), 0.0)
 
@@ -308,16 +337,13 @@ def compute_earned_schedule(nodes, status_date, hours_per_day: float = 8.0,
         sd = project_start
         flags['status_date_missing'] = True
 
-    # Always include the status date so AT can be read off the same grid.
     sd_mid = sd.replace(hour=0, minute=0, second=0, microsecond=0)
-    if sd_mid not in significant:
-        # Insertion-sorted to preserve monotonicity.
-        idx = 0
-        for d in significant:
-            if d > sd_mid:
-                break
-            idx += 1
-        significant.insert(idx, sd_mid)
+
+    # Build the date grid with status_date guaranteed in -- before
+    # capping -- so len(significant) <= _ES_MAX_DATES holds even when
+    # status_date isn't a natural breakpoint and would otherwise have
+    # required a post-cap insertion.
+    significant = _significant_evm_dates(nodes, must_include=[sd_mid])
 
     ev_hours = compute_bcwp_hours(
         nodes, hours_per_day, working_days_per_week)

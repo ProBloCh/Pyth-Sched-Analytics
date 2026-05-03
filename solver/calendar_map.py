@@ -159,9 +159,19 @@ def map_makespan_to_date(makespan, project_ctx, project_ctx_dict=None,
     that the response should omit the calendar block.
     """
     if makespan is None or makespan < 0 or not math.isfinite(makespan):
+        logger.info(
+            "calendar mapping skipped: makespan=%r is missing or non-finite",
+            makespan)
         return None
-    start_ms = _parse_iso_to_ms(getattr(project_ctx, 'start_date', None))
+    raw_start = getattr(project_ctx, 'start_date', None)
+    start_ms = _parse_iso_to_ms(raw_start)
     if start_ms is None:
+        # Only log when the caller actually tried to provide one --
+        # absent start_date is the gating signal, not a config error.
+        if raw_start is not None:
+            logger.warning(
+                "calendar mapping skipped: start_date=%r is not parseable as ISO",
+                raw_start)
         return None
 
     cal_cfg = (project_ctx_dict or {}).get('calendar') or {}
@@ -180,8 +190,14 @@ def map_makespan_to_date(makespan, project_ctx, project_ctx_dict=None,
     try:
         hours_per_day = float(raw_hpd) if raw_hpd is not None else 8.0
     except (TypeError, ValueError):
+        logger.warning(
+            "calendar mapping skipped: hours_per_day=%r is not numeric",
+            raw_hpd)
         return None
     if not math.isfinite(hours_per_day) or hours_per_day <= 0:
+        logger.warning(
+            "calendar mapping skipped: hours_per_day=%r is non-finite or "
+            "non-positive", raw_hpd)
         return None
 
     working_days = getattr(project_ctx, 'working_days', None) or [1, 2, 3, 4, 5]
@@ -205,6 +221,10 @@ def map_makespan_to_date(makespan, project_ctx, project_ctx_dict=None,
     # or wrap around, and advance_working_ms would return nonsense.
     # Guard explicitly.
     if not (math.isfinite(makespan_hours) and makespan_hours >= 0):
+        logger.warning(
+            "calendar mapping skipped: post-conversion makespan_hours=%r "
+            "is non-finite (Duration=%r, units=%r)",
+            makespan_hours, makespan, units)
         return None
 
     horizon_days = estimate_horizon_days(

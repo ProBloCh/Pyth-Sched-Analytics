@@ -483,15 +483,21 @@ def _resolve_constraint_warnings(project_ctx, project_context_dict):
                         'project start_date; the constraint was '
                         'ignored.'),
         }]
-    # _resolve_max_makespan falls back to wd_count=5 when working_days
-    # is empty/invalid, so the only way to land here in practice is a
-    # bad hours_per_day (non-numeric, NaN, +/-Inf, or non-positive).
-    # The message points at that specifically rather than implying
-    # working_days could also be the culprit.
+    # _resolve_max_makespan now resolves ISO bounds via WorkingCalendar
+    # rather than the old average-week approximation, so failure modes
+    # are: (a) bad hours_per_day (non-numeric, NaN, +/-Inf, non-positive)
+    # which is rejected explicitly inside the resolver, or (b) zero
+    # working hours over the [start, end) span (e.g. both endpoints
+    # fall on weekends with no working days between them, or every day
+    # in the span is a holiday).  Both cases produce a non-positive
+    # bound; the message names them together.
     return [{
         'code': 'malformed_calendar_config',
         'message': ('constraints.max_end_date and start_date are '
-                    'both valid ISO dates but calendar.hours_per_day '
-                    'is non-numeric, non-finite, or non-positive; '
-                    'the constraint was ignored.'),
+                    'both valid ISO dates and end > start, but the '
+                    'calendar configuration yields zero working '
+                    'hours: either calendar.hours_per_day is '
+                    'non-numeric / non-finite / non-positive, or '
+                    'every day in the span is non-working.  The '
+                    'constraint was ignored.'),
     }]
