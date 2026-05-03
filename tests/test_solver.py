@@ -730,6 +730,49 @@ class TestHardConstraints:
         assert c["final_value"] > 0
         assert c["bound"] == 1000.0
 
+    def test_max_budget_actually_moves_solution(self):
+        """The constraint penalty must demonstrably push the optimizer.
+
+        Setup: disciplines exclude cost, so only the constraint can pull
+        resources / durations down -- if the budget penalty is wired up
+        correctly, the constrained final cost is materially lower than
+        the unconstrained baseline.  Avoids the "vacuous test" failure
+        mode where the optimizer is at the bound for unrelated reasons.
+        """
+        nodes = [
+            {"ID": "0", "Duration": 0},
+            {"ID": "1", "Duration": 20},
+            {"ID": "2", "Duration": 25},
+        ]
+        links = [
+            {"source": "0", "target": "1"},
+            {"source": "1", "target": "2"},
+        ]
+        meta = {
+            "1": {"resource_count": 8.0, "resource_rate": 100.0,
+                  "crash_max_fraction": 0.1},
+            "2": {"resource_count": 8.0, "resource_rate": 100.0,
+                  "crash_max_fraction": 0.1},
+        }
+        cfg = {"max_iterations": 80, "disciplines": ["schedule", "risk"],
+               "weights": {"schedule": 0.5, "risk": 0.5}}
+
+        unconstrained = run_optimize(nodes, links, cfg, meta, {})
+        constrained = run_optimize(nodes, links, cfg, meta,
+                                   {"constraints": {"max_budget": 30000.0}})
+
+        # baseline cost = sum(rate * res * dur) = 100*8*20 + 100*8*25 = 36000
+        # Unconstrained: nothing pulls cost down -> stays at 36000
+        # Constrained: penalty pushes resources / durations down
+        #              to bring cost under 30000.
+        constrained_cost = constrained["constraints"]["max_budget"]["final_value"]
+        # Unconstrained run has no constraints field; compute analytically.
+        import numpy as np
+        unconstrained_cost = float(np.sum(
+            100 * np.ones(2) * 8 * np.array([20.0, 25.0])))
+        assert constrained_cost < unconstrained_cost - 1.0
+        assert constrained["constraints"]["max_budget"]["satisfied"] is True
+
     def test_iso_max_end_date_with_start_date_resolves(self):
         nodes, links = self._chain()
         # 33 working hrs at 8 hpd over Mon-Fri ~= 7 calendar days
@@ -836,3 +879,72 @@ class TestCalendarMapping:
             "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5]},
         })
         assert "calendar" not in result
+
+    def test_start_date_alone_does_not_trigger(self):
+        """Gating consistency with completion/monte_carlo: start_date
+        alone (no calendar fields) does NOT enable the mapping.  Both
+        endpoint families should make the same gate decision so callers
+        get predictable behaviour.
+        """
+        nodes, links = self._chain()
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",
+        })
+        assert "calendar" not in result
+
+    def test_days_units_converted_to_working_hours(self):
+        """When Duration is in days, the mapping must convert to
+        working hours via the dominant TimeUnits before advancing the
+        WorkingCalendar -- otherwise day-counts are silently treated as
+        hours and the end date is many factors off.
+        """
+        # Same project as _chain but expressed in days (Duration=10)
+        # vs hours (Duration=80).  Both should map to the same end date.
+        nodes_h = [
+            {"ID": "0", "Duration": 0},
+            {"ID": "1", "Duration": 80, "TimeUnits": "Hours"},
+            {"ID": "2", "Duration": 120, "TimeUnits": "Hours"},
+            {"ID": "3", "Duration": 64, "TimeUnits": "Hours"},
+        ]
+        nodes_d = [
+            {"ID": "0", "Duration": 0},
+            {"ID": "1", "Duration": 10, "TimeUnits": "Days"},
+            {"ID": "2", "Duration": 15, "TimeUnits": "Days"},
+            {"ID": "3", "Duration": 8,  "TimeUnits": "Days"},
+        ]
+        links = [
+            {"source": "0", "target": "1"}, {"source": "1", "target": "2"},
+            {"source": "2", "target": "3"},
+        ]
+        ctx = {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5]},
+        }
+        rh = run_sensitivity(nodes_h, links, {}, {}, ctx)
+        rd = run_sensitivity(nodes_d, links, {}, {}, ctx)
+        # Both projects represent the same plan -- end dates must match.
+        assert rh["calendar"]["makespan_end_date"] == rd["calendar"]["makespan_end_date"]
+        # Reported time_units distinguishes the two requests.
+        assert rh["calendar"]["time_units"] == "Hours"
+        assert rd["calendar"]["time_units"] == "Days"
+        # Working-hours conversion lands on the same value (264 hrs).
+        assert rh["calendar"]["makespan_working_hours"] == pytest.approx(
+            rd["calendar"]["makespan_working_hours"], abs=1e-6)
+
+    def test_mixed_time_units_emits_warning(self):
+        """Heterogeneous TimeUnits across activities is a real-world
+        data-quality issue; the response should flag it so downstream
+        consumers know the makespan/end-date mapping is approximate."""
+        nodes = [
+            {"ID": "0", "Duration": 0},
+            {"ID": "1", "Duration": 80, "TimeUnits": "Hours"},
+            {"ID": "2", "Duration": 15, "TimeUnits": "Days"},
+        ]
+        links = [
+            {"source": "0", "target": "1"}, {"source": "1", "target": "2"},
+        ]
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5]},
+        })
+        assert result["calendar"].get("mixed_time_units") is True

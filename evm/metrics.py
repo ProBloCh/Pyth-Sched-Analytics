@@ -21,6 +21,7 @@ import logging
 import math
 
 from datetime import timedelta
+import numpy as np
 
 from .helpers import (
     Bounds, clamp, safe_date, convert_to_hours,
@@ -168,13 +169,23 @@ def compute_eac(bac: float, cpi: float, spi: float = 1.0,
 #
 # ---------------------------------------------------------------------------
 
+# Cap the date grid for very large projects to keep ES O(N + D) bounded.
+# 500 points across the project horizon is far finer than any chart can
+# usefully display; PV is monotone so the linear-interp error between
+# samples is small even with subsampling.  See evm/distributions.py
+# (_significant_dates) for the same pattern.
+_ES_MAX_DATES = 500
+
+
 def _significant_evm_dates(nodes):
-    """Sorted unique list of activity Start / Finish dates.
+    """Sorted unique list of activity Start / Finish dates, capped.
 
     BCWS is piecewise-linear in time: each activity contributes a linear
     ramp from Start to Finish.  Sampling BCWS at every Start/Finish
     boundary captures every breakpoint, so linear interpolation between
-    samples is exact (not an approximation).
+    samples is exact for projects up to ``_ES_MAX_DATES`` activities.
+    Larger projects subsample the grid uniformly, accepting a small
+    interpolation error in exchange for bounded compute.
     """
     out = set()
     for n in nodes or []:
@@ -184,7 +195,61 @@ def _significant_evm_dates(nodes):
             out.add(s.replace(hour=0, minute=0, second=0, microsecond=0))
         if f is not None:
             out.add(f.replace(hour=0, minute=0, second=0, microsecond=0))
-    return sorted(out)
+    sorted_dates = sorted(out)
+    if len(sorted_dates) > _ES_MAX_DATES:
+        idx = np.linspace(0, len(sorted_dates) - 1,
+                          _ES_MAX_DATES).astype(int)
+        sorted_dates = [sorted_dates[i] for i in sorted(set(idx))]
+    return sorted_dates
+
+
+def _vectorised_pv_curve(nodes, dates, hours_per_day, working_days_per_week):
+    """Cumulative planned hours at each ``date`` -- one vectorised pass.
+
+    Each activity contributes a linearly-ramped slab between its Start
+    and Finish dates: ``planned_hrs * clip((d - start) / (finish - start),
+    0, 1)``.  We stack activity arrays once, broadcast against the
+    (D,) date grid, and reduce along the activity axis -- replacing the
+    O(N*D) Python loop the scalar version did when called per date.
+
+    Returns an (D,) numpy array of cumulative hours, aligned with the
+    input ``dates`` list.
+    """
+    starts_ms = []
+    finishes_ms = []
+    planned_hrs = []
+    for n in nodes or []:
+        dur_raw = n.get('Duration', n.get('duration', 0))
+        if dur_raw in (0, '0'):
+            continue
+        s = safe_date(n.get('Start'))
+        f = safe_date(n.get('Finish'))
+        h = convert_to_hours(
+            dur_raw, n.get('TimeUnits', 'Hours'),
+            hours_per_day, working_days_per_week)
+        if s is None or f is None or h <= 0:
+            continue
+        starts_ms.append(s.timestamp() * 1000.0)
+        finishes_ms.append(f.timestamp() * 1000.0)
+        planned_hrs.append(h)
+
+    D = len(dates)
+    if not planned_hrs or D == 0:
+        return np.zeros(D, dtype=np.float64)
+
+    s_arr = np.asarray(starts_ms, dtype=np.float64)         # (N,)
+    f_arr = np.asarray(finishes_ms, dtype=np.float64)       # (N,)
+    p_arr = np.asarray(planned_hrs, dtype=np.float64)       # (N,)
+    span = np.where(f_arr > s_arr, f_arr - s_arr, 1.0)      # (N,) avoid /0
+    d_arr = np.array(
+        [d.timestamp() * 1000.0 for d in dates], dtype=np.float64)  # (D,)
+
+    # Broadcast (N, 1) - (1, D) -> (N, D), then clip to [0, 1] and scale
+    # by the per-activity planned hours.  Sum along the activity axis.
+    frac = (d_arr[None, :] - s_arr[:, None]) / span[:, None]
+    np.clip(frac, 0.0, 1.0, out=frac)
+    pv = (frac * p_arr[:, None]).sum(axis=0)
+    return pv
 
 
 def compute_earned_schedule(nodes, status_date, hours_per_day: float = 8.0,
@@ -240,12 +305,13 @@ def compute_earned_schedule(nodes, status_date, hours_per_day: float = 8.0,
     ev_hours = compute_bcwp_hours(
         nodes, hours_per_day, working_days_per_week)
 
-    # Sample cumulative PV at every breakpoint.
-    pv_curve = [
-        (d, compute_bcws_hours(
-            nodes, d, hours_per_day, working_days_per_week))
-        for d in significant
-    ]
+    # Sample cumulative PV at every breakpoint via a single vectorised
+    # numpy pass -- O(N + D) memory, ~one sweep through the activity
+    # array.  Replaces the previous O(N*D) Python loop that called
+    # compute_bcws_hours per date and hit a wall on 10K-activity projects.
+    pv_arr = _vectorised_pv_curve(
+        nodes, significant, hours_per_day, working_days_per_week)
+    pv_curve = list(zip(significant, pv_arr.tolist()))
     pv_total = pv_curve[-1][1] if pv_curve else 0.0
 
     at_days = max(

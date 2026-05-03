@@ -210,7 +210,10 @@ Implemented in `evm/metrics.py::compute_earned_schedule`.  Surfaced on
 Project start / finish dates are inferred as the earliest activity
 `Start` and the latest activity `Finish`; the BCWS curve is sampled at
 every Start/Finish boundary so linear interpolation between samples is
-exact (BCWS is piecewise-linear in time).
+exact (BCWS is piecewise-linear in time).  The PV curve is built in a
+single vectorised numpy pass for O(N+D) cost; the date grid is capped
+at `_ES_MAX_DATES = 500` for very large projects (uniform subsample
+preserves the first / last and keeps interpolation error bounded).
 
 ### EAC tiers
 

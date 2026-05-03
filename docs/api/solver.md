@@ -507,14 +507,17 @@ best-effort solution with `satisfied: false`, not an error.
 
 ## Calendar Mapping
 
-The solver's CPM operates in abstract time units (the `Duration`
-units the request supplied -- conventionally working hours).  Real-
-world deployments need to know **when** the optimised plan finishes.
-When the request supplies a `project_context.start_date` together with
-any calendar field (`hours_per_day`, `working_days`, `holidays`), the
-response includes a `calendar` block mapping the final `makespan` to
-a real end date via the same `WorkingCalendar` used by
-`/completion/monte-carlo`.
+The solver's CPM operates in abstract time units (whatever `Duration`
+units the request supplied).  Real-world deployments need to know
+**when** the optimised plan finishes.  When the request supplies a
+`project_context.start_date` **and** at least one calendar field
+(`hours_per_day`, `working_days`, or `holidays`), the response
+includes a `calendar` block mapping the final `makespan` to a real
+end date via the same `WorkingCalendar` used by
+`/completion/monte-carlo`.  Gating matches the completion endpoint
+exactly so the two endpoint families behave consistently --
+`start_date` alone (with no calendar fields) does **not** enable the
+mapping.
 
 ```jsonc
 "calendar": {
@@ -523,16 +526,32 @@ a real end date via the same `WorkingCalendar` used by
   "project_start_date":     "2026-01-05",
   "calendar_hours_per_day": 8.0,
   "calendar_working_days":  [1, 2, 3, 4, 5],
-  "holidays_count":         2
+  "holidays_count":         2,
+  "makespan_working_hours": 264.0,           // makespan converted to hours
+  "time_units":             "Hours",         // dominant TimeUnits across nodes
+  "mixed_time_units":       false            // present and true when nodes
+                                             //   carry heterogeneous TimeUnits
 }
 ```
 
-Convention: the solver `makespan` is treated as **working hours** when
-mapping to a calendar.  Callers whose `Duration` field is in days must
-multiply by `hours_per_day` before invoking the solver, OR rely on the
-abstract makespan and skip the calendar mapping.  This matches the
-unit alignment used by `completion/monte_carlo._duration_to_work_hours`.
+### TimeUnits handling
+
+The `makespan` value the solver returns is in whatever units the
+request's `Duration` fields use (Hours, Days, Weeks, etc.).  Before
+mapping to a calendar, the response converts makespan to **working
+hours** via `evm.helpers.convert_to_hours` using the **dominant**
+`TimeUnits` across all activities (mode of node `TimeUnits`,
+default `Hours`).  The reported `time_units` field tells you which
+unit was used for the conversion; `makespan_working_hours` is the
+post-conversion value handed to the `WorkingCalendar`.
+
+When activities carry heterogeneous `TimeUnits` (mixing e.g. Hours
+and Days), the mapping uses the dominant unit and emits a
+`mixed_time_units: true` flag so downstream consumers can detect the
+data-quality issue.  In that case the underlying `makespan` itself
+may already be inconsistent (the solver is unit-blind on input), so
+prefer normalising `Duration` to a single unit upstream.
 
 The mapping is purely additive: existing callers that don't supply
-`start_date` see a byte-identical response shape, with the `calendar`
-key absent.
+both `start_date` and a calendar field see a byte-identical response
+shape with the `calendar` key absent.

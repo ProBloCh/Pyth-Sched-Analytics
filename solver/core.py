@@ -64,7 +64,9 @@ def run_sensitivity(nodes, links, solver_config_dict,
     logger.info("Sensitivity done: makespan=%.1f, critical_path_len=%d, "
                 "%.1fms", dag_state.makespan, len(cp_ids), elapsed_ms)
 
-    calendar_mapping = map_makespan_to_date(dag_state.makespan, project_ctx)
+    calendar_mapping = map_makespan_to_date(
+        dag_state.makespan, project_ctx,
+        project_ctx_dict=project_context_dict, nodes=nodes)
 
     result = {
         'objectives':     {d: float(v) for d, v in objectives.items()},
@@ -137,7 +139,9 @@ def run_optimize(nodes, links, solver_config_dict,
         })
 
     elapsed_ms = round((time.time() - t0) * 1000, 1)
-    calendar_mapping = map_makespan_to_date(dag_state.makespan, project_ctx)
+    calendar_mapping = map_makespan_to_date(
+        dag_state.makespan, project_ctx,
+        project_ctx_dict=project_context_dict, nodes=nodes)
 
     result = {
         'initial_objectives': opt['initial_objectives'],

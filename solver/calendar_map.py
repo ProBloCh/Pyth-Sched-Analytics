@@ -5,27 +5,45 @@ The solver's CPM operates in abstract time units (whatever Duration units
 the request supplied -- conventionally working hours).  Real-world
 deployments need to know *when* the optimised plan finishes.  This module
 provides an additive mapping when the request supplies a project
-start_date plus calendar fields (hours_per_day, working_days, holidays).
+start_date plus at least one calendar field (hours_per_day, working_days,
+holidays) -- matching the gating used by completion/monte_carlo so the
+two endpoint families behave consistently.
 
 Reuses the vectorised WorkingCalendar from completion/calendar.py so the
 calendar advance honours weekends and holidays consistently across the
 two endpoint families.
 
-When called without sufficient calendar inputs, returns None and the
-solver responses simply omit the date fields -- existing callers see a
-byte-identical response shape modulo additive keys.
+When the calendar can't be built (no start_date, no calendar fields, or
+unparseable start_date), returns None and the solver responses simply
+omit the date fields -- existing callers see a byte-identical response
+shape modulo additive keys.
+
+TimeUnits handling
+------------------
+The solver's makespan inherits whatever TimeUnits the request's Duration
+fields use.  Before mapping to a calendar we convert makespan to working
+hours via ``evm.helpers.convert_to_hours`` using the **dominant**
+TimeUnits across all activities (mode of node ``TimeUnits``, default
+'Hours').  When the schedule mixes TimeUnits, only the dominant value
+is used and a ``mixed_time_units`` warning is emitted in the response so
+downstream callers can detect the heterogeneity.
 """
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timezone
 import logging
 
 from completion.calendar import (
     WorkingCalendar, advance_working_ms, estimate_horizon_days,
 )
+from evm.helpers import convert_to_hours
 
 logger = logging.getLogger(__name__)
+
+
+_CALENDAR_FIELDS = ('hours_per_day', 'working_days', 'holidays')
 
 
 def _parse_iso_to_ms(value):
@@ -48,39 +66,83 @@ def _parse_iso_to_ms(value):
         return None
 
 
-def map_makespan_to_date(makespan_hours, project_ctx):
+def _dominant_time_units(nodes):
+    """Mode of node TimeUnits across the schedule.
+
+    Returns (units_string, mixed_flag).  Defaults to ('Hours', False)
+    when the schedule is empty or no TimeUnits field is present.
+    """
+    if not nodes:
+        return 'Hours', False
+    counts = Counter()
+    for n in nodes:
+        u = n.get('TimeUnits') or n.get('timeUnits')
+        if u is None:
+            continue
+        counts[str(u).strip()] += 1
+    if not counts:
+        return 'Hours', False
+    dominant, _dom_n = counts.most_common(1)[0]
+    mixed = len(counts) > 1
+    return dominant, mixed
+
+
+def map_makespan_to_date(makespan, project_ctx, project_ctx_dict=None,
+                         nodes=None):
     """Compute the calendar end date for a given makespan.
 
     Args:
-        makespan_hours: solver makespan, interpreted as **working hours**.
-        project_ctx:    ProjectContext (start_date, hours_per_day,
-                        working_days, holidays).
+        makespan:           solver makespan in the **same time units as
+                            the request's Duration fields** (typically
+                            hours, but see TimeUnits handling below).
+        project_ctx:        ProjectContext (start_date, hours_per_day,
+                            working_days, holidays).
+        project_ctx_dict:   raw project_context dict from the request,
+                            used only to gate on whether at least one
+                            calendar field was explicitly supplied
+                            (matches completion/monte_carlo gating).
+        nodes:              the request's activity list; used to detect
+                            the dominant TimeUnits so the makespan can
+                            be converted to working hours before being
+                            handed to the WorkingCalendar.
 
     Returns:
-        dict with keys
-            makespan_end_date_ms     (epoch ms)
-            makespan_end_date        (ISO date 'YYYY-MM-DD')
-            project_start_date       (ISO)
-            calendar_hours_per_day
-            calendar_working_days
-            holidays_count
-        or None when start_date is missing or unparseable.
+        dict with end-date and calendar metadata, or None when the
+        mapping cannot be built (no start_date, no calendar fields,
+        unparseable start_date, or invalid makespan).
 
-    Convention: ``makespan_hours`` is treated as working hours.  Callers
-    whose Durations are in days must multiply by hours_per_day before
-    invoking the solver, OR pass start_date in matching units.  This
-    matches how completion/monte_carlo aligns time units to the
-    calendar (see completion/monte_carlo.py:_duration_to_work_hours).
+    The mapping is gated on **both** start_date AND at least one
+    calendar field being explicitly present in the request, so it
+    matches the completion/monte_carlo behaviour.  Callers that pass
+    only start_date with no calendar fields get None, signalling
+    that the response should omit the calendar block.
     """
-    if makespan_hours is None or makespan_hours < 0:
+    if makespan is None or makespan < 0:
         return None
     start_ms = _parse_iso_to_ms(getattr(project_ctx, 'start_date', None))
     if start_ms is None:
         return None
 
+    cal_cfg = (project_ctx_dict or {}).get('calendar') or {}
+    has_calendar_fields = any(k in cal_cfg for k in _CALENDAR_FIELDS)
+    if not has_calendar_fields:
+        return None
+
     hours_per_day = float(getattr(project_ctx, 'hours_per_day', 8.0) or 8.0)
     working_days = getattr(project_ctx, 'working_days', None) or [1, 2, 3, 4, 5]
     holidays = getattr(project_ctx, 'holidays', None) or []
+
+    # Convert makespan to working hours using the dominant TimeUnits.
+    # Without this step a project whose Durations are in days would map
+    # day-counts straight into ``advance_working_ms`` (which expects
+    # hours), producing end dates many factors off from reality.
+    wd_count = sum(1 for d in working_days
+                   if isinstance(d, (int, float)) and 1 <= int(d) <= 7) or 5
+    units, mixed_units = _dominant_time_units(nodes)
+    makespan_hours = convert_to_hours(
+        float(makespan), units, hours_per_day, wd_count)
+    if not (makespan_hours is not None and makespan_hours >= 0):
+        return None
 
     horizon_days = estimate_horizon_days(
         max(makespan_hours, 1.0), hours_per_day,
@@ -103,11 +165,16 @@ def map_makespan_to_date(makespan_hours, project_ctx):
     end_dt = datetime.fromtimestamp(end_ms / 1000.0, tz=timezone.utc)
     start_dt = datetime.fromtimestamp(start_ms / 1000.0, tz=timezone.utc)
 
-    return {
+    out = {
         'makespan_end_date_ms':   end_ms,
         'makespan_end_date':      end_dt.strftime('%Y-%m-%d'),
         'project_start_date':     start_dt.strftime('%Y-%m-%d'),
         'calendar_hours_per_day': hours_per_day,
         'calendar_working_days':  list(working_days),
         'holidays_count':         len(holidays or []),
+        'makespan_working_hours': float(makespan_hours),
+        'time_units':             units,
     }
+    if mixed_units:
+        out['mixed_time_units'] = True
+    return out

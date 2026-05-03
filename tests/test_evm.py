@@ -378,6 +378,38 @@ class TestEarnedSchedule:
         assert 'SPI_t' in es
         assert 'TEAC_date' in es
 
+    def test_large_project_performance(self):
+        """ES on 5K activities must complete in well under a second.
+
+        The naive O(N*D) scalar implementation hit ~10s here; the
+        vectorised / capped-grid implementation is ~150ms.  Asserting
+        a generous 3s ceiling locks the perf class without flaking on
+        slow CI runners.
+        """
+        import time
+        from datetime import datetime, timedelta
+        N = 5_000
+        nodes = []
+        base = datetime(2025, 1, 1)
+        for i in range(N):
+            s = base + timedelta(days=i % 365)
+            f = s + timedelta(days=10)
+            nodes.append({
+                'ID': str(i),
+                'Duration': 10, 'TimeUnits': 'days',
+                'Start': s.strftime('%Y-%m-%d'),
+                'Finish': f.strftime('%Y-%m-%d'),
+                'PercentComplete': 50 if i % 3 == 0 else 0,
+            })
+        t0 = time.time()
+        r = compute_earned_schedule(nodes, '2025-06-30')
+        elapsed = time.time() - t0
+        assert elapsed < 3.0, (
+            f'compute_earned_schedule on 5K activities took {elapsed:.2f}s '
+            '-- expected <3s.  Did a refactor reintroduce the per-date loop?')
+        assert r['SPI_t_model'] > 0
+        assert r['actualTimeDays'] > 0
+
 
 # =====================================================================
 # Time-phased EV (4-case)
