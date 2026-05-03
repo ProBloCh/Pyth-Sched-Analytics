@@ -529,8 +529,9 @@ mapping.
   "holidays_count":         2,
   "makespan_working_hours": 264.0,           // makespan converted to hours
   "time_units":             "Hours",         // dominant TimeUnits across nodes
-  "mixed_time_units":       false            // present and true when nodes
-                                             //   carry heterogeneous TimeUnits
+  "mixed_time_units":       false            // always present (boolean);
+                                             //   true when activities carry
+                                             //   heterogeneous TimeUnits
 }
 ```
 

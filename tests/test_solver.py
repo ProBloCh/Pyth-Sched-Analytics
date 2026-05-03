@@ -733,11 +733,14 @@ class TestHardConstraints:
     def test_max_budget_actually_moves_solution(self):
         """The constraint penalty must demonstrably push the optimizer.
 
-        Setup: disciplines exclude cost, so only the constraint can pull
-        resources / durations down -- if the budget penalty is wired up
-        correctly, the constrained final cost is materially lower than
-        the unconstrained baseline.  Avoids the "vacuous test" failure
-        mode where the optimizer is at the bound for unrelated reasons.
+        Setup: disciplines = schedule + risk (NOT cost), so the only
+        force pulling resources down is the budget penalty itself.
+        Schedule and risk both still pull *durations* down via the
+        crash mechanism, so the unconstrained run also reduces cost
+        somewhat -- the test asserts that the constrained run goes
+        materially further, which only the penalty can deliver.
+        Avoids the "vacuous test" failure mode where the optimizer
+        sits at a bound for unrelated reasons.
         """
         nodes = [
             {"ID": "0", "Duration": 0},
@@ -757,20 +760,35 @@ class TestHardConstraints:
         cfg = {"max_iterations": 80, "disciplines": ["schedule", "risk"],
                "weights": {"schedule": 0.5, "risk": 0.5}}
 
+        # Compute the unconstrained final cost from activity_changes.
+        # Schedule and risk both have zero gradient on resources, so
+        # unconstrained resources stay at their baseline (8.0); only
+        # durations move (slightly, via crash).  This means the
+        # unconstrained final cost is materially indistinguishable from
+        # the baseline 36000 -- the assertion below isolates the
+        # constraint's effect from incidental crash-driven savings.
         unconstrained = run_optimize(nodes, links, cfg, meta, {})
+        unconstrained_dur = {
+            row['activity_id']: row['optimized_duration']
+            for row in unconstrained['activity_changes']
+        }
+        unconstrained_cost = (
+            100.0 * 8.0 * unconstrained_dur['1']
+            + 100.0 * 8.0 * unconstrained_dur['2']
+        )
+
         constrained = run_optimize(nodes, links, cfg, meta,
                                    {"constraints": {"max_budget": 30000.0}})
-
-        # baseline cost = sum(rate * res * dur) = 100*8*20 + 100*8*25 = 36000
-        # Unconstrained: nothing pulls cost down -> stays at 36000
-        # Constrained: penalty pushes resources / durations down
-        #              to bring cost under 30000.
         constrained_cost = constrained["constraints"]["max_budget"]["final_value"]
-        # Unconstrained run has no constraints field; compute analytically.
-        import numpy as np
-        unconstrained_cost = float(np.sum(
-            100 * np.ones(2) * 8 * np.array([20.0, 25.0])))
-        assert constrained_cost < unconstrained_cost - 1.0
+
+        # Constraint must add at least 5000 of cost reduction over and
+        # above whatever the unconstrained run already achieved.  Smoke
+        # run: unconstrained ~35960, constrained ~26180 -> ~9780 delta;
+        # 5000 leaves margin without being so tight that L-BFGS-B
+        # convergence noise can flake it.
+        assert constrained_cost < unconstrained_cost - 5000.0, (
+            f"Penalty did not move solution: unconstrained={unconstrained_cost}, "
+            f"constrained={constrained_cost}")
         assert constrained["constraints"]["max_budget"]["satisfied"] is True
 
     def test_iso_max_end_date_with_start_date_resolves(self):
@@ -947,4 +965,80 @@ class TestCalendarMapping:
             "start_date": "2026-01-05",
             "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5]},
         })
-        assert result["calendar"].get("mixed_time_units") is True
+        assert result["calendar"]["mixed_time_units"] is True
+
+    def test_mixed_time_units_false_when_homogeneous(self):
+        """mixed_time_units must always be present (not absent-when-false)
+        so consumers can read it without an `in` guard.  This locks the
+        contract change away from the previous present-only-when-true
+        behaviour."""
+        nodes = [
+            {"ID": "0", "Duration": 0},
+            {"ID": "1", "Duration": 80, "TimeUnits": "Hours"},
+            {"ID": "2", "Duration": 120, "TimeUnits": "Hours"},
+        ]
+        links = [
+            {"source": "0", "target": "1"}, {"source": "1", "target": "2"},
+        ]
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5]},
+        })
+        cal = result["calendar"]
+        assert "mixed_time_units" in cal
+        assert cal["mixed_time_units"] is False
+
+    def test_mixed_case_time_units_not_falsely_flagged(self):
+        """Mixing case of the same token (`Hours` and `hours`) is
+        case-folding, not unit-mixing.  The flag should stay False.
+
+        Note: this normalises case only -- cross-alias mixing
+        (`Hours` vs `h` vs `hr`) still flags as mixed even though
+        ``convert_to_hours`` resolves all of them to the same unit.
+        Alias-aware coalescing would require probing convert_to_hours
+        per pair and is out of scope here.
+        """
+        nodes = [
+            {"ID": "0", "Duration": 0},
+            {"ID": "1", "Duration": 80, "TimeUnits": "Hours"},
+            {"ID": "2", "Duration": 120, "TimeUnits": "hours"},
+            {"ID": "3", "Duration": 64, "TimeUnits": "HOURS"},
+        ]
+        links = [
+            {"source": "0", "target": "1"}, {"source": "1", "target": "2"},
+            {"source": "2", "target": "3"},
+        ]
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5]},
+        })
+        # Same token, different cases -> coalesced; flag stays False.
+        assert result["calendar"]["mixed_time_units"] is False
+        # Canonical representative is the first-seen casing.
+        assert result["calendar"]["time_units"] == "Hours"
+
+    def test_missing_time_units_votes_default_hours(self):
+        """An activity without an explicit TimeUnits field votes for
+        the default 'Hours' (matching evm.helpers.convert_to_hours
+        behaviour) rather than abstaining.  Without this, a single
+        explicit 'Days' activity in a project of otherwise-untagged
+        activities would incorrectly dominate."""
+        nodes = [
+            {"ID": "0", "Duration": 0},
+            {"ID": "1", "Duration": 80},                              # no units
+            {"ID": "2", "Duration": 120},                             # no units
+            {"ID": "3", "Duration": 5, "TimeUnits": "Days"},          # tagged
+        ]
+        links = [
+            {"source": "0", "target": "1"}, {"source": "1", "target": "2"},
+            {"source": "2", "target": "3"},
+        ]
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5]},
+        })
+        # 2 untagged (vote Hours) + 1 explicit Hours-equivalent + 1 Days
+        # -> Hours wins as the dominant canonical representative.
+        assert result["calendar"]["time_units"] == "Hours"
+        # Mix-of-units flag still fires (Days is present alongside Hours).
+        assert result["calendar"]["mixed_time_units"] is True

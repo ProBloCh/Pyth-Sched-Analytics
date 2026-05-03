@@ -378,6 +378,47 @@ class TestEarnedSchedule:
         assert 'SPI_t' in es
         assert 'TEAC_date' in es
 
+    def test_vectorised_pv_curve_matches_scalar(self):
+        """The vectorised PV curve must produce numerically identical
+        results to the scalar compute_bcws_hours called per date.
+
+        This test exists because a subtle bug in the broadcasting
+        (wrong axis, off-by-one in the clip, span = 0 handling) could
+        easily slip past the small-fixture tests if the few breakpoints
+        happen to land on degenerate values.  Running on 100 random
+        activities across hundreds of dates exercises the matrix path.
+        """
+        from datetime import datetime, timedelta
+        import random
+        from evm.metrics import _vectorised_pv_curve, _significant_evm_dates
+        from evm.metrics import compute_bcws_hours
+
+        random.seed(42)
+        nodes = []
+        base = datetime(2025, 1, 1)
+        for i in range(100):
+            start_offset = random.randint(0, 200)
+            duration_days = random.randint(1, 30)
+            s = base + timedelta(days=start_offset)
+            f = s + timedelta(days=duration_days)
+            nodes.append({
+                'ID': str(i),
+                'Duration': duration_days, 'TimeUnits': 'days',
+                'Start': s.strftime('%Y-%m-%d'),
+                'Finish': f.strftime('%Y-%m-%d'),
+            })
+        dates = _significant_evm_dates(nodes)
+        # Sanity: with 100 random activities we should easily have many
+        # breakpoints (well under the _ES_MAX_DATES cap of 500).
+        assert 50 < len(dates) <= 500
+
+        vec = _vectorised_pv_curve(nodes, dates, 8.0, 5.0)
+        for k, d in enumerate(dates):
+            scalar = compute_bcws_hours(nodes, d, 8.0, 5.0)
+            assert vec[k] == pytest.approx(scalar, rel=1e-9, abs=1e-9), (
+                f'Vectorised PV mismatch at date {d.date()}: '
+                f'vec={vec[k]} scalar={scalar}')
+
     def test_large_project_performance(self):
         """ES on 5K activities must complete in well under a second.
 

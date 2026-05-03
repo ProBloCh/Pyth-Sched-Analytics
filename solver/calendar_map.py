@@ -66,25 +66,51 @@ def _parse_iso_to_ms(value):
         return None
 
 
+_DEFAULT_TIME_UNITS = 'Hours'
+
+
 def _dominant_time_units(nodes):
     """Mode of node TimeUnits across the schedule.
 
-    Returns (units_string, mixed_flag).  Defaults to ('Hours', False)
-    when the schedule is empty or no TimeUnits field is present.
+    Returns (units_string, mixed_flag).
+
+    Activities without an explicit ``TimeUnits`` field vote for the
+    default 'Hours' -- matching the rest of the codebase's silent
+    fallback (``evm.helpers.convert_to_hours`` defaults to 'Hours' when
+    units are absent).  Without this, a single explicitly-tagged
+    'Days' activity in a project of 99 untagged activities would
+    incorrectly dominate the conversion.
+
+    Comparison is case-insensitive (mode counts use the normalised
+    lower-cased form) so 'Hours' / 'hours' / 'h' don't falsely
+    trigger ``mixed_time_units``.  ``convert_to_hours`` handles the
+    full alias table downstream, so any of those resolves to the
+    same hour count.
     """
     if not nodes:
-        return 'Hours', False
+        return _DEFAULT_TIME_UNITS, False
+
+    # Map normalised key -> canonical-cased representative; pick the
+    # first variant we see so the public field reflects what the
+    # caller actually wrote.
+    canon_for = {}
     counts = Counter()
     for n in nodes:
         u = n.get('TimeUnits') or n.get('timeUnits')
-        if u is None:
-            continue
-        counts[str(u).strip()] += 1
+        if u is None or u == '':
+            key = _DEFAULT_TIME_UNITS.lower()
+            canon_for.setdefault(key, _DEFAULT_TIME_UNITS)
+        else:
+            stripped = str(u).strip()
+            key = stripped.lower()
+            canon_for.setdefault(key, stripped)
+        counts[key] += 1
+
     if not counts:
-        return 'Hours', False
-    dominant, _dom_n = counts.most_common(1)[0]
+        return _DEFAULT_TIME_UNITS, False
+    dom_key, _dom_n = counts.most_common(1)[0]
     mixed = len(counts) > 1
-    return dominant, mixed
+    return canon_for[dom_key], mixed
 
 
 def map_makespan_to_date(makespan, project_ctx, project_ctx_dict=None,
@@ -165,7 +191,7 @@ def map_makespan_to_date(makespan, project_ctx, project_ctx_dict=None,
     end_dt = datetime.fromtimestamp(end_ms / 1000.0, tz=timezone.utc)
     start_dt = datetime.fromtimestamp(start_ms / 1000.0, tz=timezone.utc)
 
-    out = {
+    return {
         'makespan_end_date_ms':   end_ms,
         'makespan_end_date':      end_dt.strftime('%Y-%m-%d'),
         'project_start_date':     start_dt.strftime('%Y-%m-%d'),
@@ -174,7 +200,9 @@ def map_makespan_to_date(makespan, project_ctx, project_ctx_dict=None,
         'holidays_count':         len(holidays or []),
         'makespan_working_hours': float(makespan_hours),
         'time_units':             units,
+        # Always present so consumers can read the flag without a
+        # ``in`` check; True when the schedule mixed TimeUnits across
+        # activities (case-insensitive, after coalescing missing /
+        # empty values to the default 'Hours').
+        'mixed_time_units':       mixed_units,
     }
-    if mixed_units:
-        out['mixed_time_units'] = True
-    return out
