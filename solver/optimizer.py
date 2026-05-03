@@ -19,6 +19,14 @@ logger = logging.getLogger(__name__)
 
 WALL_TIME_LIMIT = 120  # seconds — safety net; Gunicorn --timeout is primary
 
+# Quadratic-penalty weight for hard constraints (max_makespan, max_budget).
+# The penalty is normalised by the constraint's bound so it is dimensionless,
+# i.e. a 100% violation contributes ``CONSTRAINT_PENALTY_LAMBDA`` to the
+# weighted objective.  50.0 is a moderate setting -- large enough to dominate
+# the discipline weights when the bound is meaningfully exceeded, small
+# enough that a feasible interior solution still sees the discipline tradeoff.
+CONSTRAINT_PENALTY_LAMBDA = 50.0
+
 
 def optimize(dag_state, params, project_ctx, config, deadline=None,
              utopia=None, augmentation_rho=0.05):
@@ -71,6 +79,16 @@ def optimize(dag_state, params, project_ctx, config, deadline=None,
     # ---- Tchebycheff constants -------------------------------------------
     _kappa = 20.0    # smooth-max sharpness (log-sum-exp)
 
+    # ---- Hard-constraint setup ------------------------------------------
+    max_makespan = getattr(project_ctx, 'max_makespan', None)
+    max_budget = getattr(project_ctx, 'max_budget', None)
+    constraints_active = (max_makespan is not None) or (max_budget is not None)
+    if constraints_active:
+        logger.info(
+            "Hard constraints active: max_makespan=%s, max_budget=%s, "
+            "lambda=%.1f",
+            max_makespan, max_budget, CONSTRAINT_PENALTY_LAMBDA)
+
     # ---- Objective + gradient callback -----------------------------------
     def func_and_grad(x):
         if time.time() > deadline:
@@ -118,6 +136,15 @@ def optimize(dag_state, params, project_ctx, config, deadline=None,
                 if d in grads:
                     dur_g += coeff * grads[d]['duration']
                     res_g += coeff * grads[d]['resources']
+
+        # ---- Constraint penalties (added on top of the scalarised obj) --
+        if constraints_active:
+            pen, pen_dur, pen_res = _constraint_penalty(
+                dag_state, params, project_ctx, objs,
+                max_makespan, max_budget, grads)
+            w_obj += pen
+            dur_g += pen_dur
+            res_g += pen_res
 
         history.append({
             'iteration': len(history),
@@ -168,6 +195,11 @@ def optimize(dag_state, params, project_ctx, config, deadline=None,
 
     final = compute_objectives(dag_state, params, project_ctx, disciplines)
 
+    constraints_report = None
+    if constraints_active:
+        constraints_report = _constraints_report(
+            dag_state, params, final, max_makespan, max_budget)
+
     return {
         'optimized_durations':  params.durations.copy(),
         'optimized_resources':  params.resource_counts.copy(),
@@ -176,6 +208,7 @@ def optimize(dag_state, params, project_ctx, config, deadline=None,
         'iterations': len(history),
         'converged':  converged,
         'history':    history,
+        'constraints': constraints_report,
     }
 
 
@@ -200,4 +233,95 @@ def _empty(disciplines):
         'iterations': 0,
         'converged':  True,
         'history':    [],
+        'constraints': None,
     }
+
+
+def _constraint_penalty(dag_state, params, project_ctx, objs,
+                        max_makespan, max_budget, grads):
+    """Quadratic-penalty contribution from hard constraints.
+
+    Returns (penalty_value, dur_grad_addition, res_grad_addition).
+
+    Each constraint contributes
+        L * max(0, val - bound)^2 / bound^2
+    so the magnitude is dimensionless and a 100% overshoot adds ``L``
+    to the weighted objective.  Gradients reuse the analytic schedule
+    and cost gradients already in ``grads`` -- no additional CPM
+    evaluations needed.
+    """
+    n = dag_state.n
+    pen = 0.0
+    dur_g = np.zeros(n, dtype=np.float64)
+    res_g = np.zeros(n, dtype=np.float64)
+    L = CONSTRAINT_PENALTY_LAMBDA
+
+    if max_makespan is not None and max_makespan > 0:
+        violation = dag_state.makespan - max_makespan
+        if violation > 0:
+            inv_b2 = 1.0 / (max_makespan * max_makespan)
+            pen += L * violation * violation * inv_b2
+            coeff = 2.0 * L * violation * inv_b2
+            sched = grads.get('schedule')
+            if sched is not None:
+                dur_g += coeff * sched['duration']
+                res_g += coeff * sched['resources']
+            else:
+                # Fallback: schedule not in disciplines.  Use the
+                # critical mask directly (dMakespan/dd_i = 1 on CP).
+                dur_g[dag_state.critical_mask] += coeff
+
+    if max_budget is not None and max_budget > 0:
+        cost = float(objs.get('cost', 0.0))
+        if 'cost' not in objs:
+            # Compute cost on demand if not in disciplines.
+            cost = float(np.sum(
+                params.resource_rates * params.resource_counts
+                * params.durations))
+        violation = cost - max_budget
+        if violation > 0:
+            inv_b2 = 1.0 / (max_budget * max_budget)
+            pen += L * violation * violation * inv_b2
+            coeff = 2.0 * L * violation * inv_b2
+            cost_g = grads.get('cost')
+            if cost_g is not None:
+                dur_g += coeff * cost_g['duration']
+                res_g += coeff * cost_g['resources']
+            else:
+                # Analytic cost gradients (reproduce adjoints.cost_adj_*).
+                dur_g += coeff * (params.resource_rates
+                                  * params.resource_counts)
+                res_g += coeff * (params.resource_rates
+                                  * params.durations)
+
+    return pen, dur_g, res_g
+
+
+def _constraints_report(dag_state, params, final_objs, max_makespan, max_budget):
+    """Per-constraint feasibility status for the response."""
+    out = {}
+    if max_makespan is not None:
+        violation = max(0.0, dag_state.makespan - max_makespan)
+        out['max_makespan'] = {
+            'bound':         float(max_makespan),
+            'final_value':   float(dag_state.makespan),
+            'violation':     float(violation),
+            'satisfied':     violation <= 1e-6 * max(max_makespan, 1.0),
+        }
+    if max_budget is not None:
+        if 'cost' in final_objs:
+            cost = float(final_objs['cost'])
+        else:
+            # Cost wasn't an active discipline; compute analytically so
+            # the report still reflects the actual final-state spend.
+            cost = float(np.sum(
+                params.resource_rates * params.resource_counts
+                * params.durations))
+        violation = max(0.0, cost - max_budget)
+        out['max_budget'] = {
+            'bound':         float(max_budget),
+            'final_value':   cost,
+            'violation':     float(violation),
+            'satisfied':     violation <= 1e-6 * max(max_budget, 1.0),
+        }
+    return out or None

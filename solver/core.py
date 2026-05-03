@@ -17,6 +17,7 @@ from .stochastic import run_ensemble
 from .optimizer import optimize
 from .pareto import run_pareto as _run_pareto
 from .analysis import compute_analysis
+from .calendar_map import map_makespan_to_date
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,8 @@ def run_sensitivity(nodes, links, solver_config_dict,
     logger.info("Sensitivity done: makespan=%.1f, critical_path_len=%d, "
                 "%.1fms", dag_state.makespan, len(cp_ids), elapsed_ms)
 
+    calendar_mapping = map_makespan_to_date(dag_state.makespan, project_ctx)
+
     result = {
         'objectives':     {d: float(v) for d, v in objectives.items()},
         'makespan':       dag_state.makespan,
@@ -75,6 +78,8 @@ def run_sensitivity(nodes, links, solver_config_dict,
         },
         'computation_ms': elapsed_ms,
     }
+    if calendar_mapping is not None:
+        result['calendar'] = calendar_mapping
 
     if stochastic:
         result['stochastic'] = {
@@ -132,6 +137,7 @@ def run_optimize(nodes, links, solver_config_dict,
         })
 
     elapsed_ms = round((time.time() - t0) * 1000, 1)
+    calendar_mapping = map_makespan_to_date(dag_state.makespan, project_ctx)
 
     result = {
         'initial_objectives': opt['initial_objectives'],
@@ -149,6 +155,7 @@ def run_optimize(nodes, links, solver_config_dict,
         'iterations':        opt['iterations'],
         'converged':         opt['converged'],
         'history':           opt['history'],
+        'constraints':       opt.get('constraints'),
         'config': {
             'disciplines':   config.disciplines,
             'weights':       config.weights,
@@ -156,6 +163,24 @@ def run_optimize(nodes, links, solver_config_dict,
         },
         'computation_ms': elapsed_ms,
     }
+    if calendar_mapping is not None:
+        result['calendar'] = calendar_mapping
+
+    # Surface a warning when callers supplied a constraint that we
+    # couldn't resolve to a numeric bound (e.g. ISO max_end_date with
+    # no project start_date) so they don't silently get an
+    # unconstrained run.
+    if (project_ctx.max_end_date is not None
+            and project_ctx.max_makespan is None):
+        result.setdefault('warnings', []).append({
+            'code':    'unresolved_max_end_date',
+            'message': ('max_end_date supplied as a non-numeric value '
+                        'but no project start_date was given; the '
+                        'constraint was ignored.  Pass either '
+                        'constraints.max_makespan (numeric) or both '
+                        'constraints.max_end_date + start_date as ISO '
+                        'dates.'),
+        })
 
     if stochastic:
         result['stochastic'] = {

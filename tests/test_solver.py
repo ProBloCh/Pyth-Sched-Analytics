@@ -669,3 +669,170 @@ class TestBugfixRegressions:
             params.durations[i] = orig
 
         np.testing.assert_allclose(analytical, fd, atol=1e-3)
+
+
+# =====================================================================
+# Hard constraints (max_makespan / max_budget) + calendar mapping
+# =====================================================================
+
+class TestHardConstraints:
+    """Quadratic-penalty enforcement of max_makespan and max_budget,
+    plus the unresolved-constraint warning path."""
+
+    def _chain(self):
+        nodes = [
+            {"ID": "0", "Duration": 0},
+            {"ID": "1", "Duration": 10},
+            {"ID": "2", "Duration": 15},
+            {"ID": "3", "Duration": 8},
+        ]
+        links = [
+            {"source": "0", "target": "1", "type": "FS", "lag": 0},
+            {"source": "1", "target": "2", "type": "FS", "lag": 0},
+            {"source": "2", "target": "3", "type": "FS", "lag": 0},
+        ]
+        return nodes, links
+
+    def test_unconstrained_response_omits_constraints(self):
+        nodes, links = self._chain()
+        result = run_optimize(nodes, links, {"max_iterations": 20}, {}, {})
+        assert result.get("constraints") is None
+
+    def test_max_makespan_active_reports_violation(self):
+        nodes, links = self._chain()
+        # baseline 33, crash floor ~26.4; 25 is infeasible -> violation > 0
+        result = run_optimize(nodes, links, {"max_iterations": 60}, {},
+                              {"constraints": {"max_makespan": 25.0}})
+        c = result["constraints"]["max_makespan"]
+        assert c["bound"] == 25.0
+        assert c["violation"] > 0
+        assert c["satisfied"] is False
+
+    def test_max_makespan_satisfied(self):
+        nodes, links = self._chain()
+        # 100 is far above the 33 baseline -> satisfied
+        result = run_optimize(nodes, links, {"max_iterations": 20}, {},
+                              {"constraints": {"max_makespan": 100.0}})
+        c = result["constraints"]["max_makespan"]
+        assert c["satisfied"] is True
+        assert c["violation"] == 0.0
+
+    def test_max_budget_active(self):
+        nodes, links = self._chain()
+        meta = {"1": {"resource_count": 5.0}, "2": {"resource_count": 5.0},
+                "3": {"resource_count": 5.0}}
+        result = run_optimize(nodes, links,
+            {"max_iterations": 30, "disciplines": ["schedule"],
+             "weights": {"schedule": 1.0}},
+            meta, {"constraints": {"max_budget": 1000.0}})
+        c = result["constraints"]["max_budget"]
+        # final_value computed even though cost is not in disciplines
+        assert c["final_value"] > 0
+        assert c["bound"] == 1000.0
+
+    def test_iso_max_end_date_with_start_date_resolves(self):
+        nodes, links = self._chain()
+        # 33 working hrs at 8 hpd over Mon-Fri ~= 7 calendar days
+        result = run_optimize(nodes, links, {"max_iterations": 20}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0, "working_days": [1,2,3,4,5]},
+            "constraints": {"max_end_date": "2027-01-05"},
+        })
+        # max_makespan in the report exists (not None)
+        assert result["constraints"] is not None
+        assert "max_makespan" in result["constraints"]
+
+    def test_iso_max_end_date_without_start_warns(self):
+        nodes, links = self._chain()
+        result = run_optimize(nodes, links, {"max_iterations": 20}, {}, {
+            "constraints": {"max_end_date": "2026-12-31"},
+        })
+        assert result.get("constraints") is None
+        warnings = result.get("warnings", [])
+        codes = [w.get("code") for w in warnings]
+        assert "unresolved_max_end_date" in codes
+
+    def test_invalid_max_budget_silently_ignored(self):
+        nodes, links = self._chain()
+        result = run_optimize(nodes, links, {"max_iterations": 20}, {},
+                              {"constraints": {"max_budget": "not-a-number"}})
+        assert result.get("constraints") is None
+
+    def test_negative_max_budget_silently_ignored(self):
+        nodes, links = self._chain()
+        result = run_optimize(nodes, links, {"max_iterations": 20}, {},
+                              {"constraints": {"max_budget": -100.0}})
+        assert result.get("constraints") is None
+
+
+class TestCalendarMapping:
+    """Opt-in mapping from abstract makespan to a calendar end date."""
+
+    def _chain(self):
+        nodes = [
+            {"ID": "0", "Duration": 0},
+            {"ID": "1", "Duration": 80},
+            {"ID": "2", "Duration": 120},
+            {"ID": "3", "Duration": 64},
+        ]
+        links = [
+            {"source": "0", "target": "1"}, {"source": "1", "target": "2"},
+            {"source": "2", "target": "3"},
+        ]
+        return nodes, links
+
+    def test_no_calendar_returns_no_mapping(self):
+        nodes, links = self._chain()
+        result = run_sensitivity(nodes, links, {}, {}, {})
+        assert "calendar" not in result
+
+    def test_calendar_mapping_basic(self):
+        nodes, links = self._chain()
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0, "working_days": [1,2,3,4,5]},
+        })
+        cal = result["calendar"]
+        assert cal["project_start_date"] == "2026-01-05"
+        assert cal["makespan_end_date"] is not None
+        # 264 hrs / 8 hpd = 33 working days; ~7 calendar weeks
+        from datetime import datetime
+        end = datetime.strptime(cal["makespan_end_date"], "%Y-%m-%d")
+        start = datetime.strptime(cal["project_start_date"], "%Y-%m-%d")
+        delta_days = (end - start).days
+        assert 40 <= delta_days <= 55
+
+    def test_holidays_push_end_date_later(self):
+        nodes, links = self._chain()
+        ctx_no = {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5]},
+        }
+        ctx_h = {
+            "start_date": "2026-01-05",
+            "calendar": {
+                "hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5],
+                "holidays": ["2026-01-19", "2026-02-16", "2026-02-17"],
+            },
+        }
+        r1 = run_sensitivity(nodes, links, {}, {}, ctx_no)
+        r2 = run_sensitivity(nodes, links, {}, {}, ctx_h)
+        assert r2["calendar"]["makespan_end_date"] >= r1["calendar"]["makespan_end_date"]
+        assert r2["calendar"]["holidays_count"] == 3
+
+    def test_optimize_includes_calendar_mapping(self):
+        nodes, links = self._chain()
+        result = run_optimize(nodes, links, {"max_iterations": 20}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5]},
+        })
+        assert "calendar" in result
+        assert result["calendar"]["makespan_end_date"] is not None
+
+    def test_unparseable_start_date_skips_mapping(self):
+        nodes, links = self._chain()
+        result = run_sensitivity(nodes, links, {}, {}, {
+            "start_date": "not-a-date",
+            "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3, 4, 5]},
+        })
+        assert "calendar" not in result

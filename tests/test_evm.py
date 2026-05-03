@@ -24,6 +24,7 @@ from evm.helpers import (
 )
 from evm.metrics import (
     compute_evm_metrics, compute_eac, compute_duration_weighted,
+    compute_earned_schedule,
     compute_bcws_hours, compute_bcwp_hours, compute_bac_hours,
     compute_acwp,
 )
@@ -274,6 +275,108 @@ class TestDurationWeighted:
         # Actual = 100% * 80hr = 80, Planned = 80 (finished by 01-11)
         assert r['actualCompletedHours'] == 80.0
         assert r['durationWeightedSPI'] == 1.0
+
+
+# =====================================================================
+# Earned Schedule (Lipke 2003)
+# =====================================================================
+
+class TestEarnedSchedule:
+    """Lipke ES / SPI(t) / TEAC.  Locks the time-based fix for the
+    cost-SPI-converges-to-1.0-at-completion pathology and the basic
+    PV-curve interpolation."""
+
+    def _three_seq(self, **pct):
+        """Three sequential 10-day activities Jan 1 - Feb 1."""
+        return [
+            {'ID': '1', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '2025-01-01', 'Finish': '2025-01-11',
+             'PercentComplete': pct.get('p1', 0)},
+            {'ID': '2', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '2025-01-12', 'Finish': '2025-01-22',
+             'PercentComplete': pct.get('p2', 0)},
+            {'ID': '3', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '2025-01-23', 'Finish': '2025-02-02',
+             'PercentComplete': pct.get('p3', 0)},
+        ]
+
+    def test_empty_nodes_returns_neutral(self):
+        r = compute_earned_schedule([], '2025-06-01')
+        assert r['SPI_t'] == 1.0
+        assert r['flags'].get('no_baseline') is True
+
+    def test_not_started_zero_es(self):
+        nodes = self._three_seq()  # no progress
+        r = compute_earned_schedule(nodes, '2025-01-15')
+        assert r['earnedScheduleDays'] == 0.0
+        assert r['flags'].get('not_started') is True
+
+    def test_on_schedule(self):
+        # First task done, second 50%, status Jan 16 (16 days into 32-day plan)
+        nodes = self._three_seq(p1=100, p2=50)
+        r = compute_earned_schedule(nodes, '2025-01-17')
+        # EV = 80 + 80*0.5 = 120 hr; PV at Jan 17 = 80 (act1) + 80*5/10 (act2)
+        # Plan accrues to 120h on Jan 17; ES_date == status_date.
+        assert r['SPI_t'] == pytest.approx(1.0, abs=0.05)
+        assert r['flags'].get('completed', False) is False
+
+    def test_late_after_completion_doesnt_collapse_to_1(self):
+        """Lipke's killer feature: cost-based SPI=1.0 at finish even
+        when the project finished late, but SPI(t) correctly reports
+        the schedule slip."""
+        nodes = self._three_seq(p1=100, p2=100, p3=100)  # 100% earned
+        # PD = 32 days (Jan 1 - Feb 2).  Status = 8 days past planned
+        # finish, so AT = 40, ES = PD = 32, SPI(t) = 0.8.
+        r = compute_earned_schedule(nodes, '2025-02-10')
+        assert r['flags'].get('completed') is True
+        assert r['SPI_t_model'] == pytest.approx(0.8, abs=0.05)
+
+    def test_late_in_progress_spi_t_below_1(self):
+        # Only first task done at status Jan 22 (was supposed to finish all 3 by Feb 2)
+        nodes = self._three_seq(p1=100, p2=0)
+        r = compute_earned_schedule(nodes, '2025-01-22')
+        # EV = 80; planned PV reaches 80 at Jan 11 -> ES=10 days
+        # AT = 21 days -> SPI(t) ~= 0.476
+        assert r['SPI_t_model'] == pytest.approx(10.0 / 21.0, abs=0.05)
+
+    def test_teac_extends_when_late(self):
+        nodes = self._three_seq(p1=100, p2=0)
+        r = compute_earned_schedule(nodes, '2025-01-22')
+        # PD = 32, SPI(t) ~= 0.476, TEAC = PD / SPI(t) ~= 67 days
+        assert r['TEAC_days'] > r['plannedDurationDays']
+        assert r['TEAC_days'] == pytest.approx(67.0, abs=2.0)
+
+    def test_teac_at_least_at(self):
+        # A project already 50 days in cannot finish in fewer than 50 days,
+        # even if the math says so.
+        nodes = self._three_seq(p1=100, p2=100)
+        r = compute_earned_schedule(nodes, '2025-04-01')  # 90 days in
+        assert r['TEAC_days'] >= r['actualTimeDays']
+
+    def test_es_date_iso(self):
+        nodes = self._three_seq(p1=100)
+        r = compute_earned_schedule(nodes, '2025-01-25')
+        # EV=80; PV reaches 80 on Jan 11 (end of activity 1).
+        assert r['earnedScheduleDate'] == '2025-01-11'
+
+    def test_status_before_start(self):
+        nodes = self._three_seq()
+        r = compute_earned_schedule(nodes, '2024-12-15')
+        assert r['actualTimeDays'] == 0.0
+        assert r['flags'].get('status_before_start') is True
+
+    def test_engine_surfaces_earned_schedule(self):
+        """The /evm/analyze response shape must include earnedSchedule
+        so callers can read SPI(t) without recomputing."""
+        nodes = self._three_seq(p1=100, p2=50)
+        result = run_evm_analysis(nodes, [], {
+            'statusDate': '2025-01-17',
+            'costRate': 100.0,
+        })
+        assert 'earnedSchedule' in result['actual']
+        es = result['actual']['earnedSchedule']
+        assert 'SPI_t' in es
+        assert 'TEAC_date' in es
 
 
 # =====================================================================

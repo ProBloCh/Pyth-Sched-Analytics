@@ -20,6 +20,8 @@ from __future__ import annotations
 import logging
 import math
 
+from datetime import timedelta
+
 from .helpers import (
     Bounds, clamp, safe_date, convert_to_hours,
     normalize_percent_complete, difference_in_calendar_days,
@@ -142,6 +144,196 @@ def compute_eac(bac: float, cpi: float, spi: float = 1.0,
     lower = max(ac, bac * Bounds.MIN_EAC_FACTOR)
     upper = bac * (2.5 if pct > 50.0 else Bounds.MAX_EAC_FACTOR)
     return clamp(eac, lower, upper)
+
+
+# ---------------------------------------------------------------------------
+# Earned Schedule (Lipke 2003)
+# ---------------------------------------------------------------------------
+#
+# The standard SPI = EV / PV degenerates to 1.0 at project completion
+# regardless of how late the project actually finished, because once all
+# work is earned both EV and PV equal BAC.  Earned Schedule (Lipke,
+# "Schedule Is Different", The Measurable News, 2003) fixes this by
+# projecting EV horizontally onto the planned PV curve to find the
+# **time** at which the work currently earned should have been completed.
+#
+#   ES   = the date on which planned PV first equals current EV
+#   AT   = elapsed time since project start (the actual time)
+#   SPI(t) = ES / AT   -- a time-based SPI; stays <1 if the project is
+#                         late, even at completion
+#   TEAC(t) = AT + (PD - ES) / SPI(t) = PD / SPI(t)   (when AT > 0)
+#
+# This is purely additive to the existing cost-based EVM metrics and
+# does not change any existing field in the response.
+#
+# ---------------------------------------------------------------------------
+
+def _significant_evm_dates(nodes):
+    """Sorted unique list of activity Start / Finish dates.
+
+    BCWS is piecewise-linear in time: each activity contributes a linear
+    ramp from Start to Finish.  Sampling BCWS at every Start/Finish
+    boundary captures every breakpoint, so linear interpolation between
+    samples is exact (not an approximation).
+    """
+    out = set()
+    for n in nodes or []:
+        s = safe_date(n.get('Start'))
+        f = safe_date(n.get('Finish'))
+        if s is not None:
+            out.add(s.replace(hour=0, minute=0, second=0, microsecond=0))
+        if f is not None:
+            out.add(f.replace(hour=0, minute=0, second=0, microsecond=0))
+    return sorted(out)
+
+
+def compute_earned_schedule(nodes, status_date, hours_per_day: float = 8.0,
+                            working_days_per_week: float = 5.0) -> dict:
+    """Lipke (2003) Earned Schedule, SPI(t), and time-based EAC.
+
+    Returns a dict with:
+        earnedScheduleDays   : ES in calendar days from project start
+        actualTimeDays       : AT (status_date - project_start) in days
+        plannedDurationDays  : PD (project_finish - project_start) in days
+        SPI_t                : raw  ES / AT  (Inf when AT == 0 and ES > 0)
+        SPI_t_model          : clamped to evm Bounds.MIN_SPI..MAX_SPI
+        earnedScheduleDate   : ISO date when current EV was planned
+        TEAC_days            : PD / SPI(t), clamped >= AT  (Lipke
+                               Independent Estimate at Completion (time))
+        TEAC_date            : project_start + TEAC_days, ISO
+        flags                : diagnostics (no_baseline / completed /
+                               not_started / status_before_start)
+
+    Uses calendar days throughout to match the project's planned-date
+    arithmetic in difference_in_calendar_days.  EV/PV are accumulated
+    in the same hour-units that compute_bcwp_hours / compute_bcws_hours
+    use, so the curves are dimensionally consistent for interpolation.
+    """
+    sd = safe_date(status_date)
+    significant = _significant_evm_dates(nodes)
+
+    flags = {}
+    if not significant:
+        flags['no_baseline'] = True
+        return _empty_es(flags)
+
+    project_start = significant[0]
+    project_finish = significant[-1]
+    pd_days = max(
+        difference_in_calendar_days(project_finish, project_start), 0.0)
+
+    if sd is None:
+        sd = project_start
+        flags['status_date_missing'] = True
+
+    # Always include the status date so AT can be read off the same grid.
+    sd_mid = sd.replace(hour=0, minute=0, second=0, microsecond=0)
+    if sd_mid not in significant:
+        # Insertion-sorted to preserve monotonicity.
+        idx = 0
+        for d in significant:
+            if d > sd_mid:
+                break
+            idx += 1
+        significant.insert(idx, sd_mid)
+
+    ev_hours = compute_bcwp_hours(
+        nodes, hours_per_day, working_days_per_week)
+
+    # Sample cumulative PV at every breakpoint.
+    pv_curve = [
+        (d, compute_bcws_hours(
+            nodes, d, hours_per_day, working_days_per_week))
+        for d in significant
+    ]
+    pv_total = pv_curve[-1][1] if pv_curve else 0.0
+
+    at_days = max(
+        difference_in_calendar_days(sd_mid, project_start), 0.0)
+    if at_days <= 0:
+        flags['status_before_start'] = True
+
+    # ES: smallest date at which cumulative PV >= EV.  Linear interp
+    # between samples (PV is piecewise-linear so this is exact).
+    es_days = 0.0
+    es_date = project_start
+    if ev_hours <= 0:
+        flags['not_started'] = True
+        es_days = 0.0
+        es_date = project_start
+    elif pv_total <= 0:
+        flags['no_baseline'] = True
+        es_days = 0.0
+        es_date = project_start
+    elif ev_hours >= pv_total:
+        flags['completed'] = True
+        es_days = pd_days
+        es_date = project_finish
+    else:
+        for k in range(len(pv_curve) - 1):
+            d0, pv0 = pv_curve[k]
+            d1, pv1 = pv_curve[k + 1]
+            if pv0 <= ev_hours <= pv1:
+                span = pv1 - pv0
+                if span > 0:
+                    frac = (ev_hours - pv0) / span
+                else:
+                    frac = 0.0
+                day_span = difference_in_calendar_days(d1, d0)
+                es_days = (
+                    difference_in_calendar_days(d0, project_start)
+                    + frac * day_span)
+                es_date = d0 + timedelta(days=frac * day_span)
+                break
+
+    # SPI(t) - raw can be Inf if AT == 0 with ES > 0; clamp the _model.
+    if at_days > 0:
+        spi_t = es_days / at_days
+    elif es_days > 0:
+        spi_t = math.inf
+    else:
+        spi_t = 1.0
+    spi_t_model = (clamp(spi_t, Bounds.MIN_SPI, Bounds.MAX_SPI)
+                   if math.isfinite(spi_t) else 1.0)
+
+    # Time-based EAC: Lipke IEAC(t) = PD / SPI(t).  Clamped to be at
+    # least the elapsed AT (a project that's already taken AT days
+    # cannot finish in fewer than AT days).
+    if pd_days <= 0 or spi_t_model <= 0:
+        teac_days = 0.0
+    else:
+        teac_days = max(at_days, pd_days / spi_t_model)
+    teac_date = project_start + timedelta(days=teac_days)
+
+    return {
+        'earnedScheduleDays':  es_days,
+        'actualTimeDays':      at_days,
+        'plannedDurationDays': pd_days,
+        'SPI_t':               spi_t,
+        'SPI_t_model':         spi_t_model,
+        'earnedScheduleDate':  es_date.strftime('%Y-%m-%d'),
+        'TEAC_days':           teac_days,
+        'TEAC_date':           teac_date.strftime('%Y-%m-%d'),
+        'projectStartDate':    project_start.strftime('%Y-%m-%d'),
+        'projectFinishDate':   project_finish.strftime('%Y-%m-%d'),
+        'flags':               flags,
+    }
+
+
+def _empty_es(flags):
+    return {
+        'earnedScheduleDays':  0.0,
+        'actualTimeDays':      0.0,
+        'plannedDurationDays': 0.0,
+        'SPI_t':               1.0,
+        'SPI_t_model':         1.0,
+        'earnedScheduleDate':  None,
+        'TEAC_days':           0.0,
+        'TEAC_date':           None,
+        'projectStartDate':    None,
+        'projectFinishDate':   None,
+        'flags':               flags,
+    }
 
 
 # ---------------------------------------------------------------------------

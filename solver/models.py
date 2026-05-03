@@ -107,6 +107,13 @@ class ProjectContext:
     resource_capacities: dict = field(default_factory=lambda: {'default': 10})
     max_end_date: str = None
     max_budget: float = None
+    # Resolved numeric constraints in the same time units as the
+    # solver's makespan (whatever Duration units the request supplied).
+    # Populated by from_dict via _resolve_max_makespan; None means the
+    # constraint either wasn't supplied or couldn't be parsed.
+    max_makespan: float = None
+    start_date: str = None
+    holidays: list = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d):
@@ -114,14 +121,82 @@ class ProjectContext:
             return cls()
         calendar = d.get('calendar', {})
         constraints = d.get('constraints', {})
+        start_date = (d.get('start_date')
+                      or calendar.get('start_date')
+                      or (d.get('project') or {}).get('start_date'))
+        max_makespan = _resolve_max_makespan(
+            constraints.get('max_makespan'),
+            constraints.get('max_end_date'),
+            start_date,
+            calendar.get('hours_per_day', 8.0),
+            calendar.get('working_days', [1, 2, 3, 4, 5]),
+        )
         return cls(
             hours_per_day=calendar.get('hours_per_day', 8.0),
             working_days=calendar.get('working_days', [1, 2, 3, 4, 5]),
             phase=d.get('phase', 'construction'),
             resource_capacities=d.get('resource_capacities', {'default': 10}),
             max_end_date=constraints.get('max_end_date'),
-            max_budget=constraints.get('max_budget'),
+            max_budget=_safe_constraint(constraints.get('max_budget')),
+            max_makespan=max_makespan,
+            start_date=start_date,
+            holidays=calendar.get('holidays') or [],
         )
+
+
+def _safe_constraint(value):
+    """Coerce a constraint value to a positive float, else None."""
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(v) or v <= 0:
+        return None
+    return v
+
+
+def _resolve_max_makespan(max_makespan_raw, max_end_date_raw, start_date_raw,
+                          hours_per_day, working_days):
+    """Resolve a numeric max_makespan in the solver's time units.
+
+    Priority:
+      1. Explicit numeric ``constraints.max_makespan`` (already in solver
+         time units; the unambiguous form).
+      2. Numeric ``constraints.max_end_date`` (treated as time units;
+         backward-compatible with callers that passed a number here).
+      3. ISO ``constraints.max_end_date`` plus an ISO project ``start_date``:
+         convert the calendar-day difference to working hours using the
+         supplied hours_per_day and working_days_per_week.
+
+    Returns None when no resolution is possible -- the optimizer then
+    skips that constraint silently (the analysis layer surfaces
+    unresolved constraints separately so callers can detect mis-config).
+    """
+    direct = _safe_constraint(max_makespan_raw)
+    if direct is not None:
+        return direct
+    direct = _safe_constraint(max_end_date_raw)
+    if direct is not None:
+        return direct
+    if max_end_date_raw is None or start_date_raw is None:
+        return None
+    try:
+        from datetime import datetime
+        end = datetime.fromisoformat(
+            str(max_end_date_raw).replace('Z', '+00:00'))
+        start = datetime.fromisoformat(
+            str(start_date_raw).replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+    cal_days = (end - start).total_seconds() / 86400.0
+    if cal_days <= 0:
+        return None
+    wd_count = len([d for d in (working_days or [])
+                    if isinstance(d, (int, float))]) or 5
+    working_hours = cal_days * (wd_count / 7.0) * float(hours_per_day or 8.0)
+    return working_hours if working_hours > 0 else None
 
 
 def _safe_float(value, default, lo=0.0, hi=1e12):
