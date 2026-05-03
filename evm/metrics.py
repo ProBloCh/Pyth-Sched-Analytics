@@ -384,9 +384,14 @@ def compute_earned_schedule(nodes, status_date, hours_per_day: float = 8.0,
     pv_curve = list(zip(significant, pv_arr.tolist()))
     pv_total = pv_curve[-1][1] if pv_curve else 0.0
 
-    at_days = max(
-        difference_in_calendar_days(sd_mid, project_start), 0.0)
-    if at_days <= 0:
+    # Compute the unclamped calendar-day difference first so we can
+    # distinguish "status exactly at project_start" (raw == 0, flag
+    # NOT set, AT == 0) from "status strictly before project_start"
+    # (raw < 0, flag SET, AT clamped to 0).  Without this split, the
+    # flag would also fire on the kickoff-day case.
+    raw_at_days = difference_in_calendar_days(sd_mid, project_start)
+    at_days = max(raw_at_days, 0.0)
+    if raw_at_days < 0:
         flags['status_before_start'] = True
 
     # ES: smallest date at which cumulative PV >= EV.  Linear interp

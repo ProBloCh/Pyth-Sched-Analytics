@@ -73,6 +73,41 @@ class TestConvertToHours:
         assert convert_to_hours(10, 'xyz') == 10
 
 
+class TestWorkingHoursToUnit:
+    """Inverse of convert_to_hours.  Locks the malformed-input
+    contract: None -> default, but 0 / NaN / Inf / negative explicitly
+    return 0.0 rather than silently being swapped for defaults.
+    """
+
+    def test_hours_roundtrip_default(self):
+        from evm.helpers import working_hours_to_unit
+        # 16 working hours at 8 hpd = 2 days
+        assert working_hours_to_unit(16.0, 'days') == pytest.approx(2.0)
+
+    def test_none_hours_per_day_uses_default(self):
+        from evm.helpers import working_hours_to_unit
+        # None -> default 8 hpd, so 16h = 2 days
+        assert working_hours_to_unit(16.0, 'days', None) == pytest.approx(2.0)
+
+    def test_zero_hours_per_day_returns_zero(self):
+        from evm.helpers import working_hours_to_unit
+        # Pre-fix: ``or 8.0`` silently swapped 0 for default and
+        # returned 2 days, masking the malformed config.
+        assert working_hours_to_unit(16.0, 'days', 0) == 0.0
+
+    def test_negative_hours_per_day_returns_zero(self):
+        from evm.helpers import working_hours_to_unit
+        assert working_hours_to_unit(16.0, 'days', -8) == 0.0
+
+    def test_nan_hours_per_day_returns_zero(self):
+        from evm.helpers import working_hours_to_unit
+        assert working_hours_to_unit(16.0, 'days', float('nan')) == 0.0
+
+    def test_string_hours_per_day_returns_zero(self):
+        from evm.helpers import working_hours_to_unit
+        assert working_hours_to_unit(16.0, 'days', 'eight') == 0.0
+
+
 class TestNormalizePercentComplete:
 
     def test_p6_100_scale(self):
@@ -369,6 +404,17 @@ class TestEarnedSchedule:
         r = compute_earned_schedule(nodes, '2024-12-15')
         assert r['actualTimeDays'] == 0.0
         assert r['flags'].get('status_before_start') is True
+
+    def test_status_at_project_start_is_not_before(self):
+        """status_date == project_start (kickoff day) must not flag
+        status_before_start -- the project just hasn't started accruing
+        time yet.  Pre-fix the flag fired whenever AT == 0, conflating
+        "before kickoff" with "at kickoff"."""
+        nodes = self._three_seq()
+        r = compute_earned_schedule(nodes, '2025-01-01')
+        assert r['actualTimeDays'] == 0.0
+        # Flag must NOT be set on kickoff day.
+        assert r['flags'].get('status_before_start') is not True
 
     def test_engine_surfaces_earned_schedule(self):
         """The /evm/analyze response shape must include earnedSchedule

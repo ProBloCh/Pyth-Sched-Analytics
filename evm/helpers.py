@@ -187,7 +187,13 @@ def working_hours_to_unit(hours, time_units, hours_per_day: float = 8.0,
     one-for-one, including the ``m`` = minutes vs ``mo`` = months
     distinction.
 
-    Returns 0.0 when ``hours`` is non-finite or non-positive.
+    Returns 0.0 when ``hours`` is non-finite or non-positive, or when
+    ``hours_per_day`` / ``working_days_per_week`` are explicitly
+    malformed (non-numeric, non-finite, or non-positive).  ``None`` is
+    treated as "use default" (8 hpd / 5 dpw); zero or negative values
+    are NOT silently swapped for defaults via ``or`` -- masking those
+    would let a malformed calendar config produce a plausible-looking
+    result that disagrees with the resolver and the calendar mapping.
     """
     try:
         h = float(hours)
@@ -195,8 +201,22 @@ def working_hours_to_unit(hours, time_units, hours_per_day: float = 8.0,
         return 0.0
     if not math.isfinite(h) or h <= 0:
         return 0.0
-    hpd = max(float(hours_per_day or 8.0), 1e-9)
-    dpw = max(float(working_days_per_week or 5.0), 1e-9)
+
+    def _validate(raw, default):
+        if raw is None:
+            return default
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(v) or v <= 0:
+            return None
+        return v
+
+    hpd = _validate(hours_per_day, 8.0)
+    dpw = _validate(working_days_per_week, 5.0)
+    if hpd is None or dpw is None:
+        return 0.0
 
     u_raw = str(time_units if time_units is not None else 'Hours').strip().lower()
     if not u_raw:
