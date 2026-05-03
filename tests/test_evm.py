@@ -287,7 +287,12 @@ class TestEarnedSchedule:
     PV-curve interpolation."""
 
     def _three_seq(self, **pct):
-        """Three sequential 10-day activities Jan 1 - Feb 1."""
+        """Three sequential 10-day activities Jan 1 - Feb 2 (PD = 32 days).
+
+        Activity 1: Jan  1 - Jan 11
+        Activity 2: Jan 12 - Jan 22
+        Activity 3: Jan 23 - Feb  2
+        """
         return [
             {'ID': '1', 'Duration': 10, 'TimeUnits': 'days',
              'Start': '2025-01-01', 'Finish': '2025-01-11',
