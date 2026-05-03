@@ -864,6 +864,272 @@ def _maybe_build_calendar(nodes, dag_state, id_to_idx, status_ms,
 
 
 # ---------------------------------------------------------------------------
+# Stochastic TEAC (Lipke time-based Estimate at Completion, per percentile)
+# ---------------------------------------------------------------------------
+#
+# The deterministic Earned Schedule (evm/metrics.compute_earned_schedule)
+# returns a single TEAC value clamped through Bounds.MIN_SPI/MAX_SPI.
+# That sits awkwardly in a codebase whose research identity is fat-tailed
+# overruns: for an offshore O&G project at the P80, the 50/50 chance of
+# overrun isn't a one-number SPI(t), it's a five-tier distribution.
+#
+# This block reuses the per-percentile finish dates already produced by
+# the MC propagation and recasts them as Lipke-style TEAC values:
+#
+#   TEAC_p_days = (finish_p_date - project_start_date) calendar days
+#   SPI(t)_p    = PD / TEAC_p   (clamped to Bounds.MIN_SPI..MAX_SPI for the
+#                                model variant; raw kept as well)
+#   impact_p    = (finish_p_date - expected_finish_date) days  (delta from
+#                                deterministic baseline)
+#
+# It does NOT recompute the percentiles -- those are the same sorted
+# samples /completion/monte-carlo already exposes via p20_finish /
+# p50_finish / p80_finish.  The contribution is to (a) anchor them to a
+# baseline project_start so the duration is meaningful, and (b) emit the
+# implied SPI(t) so consumers reading evmMetrics.actual.earnedSchedule
+# can see the uncertainty band around its single deterministic SPI(t).
+
+# Mirror evm.helpers.Bounds.MIN_SPI / MAX_SPI so the clamped SPI(t)_model
+# emitted here matches what /evm/analyze emits for the same SPI(t).  An
+# earlier draft hardcoded 0.1 / 5.0, which silently diverged once
+# Bounds was widened to 0.05 / 10.0 -- making /evm/analyze.actual.
+# earnedSchedule.SPI_t_model and response.teac.percentiles.*.spi_t_model
+# disagree on the same project.  Importing from the canonical source
+# means a future Bounds change updates both endpoints atomically.
+from evm.helpers import Bounds as _EVM_BOUNDS
+_TEAC_MIN_SPI = _EVM_BOUNDS.MIN_SPI
+_TEAC_MAX_SPI = _EVM_BOUNDS.MAX_SPI
+
+
+def _baseline_project_start_ms(nodes, fallback_ms):
+    """Earliest baseline ``Start`` across nodes, or ``fallback_ms`` when
+    none is parseable.  Mirrors evm.metrics._significant_evm_dates(...)[0]
+    but uses the milliseconds path that the rest of monte_carlo.py
+    operates in.
+    """
+    earliest = None
+    for n in nodes or []:
+        s_ms = _parse_iso_to_ms(n.get('Start') or n.get('start'))
+        if s_ms is None:
+            continue
+        if earliest is None or s_ms < earliest:
+            earliest = s_ms
+    return float(earliest) if earliest is not None else float(fallback_ms)
+
+
+def _baseline_project_finish_ms(nodes, fallback_ms):
+    """Latest baseline ``Finish`` across nodes, or ``fallback_ms``."""
+    latest = None
+    for n in nodes or []:
+        f_ms = _parse_iso_to_ms(n.get('Finish') or n.get('finish'))
+        if f_ms is None:
+            continue
+        if latest is None or f_ms > latest:
+            latest = f_ms
+    return float(latest) if latest is not None else float(fallback_ms)
+
+
+def _spi_t_from_pd_and_teac(pd_days, teac_days):
+    """Implied SPI(t) = PD / TEAC, with raw + clamped variants.
+
+    Returns ``(None, None)`` when ``pd_days <= 0`` -- the most common
+    cause is partial baseline (Start without Finish, or vice versa),
+    where PD has no defined value and reporting any SPI(t) would imply
+    a baseline comparison the data doesn't support.
+
+    Raw is preserved (Inf when teac_days == 0 with pd_days > 0).  Model
+    is clamped to [_TEAC_MIN_SPI, _TEAC_MAX_SPI] for use in downstream
+    EAC arithmetic; matches the convention in
+    evm.metrics.compute_earned_schedule.
+    """
+    if pd_days <= 0:
+        return None, None
+    if teac_days > 0:
+        raw = pd_days / teac_days
+    else:
+        raw = float('inf')
+    if not np.isfinite(raw):
+        model = 1.0
+    else:
+        model = float(np.clip(raw, _TEAC_MIN_SPI, _TEAC_MAX_SPI))
+    return raw, model
+
+
+def _teac_percentile(label, finish_ms, project_start_ms, expected_finish_ms,
+                     pd_days):
+    """Build one percentile entry for the TEAC block.
+
+    All day quantities are calendar days (clock-time deltas / 86_400_000)
+    to match the rest of /completion/monte-carlo's day reporting
+    (spread_days, p20_impact_days, ...).  This differs by < 1 day from
+    evm.metrics' midnight-floored difference_in_calendar_days under
+    typical inputs but stays internally consistent within the response.
+    """
+    teac_days = max(0.0, (finish_ms - project_start_ms) / _MS_PER_DAY)
+    impact_days = (finish_ms - expected_finish_ms) / _MS_PER_DAY
+    spi_t, spi_t_model = _spi_t_from_pd_and_teac(pd_days, teac_days)
+    return {
+        'label':       label,
+        'teac_days':   round(teac_days, 2),
+        'teac_date':   _ms_to_iso(finish_ms),
+        'spi_t':       (None if (spi_t is None or not np.isfinite(spi_t))
+                        else round(spi_t, 4)),
+        'spi_t_model': (None if spi_t_model is None
+                        else round(spi_t_model, 4)),
+        'impact_days': round(impact_days, 2),
+    }
+
+
+def _compose_teac_block(nodes, status_ms, expected_finish_ms,
+                        proj_finish_sorted, M_actual, in_scope_count):
+    """Build the stochastic TEAC block from MC finish-date samples.
+
+    Composes the existing /completion/monte-carlo per-percentile finish
+    dates with a baseline project_start anchor to produce Lipke-style
+    time-based EAC values.  Reuses the sorted samples computed for
+    p20/p50/p80 -- no extra MC pass.
+    """
+    has_baseline_start = any(
+        _parse_iso_to_ms(n.get('Start') or n.get('start')) is not None
+        for n in nodes or [])
+    has_baseline_finish = any(
+        _parse_iso_to_ms(n.get('Finish') or n.get('finish')) is not None
+        for n in nodes or [])
+    has_full_baseline = has_baseline_start and has_baseline_finish
+
+    project_start_ms = _baseline_project_start_ms(nodes, fallback_ms=status_ms)
+    project_finish_ms = _baseline_project_finish_ms(
+        nodes, fallback_ms=expected_finish_ms)
+
+    # PD = baseline_finish - baseline_start.  Only well-defined when BOTH
+    # sides are recorded.  If only one is present, the missing anchor
+    # falls back to a forecast date (status_ms / expected_finish_ms),
+    # which would make PD a synthetic number compared against itself --
+    # the deterministic SPI(t) would lock to 1.0 even for a project with
+    # no baseline duration to compare against.  Treat partial baseline
+    # as "no baseline" for the purposes of PD / SPI(t) reporting.
+    if has_full_baseline:
+        pd_days = max(0.0, (project_finish_ms - project_start_ms)
+                      / _MS_PER_DAY)
+    else:
+        pd_days = 0.0
+
+    raw_at_days = (status_ms - project_start_ms) / _MS_PER_DAY
+    at_days = max(0.0, raw_at_days)
+
+    flags = {}
+    # `no_baseline` fires when EITHER Start or Finish is absent project-
+    # wide (not just both).  Partial baselines are not enough to anchor
+    # PD / SPI(t).
+    if not has_full_baseline:
+        flags['no_baseline'] = True
+    if raw_at_days < 0:
+        flags['status_before_start'] = True
+    if in_scope_count == 0:
+        flags['all_completed'] = True
+
+    # Percentile finish dates: reuse the already-sorted MC samples.
+    # P10 and P95 are added on top of the existing P20/P50/P80 contract
+    # because TEAC bands are commonly reported at the P10 (best case)
+    # and P95 (Flyvbjerg-table cap) extremes.
+    def _pct(p):
+        if M_actual <= 0:
+            return float(expected_finish_ms)
+        idx = int(p * (M_actual - 1))
+        return float(proj_finish_sorted[idx])
+
+    p10_ms = _pct(0.10)
+    p20_ms = _pct(0.20)
+    p50_ms = _pct(0.50)
+    p80_ms = _pct(0.80)
+    p95_ms = _pct(0.95)
+
+    percentiles = {
+        'p10': _teac_percentile('P10', p10_ms, project_start_ms,
+                                expected_finish_ms, pd_days),
+        'p20': _teac_percentile('P20', p20_ms, project_start_ms,
+                                expected_finish_ms, pd_days),
+        'p50': _teac_percentile('P50', p50_ms, project_start_ms,
+                                expected_finish_ms, pd_days),
+        'p80': _teac_percentile('P80', p80_ms, project_start_ms,
+                                expected_finish_ms, pd_days),
+        'p95': _teac_percentile('P95', p95_ms, project_start_ms,
+                                expected_finish_ms, pd_days),
+    }
+
+    # MC deterministic midpoint: the no-risk-multiplier CPM forward pass
+    # finish, in TEAC form.  This is NOT the same number as
+    # /evm/analyze.actual.earnedSchedule.TEAC_date.  EVM's TEAC is
+    # `max(AT, PD / SPI_t_model)` where SPI(t) comes from the EV/PV
+    # intersection (cost-side Earned Schedule).  This block's deterministic
+    # value comes from a CPM forward pass through the remaining-work DAG.
+    # The two agree when no progress has been recorded and ExpectedStart
+    # equals Start, but diverge under in-progress / out-of-sequence /
+    # status-after-completion conditions because they are different
+    # computations.  Surfacing it here gives consumers the natural
+    # midpoint of the MC band so the percentile spread can be read in
+    # one response; the EVM endpoint remains the authoritative deterministic
+    # ES TEAC.
+    det_teac_days = max(0.0, (expected_finish_ms - project_start_ms)
+                        / _MS_PER_DAY)
+    det_spi_t, det_spi_t_model = _spi_t_from_pd_and_teac(
+        pd_days, det_teac_days)
+
+    # When the baseline is partial / absent, projectFinishDate falls back
+    # to expected_finish_ms (a forecast date).  Don't echo that synthetic
+    # value as if it were a recorded baseline; emit None so consumers see
+    # the missing data rather than treating a forecast as a baseline.
+    project_finish_emit = (_ms_to_iso(project_finish_ms)
+                           if has_full_baseline else None)
+    project_start_emit = (_ms_to_iso(project_start_ms)
+                          if has_baseline_start else None)
+
+    return {
+        'projectStartDate':    project_start_emit,
+        'projectFinishDate':   project_finish_emit,
+        'plannedDurationDays': (round(pd_days, 2) if has_full_baseline
+                                else None),
+        'statusDate':          _ms_to_iso(status_ms),
+        'actualTimeDays':      round(at_days, 2),
+        'percentiles':         percentiles,
+        'deterministic': {
+            'teac_days':   round(det_teac_days, 2),
+            'teac_date':   _ms_to_iso(expected_finish_ms),
+            'spi_t':       (None if (det_spi_t is None
+                                     or not np.isfinite(det_spi_t))
+                            else round(det_spi_t, 4)),
+            'spi_t_model': (None if det_spi_t_model is None
+                            else round(det_spi_t_model, 4)),
+            'source':      'mc_no_risk_cpm',
+            'note':        ('No-risk-multiplier CPM midpoint of the MC '
+                            'band.  Equals top-level expected_finish on '
+                            'the regular MC path; clamps forward to '
+                            'statusDate on the all-completed stale-status '
+                            'edge case so TEAC >= AT (Lipke).  Differs '
+                            'from /evm/analyze.actual.earnedSchedule.'
+                            'TEAC_date, which uses max(AT, PD / '
+                            'SPI_t_model) on the cost-side EV/PV '
+                            'intersection.'),
+        },
+        'flags':                flags,
+        'method':               'lipke_2003_stochastic',
+        'crossReference': {
+            'evm_endpoint':  '/evm/analyze',
+            'evm_field':     'actual.earnedSchedule',
+            'note':          ('Authoritative deterministic Lipke ES / '
+                              'SPI(t) / TEAC live on /evm/analyze (cost-'
+                              'side EV vs PV intersection).  This block '
+                              'provides the five-tier risk-model '
+                              'uncertainty band around the MC '
+                              'remaining-work midpoint, which uses the '
+                              'CPM forward pass and may diverge from '
+                              'the EVM TEAC under in-progress / out-of-'
+                              'sequence / status-after-completion data.'),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -928,10 +1194,33 @@ def run_completion_mc(nodes, links, status_date,
         calendar)
 
     if not np.any(in_scope):
-        # Nothing left to simulate -- all activities have ActualFinish
+        # Nothing left to simulate -- all activities have ActualFinish.
+        # Pre-existing finish-date fields (expected_finish, p20/p50/p80)
+        # report the actual completion date as-is, regardless of where
+        # status_date is.  This preserves the historical contract:
+        # consumers reading p80_finish for a closed-out project must
+        # still see the recorded completion, not the caller's status.
+        # Only the new `teac` block clamps to status_ms (via
+        # `teac_completion_ms` below), mirroring evm.metrics's
+        # `teac_days = max(at_days, ...)` so AT > TEAC > SPI(t) > 1
+        # can't fire on a stale-status report.
         latest = float(np.nanmax(actual_finish_ms)) if np.any(
             np.isfinite(actual_finish_ms)) else status_ms
         iso = _ms_to_iso(latest)
+        # TEAC-internal clamp: the new teac block's percentiles, the
+        # deterministic midpoint, and AT all reference status_ms; if
+        # the project actually finished earlier, the TEAC view is
+        # "you've spent at least AT, so TEAC >= AT".  Doesn't touch
+        # the public iso fields above.
+        teac_completion_ms = max(latest, status_ms)
+        teac_block = _compose_teac_block(
+            nodes=nodes,
+            status_ms=status_ms,
+            expected_finish_ms=teac_completion_ms,
+            proj_finish_sorted=np.array(
+                [teac_completion_ms], dtype=np.float64),
+            M_actual=1,
+            in_scope_count=0)
         return {
             'status_date':        _ms_to_iso(status_ms),
             'expected_finish':    iso,
@@ -950,6 +1239,7 @@ def run_completion_mc(nodes, links, status_date,
             'scope_size':           0,
             'iterations':           0,
             'seed':                 config.seed,
+            'teac':                 teac_block,
             'computation_ms':       round((time.time() - t0) * 1000, 1),
         }
 
@@ -1060,6 +1350,19 @@ def run_completion_mc(nodes, links, status_date,
     calibration_warnings = _build_calibration_warnings(
         nodes, in_scope, risk, ref_params, status_ms, project_dates)
 
+    # Stochastic TEAC block: composes the MC finish-date distribution
+    # with a baseline project_start anchor to produce Lipke-style
+    # time-based EAC values per percentile.  Reuses the already-sorted
+    # samples (no second pass) and the same expected_finish baseline
+    # that drives p20_impact_days etc.
+    teac_block = _compose_teac_block(
+        nodes=nodes,
+        status_ms=status_ms,
+        expected_finish_ms=expected_finish_ms,
+        proj_finish_sorted=proj_sorted,
+        M_actual=M_actual,
+        in_scope_count=int(np.sum(in_scope)))
+
     result = {
         'status_date':      _ms_to_iso(status_ms),
         'expected_finish':  _ms_to_iso(expected_finish_ms),
@@ -1090,6 +1393,7 @@ def run_completion_mc(nodes, links, status_date,
         },
         'reference_class_calibrated': calibrated,
         'calibration_warnings':       calibration_warnings,
+        'teac':                       teac_block,
         'computation_ms': round((time.time() - t0) * 1000, 1),
     }
     return result
@@ -1097,6 +1401,18 @@ def run_completion_mc(nodes, links, status_date,
 
 def _empty_result(status_date, t0):
     iso = _ms_to_iso(_parse_iso_to_ms(status_date))
+    status_ms = _parse_iso_to_ms(status_date)
+    # Empty-project TEAC: no nodes, fallback project_start = status_ms,
+    # zero PD / zero AT, all percentiles at status.  Uniform shape lets
+    # consumers blindly read .teac without a presence check.
+    teac_block = _compose_teac_block(
+        nodes=[],
+        status_ms=status_ms if status_ms is not None else 0.0,
+        expected_finish_ms=status_ms if status_ms is not None else 0.0,
+        proj_finish_sorted=np.array(
+            [status_ms if status_ms is not None else 0.0], dtype=np.float64),
+        M_actual=1,
+        in_scope_count=0)
     return {
         'status_date':      iso,
         'expected_finish':  iso,
@@ -1115,5 +1431,6 @@ def _empty_result(status_date, t0):
         'scope_size':           0,
         'iterations':           0,
         'seed':                 42,
+        'teac':                 teac_block,
         'computation_ms':       round((time.time() - t0) * 1000, 1),
     }
