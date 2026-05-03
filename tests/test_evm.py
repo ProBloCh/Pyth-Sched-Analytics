@@ -24,6 +24,7 @@ from evm.helpers import (
 )
 from evm.metrics import (
     compute_evm_metrics, compute_eac, compute_duration_weighted,
+    compute_earned_schedule,
     compute_bcws_hours, compute_bcwp_hours, compute_bac_hours,
     compute_acwp,
 )
@@ -70,6 +71,41 @@ class TestConvertToHours:
 
     def test_unknown_unit_defaults_to_hours(self):
         assert convert_to_hours(10, 'xyz') == 10
+
+
+class TestWorkingHoursToUnit:
+    """Inverse of convert_to_hours.  Locks the malformed-input
+    contract: None -> default, but 0 / NaN / Inf / negative explicitly
+    return 0.0 rather than silently being swapped for defaults.
+    """
+
+    def test_hours_roundtrip_default(self):
+        from evm.helpers import working_hours_to_unit
+        # 16 working hours at 8 hpd = 2 days
+        assert working_hours_to_unit(16.0, 'days') == pytest.approx(2.0)
+
+    def test_none_hours_per_day_uses_default(self):
+        from evm.helpers import working_hours_to_unit
+        # None -> default 8 hpd, so 16h = 2 days
+        assert working_hours_to_unit(16.0, 'days', None) == pytest.approx(2.0)
+
+    def test_zero_hours_per_day_returns_zero(self):
+        from evm.helpers import working_hours_to_unit
+        # Pre-fix: ``or 8.0`` silently swapped 0 for default and
+        # returned 2 days, masking the malformed config.
+        assert working_hours_to_unit(16.0, 'days', 0) == 0.0
+
+    def test_negative_hours_per_day_returns_zero(self):
+        from evm.helpers import working_hours_to_unit
+        assert working_hours_to_unit(16.0, 'days', -8) == 0.0
+
+    def test_nan_hours_per_day_returns_zero(self):
+        from evm.helpers import working_hours_to_unit
+        assert working_hours_to_unit(16.0, 'days', float('nan')) == 0.0
+
+    def test_string_hours_per_day_returns_zero(self):
+        from evm.helpers import working_hours_to_unit
+        assert working_hours_to_unit(16.0, 'days', 'eight') == 0.0
 
 
 class TestNormalizePercentComplete:
@@ -274,6 +310,348 @@ class TestDurationWeighted:
         # Actual = 100% * 80hr = 80, Planned = 80 (finished by 01-11)
         assert r['actualCompletedHours'] == 80.0
         assert r['durationWeightedSPI'] == 1.0
+
+
+# =====================================================================
+# Earned Schedule (Lipke 2003)
+# =====================================================================
+
+class TestEarnedSchedule:
+    """Lipke ES / SPI(t) / TEAC.  Locks the time-based fix for the
+    cost-SPI-converges-to-1.0-at-completion pathology and the basic
+    PV-curve interpolation."""
+
+    def _three_seq(self, **pct):
+        """Three sequential 10-day activities Jan 1 - Feb 2 (PD = 32 days).
+
+        Activity 1: Jan  1 - Jan 11
+        Activity 2: Jan 12 - Jan 22
+        Activity 3: Jan 23 - Feb  2
+        """
+        return [
+            {'ID': '1', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '2025-01-01', 'Finish': '2025-01-11',
+             'PercentComplete': pct.get('p1', 0)},
+            {'ID': '2', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '2025-01-12', 'Finish': '2025-01-22',
+             'PercentComplete': pct.get('p2', 0)},
+            {'ID': '3', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '2025-01-23', 'Finish': '2025-02-02',
+             'PercentComplete': pct.get('p3', 0)},
+        ]
+
+    def test_empty_nodes_returns_neutral(self):
+        r = compute_earned_schedule([], '2025-06-01')
+        assert r['SPI_t'] == 1.0
+        assert r['flags'].get('no_baseline') is True
+
+    def test_not_started_zero_es(self):
+        nodes = self._three_seq()  # no progress
+        r = compute_earned_schedule(nodes, '2025-01-15')
+        assert r['earnedScheduleDays'] == 0.0
+        assert r['flags'].get('not_started') is True
+
+    def test_on_schedule(self):
+        # First task done, second 50%, status Jan 16 (16 days into 32-day plan)
+        nodes = self._three_seq(p1=100, p2=50)
+        r = compute_earned_schedule(nodes, '2025-01-17')
+        # EV = 80 + 80*0.5 = 120 hr; PV at Jan 17 = 80 (act1) + 80*5/10 (act2)
+        # Plan accrues to 120h on Jan 17; ES_date == status_date.
+        assert r['SPI_t'] == pytest.approx(1.0, abs=0.05)
+        assert r['flags'].get('completed', False) is False
+
+    def test_late_after_completion_doesnt_collapse_to_1(self):
+        """Lipke's killer feature: cost-based SPI=1.0 at finish even
+        when the project finished late, but SPI(t) correctly reports
+        the schedule slip."""
+        nodes = self._three_seq(p1=100, p2=100, p3=100)  # 100% earned
+        # PD = 32 days (Jan 1 - Feb 2).  Status = 8 days past planned
+        # finish, so AT = 40, ES = PD = 32, SPI(t) = 0.8.
+        r = compute_earned_schedule(nodes, '2025-02-10')
+        assert r['flags'].get('completed') is True
+        assert r['SPI_t_model'] == pytest.approx(0.8, abs=0.05)
+
+    def test_late_in_progress_spi_t_below_1(self):
+        # Only first task done at status Jan 22 (was supposed to finish all 3 by Feb 2)
+        nodes = self._three_seq(p1=100, p2=0)
+        r = compute_earned_schedule(nodes, '2025-01-22')
+        # EV = 80; planned PV reaches 80 at Jan 11 -> ES=10 days
+        # AT = 21 days -> SPI(t) ~= 0.476
+        assert r['SPI_t_model'] == pytest.approx(10.0 / 21.0, abs=0.05)
+
+    def test_teac_extends_when_late(self):
+        nodes = self._three_seq(p1=100, p2=0)
+        r = compute_earned_schedule(nodes, '2025-01-22')
+        # PD = 32, SPI(t) ~= 0.476, TEAC = PD / SPI(t) ~= 67 days
+        assert r['TEAC_days'] > r['plannedDurationDays']
+        assert r['TEAC_days'] == pytest.approx(67.0, abs=2.0)
+
+    def test_teac_at_least_at(self):
+        # A project already 50 days in cannot finish in fewer than 50 days,
+        # even if the math says so.
+        nodes = self._three_seq(p1=100, p2=100)
+        r = compute_earned_schedule(nodes, '2025-04-01')  # 90 days in
+        assert r['TEAC_days'] >= r['actualTimeDays']
+
+    def test_es_date_iso(self):
+        nodes = self._three_seq(p1=100)
+        r = compute_earned_schedule(nodes, '2025-01-25')
+        # EV=80; PV reaches 80 on Jan 11 (end of activity 1).
+        assert r['earnedScheduleDate'] == '2025-01-11'
+
+    def test_status_before_start(self):
+        nodes = self._three_seq()
+        r = compute_earned_schedule(nodes, '2024-12-15')
+        assert r['actualTimeDays'] == 0.0
+        assert r['flags'].get('status_before_start') is True
+
+    def test_status_at_project_start_is_not_before(self):
+        """status_date == project_start (kickoff day) must not flag
+        status_before_start -- the project just hasn't started accruing
+        time yet.  Pre-fix the flag fired whenever AT == 0, conflating
+        "before kickoff" with "at kickoff"."""
+        nodes = self._three_seq()
+        r = compute_earned_schedule(nodes, '2025-01-01')
+        assert r['actualTimeDays'] == 0.0
+        # Flag must NOT be set on kickoff day.
+        assert r['flags'].get('status_before_start') is not True
+
+    def test_engine_surfaces_earned_schedule(self):
+        """The /evm/analyze response shape must include earnedSchedule
+        so callers can read SPI(t) without recomputing."""
+        nodes = self._three_seq(p1=100, p2=50)
+        result = run_evm_analysis(nodes, [], {
+            'statusDate': '2025-01-17',
+            'costRate': 100.0,
+        })
+        assert 'earnedSchedule' in result['actual']
+        es = result['actual']['earnedSchedule']
+        assert 'SPI_t' in es
+        assert 'TEAC_date' in es
+
+    def test_es_ev_pv_units_consistent_camelcase(self):
+        """compute_earned_schedule must use matching TimeUnits keys for
+        EV (compute_bcwp_hours) and PV (_vectorised_pv_curve).  Pre-fix
+        compute_bcwp_hours read only TimeUnits (PascalCase), while the
+        round-16 PV fix added timeUnits (camelCase) fallback -- so a
+        camelCase-tagged schedule got EV in Hours and PV in Days,
+        producing a nonsensical ES.
+
+        Two equivalent schedules (one tagged with TimeUnits, one with
+        timeUnits) must produce the same SPI_t.
+        """
+        nodes_pascal = [
+            {'ID': '1', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '2025-01-01', 'Finish': '2025-01-11',
+             'PercentComplete': 100},
+            {'ID': '2', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '2025-01-12', 'Finish': '2025-01-22',
+             'PercentComplete': 50},
+        ]
+        nodes_camel = [
+            {'ID': '1', 'Duration': 10, 'timeUnits': 'days',
+             'Start': '2025-01-01', 'Finish': '2025-01-11',
+             'PercentComplete': 100},
+            {'ID': '2', 'Duration': 10, 'timeUnits': 'days',
+             'Start': '2025-01-12', 'Finish': '2025-01-22',
+             'PercentComplete': 50},
+        ]
+        r_pascal = compute_earned_schedule(nodes_pascal, '2025-01-17')
+        r_camel = compute_earned_schedule(nodes_camel, '2025-01-17')
+        assert r_pascal['SPI_t_model'] == pytest.approx(
+            r_camel['SPI_t_model'], rel=1e-9)
+        assert r_pascal['earnedScheduleDays'] == pytest.approx(
+            r_camel['earnedScheduleDays'], rel=1e-9)
+
+    def test_vectorised_pv_curve_handles_camelcase_timeunits(self):
+        """Mirror the dual-key fallback used by compute_duration_weighted:
+        a node carrying ``timeUnits`` (camelCase) must convert with the
+        right unit, not silently default to Hours.  Pre-fix the helper
+        only read ``TimeUnits`` (PascalCase), producing wrong PV in
+        ES for mixed-shape inputs."""
+        from evm.metrics import _vectorised_pv_curve, _significant_evm_dates
+        # Two-week activity expressed in days via the camelCase key.
+        nodes = [{
+            'ID': '1',
+            'Duration': 14, 'timeUnits': 'days',  # camelCase!
+            'Start': '2025-01-01', 'Finish': '2025-01-15',
+        }]
+        dates = _significant_evm_dates(nodes)
+        pv = _vectorised_pv_curve(nodes, dates, 8.0, 5.0)
+        # 14 days * 8 hpd = 112 working hours.  Pre-fix the camelCase
+        # was missed and the helper defaulted to 'Hours', returning
+        # 14 (treating 14 as already in hours).
+        assert pv[-1] == pytest.approx(112.0)
+
+    def test_vectorised_pv_curve_handles_milestones(self):
+        """Activities with finish == start (milestones) and degenerate
+        finish < start data must match the scalar reference, which
+        gives full credit when sd_time >= f.  The vectorised path's
+        step branch handles this; without it, milestones contributed 0
+        at the milestone date instead of planned_hrs.
+        """
+        from evm.metrics import _vectorised_pv_curve
+        from datetime import datetime, timezone
+        # Milestone activity: finish == start.  Use Duration=1 day so
+        # it isn't filtered out by the "Duration in (0, '0')" guard.
+        nodes = [{
+            'ID': 'M', 'Duration': 1, 'TimeUnits': 'days',
+            'Start': '2025-01-15', 'Finish': '2025-01-15',
+        }]
+        dates = [
+            datetime(2025, 1, 14, tzinfo=timezone.utc),  # before
+            datetime(2025, 1, 15, tzinfo=timezone.utc),  # at boundary
+            datetime(2025, 1, 16, tzinfo=timezone.utc),  # after
+        ]
+        pv = _vectorised_pv_curve(nodes, dates, 8.0, 5.0)
+        assert pv[0] == 0.0           # before milestone -> 0
+        assert pv[1] == pytest.approx(8.0)  # at milestone -> full credit
+        assert pv[2] == pytest.approx(8.0)  # after -> still full credit
+
+    def test_vectorised_pv_curve_matches_scalar(self):
+        """The vectorised PV curve must produce numerically identical
+        results to the scalar compute_bcws_hours called per date.
+
+        This test exists because a subtle bug in the broadcasting
+        (wrong axis, off-by-one in the clip, span = 0 handling) could
+        easily slip past the small-fixture tests if the few breakpoints
+        happen to land on degenerate values.  Running on 100 random
+        activities across hundreds of dates exercises the matrix path.
+        """
+        from datetime import datetime, timedelta
+        import random
+        from evm.metrics import _vectorised_pv_curve, _significant_evm_dates
+        from evm.metrics import compute_bcws_hours
+
+        random.seed(42)
+        nodes = []
+        base = datetime(2025, 1, 1)
+        for i in range(100):
+            start_offset = random.randint(0, 200)
+            duration_days = random.randint(1, 30)
+            s = base + timedelta(days=start_offset)
+            f = s + timedelta(days=duration_days)
+            nodes.append({
+                'ID': str(i),
+                'Duration': duration_days, 'TimeUnits': 'days',
+                'Start': s.strftime('%Y-%m-%d'),
+                'Finish': f.strftime('%Y-%m-%d'),
+            })
+        dates = _significant_evm_dates(nodes)
+        # Sanity: with 100 random activities we should easily have many
+        # breakpoints (well under the _ES_MAX_DATES cap of 500).
+        assert 50 < len(dates) <= 500
+
+        vec = _vectorised_pv_curve(nodes, dates, 8.0, 5.0)
+        for k, d in enumerate(dates):
+            scalar = compute_bcws_hours(nodes, d, 8.0, 5.0)
+            assert vec[k] == pytest.approx(scalar, rel=1e-9, abs=1e-9), (
+                f'Vectorised PV mismatch at date {d.date()}: '
+                f'vec={vec[k]} scalar={scalar}')
+
+    def test_cap_swap_preserves_first_and_last(self):
+        """The cap's must-include swap must NOT drop the project's
+        first/last breakpoints -- ES uses them to compute project_start,
+        project_finish, and PD.  Pre-fix the swap could pick either
+        end-date as 'droppable' because ``kept`` is a set (unordered).
+        """
+        from datetime import datetime, timedelta, timezone
+        from evm.metrics import _significant_evm_dates, _ES_MAX_DATES
+
+        nodes = []
+        base = datetime(2020, 1, 1)
+        for i in range(_ES_MAX_DATES * 2):
+            s = base + timedelta(days=i)
+            nodes.append({
+                'ID': str(i),
+                'Duration': 1, 'TimeUnits': 'days',
+                'Start': s.strftime('%Y-%m-%d'),
+                'Finish': (s + timedelta(days=1)).strftime('%Y-%m-%d'),
+            })
+        # Pick several must-include dates that aren't natural
+        # breakpoints; the swap loop must keep the project first/last
+        # AND the must-includes.
+        must_dates = [
+            '2021-03-15', '2021-06-15', '2021-09-15', '2021-12-15',
+            '2022-03-15', '2022-06-15',
+        ]
+        result = _significant_evm_dates(nodes, must_include=must_dates)
+        assert len(result) <= _ES_MAX_DATES
+
+        # Project first/last must survive (they drive PD).
+        first_expected = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        # Last activity has Finish = base + (N-1+1) days
+        last_expected = (base + timedelta(days=_ES_MAX_DATES * 2)
+                         ).replace(tzinfo=timezone.utc)
+        assert first_expected in result
+        assert last_expected in result
+
+        # All must-include dates must survive too.
+        for d in must_dates:
+            assert datetime.strptime(d, '%Y-%m-%d').replace(
+                tzinfo=timezone.utc) in result
+
+    def test_significant_dates_cap_preserved_with_status_date(self):
+        """Inserting status_date into the date grid must NOT push the
+        post-cap count past _ES_MAX_DATES.  Round 5 fix: must_include
+        is applied BEFORE capping so the broadcast in
+        _vectorised_pv_curve respects the documented size ceiling.
+        """
+        from datetime import datetime, timedelta, timezone
+        from evm.metrics import _significant_evm_dates, _ES_MAX_DATES
+
+        # Build a project with many more breakpoints than the cap.
+        nodes = []
+        base = datetime(2020, 1, 1)
+        for i in range(_ES_MAX_DATES * 3):  # 1500 -> well over the 500 cap
+            s = base + timedelta(days=i)
+            nodes.append({
+                'ID': str(i),
+                'Duration': 1, 'TimeUnits': 'days',
+                'Start': s.strftime('%Y-%m-%d'),
+                'Finish': (s + timedelta(days=1)).strftime('%Y-%m-%d'),
+            })
+
+        # Status date must round-trip through safe_date to land
+        # tz-aware UTC at midnight, matching what _significant_evm_dates
+        # stores internally.
+        sd_iso = '2021-07-15'
+        result = _significant_evm_dates(nodes, must_include=[sd_iso])
+        assert len(result) <= _ES_MAX_DATES
+        expected_sd = datetime(2021, 7, 15, tzinfo=timezone.utc)
+        assert expected_sd in result
+
+    def test_large_project_performance(self):
+        """ES on 5K activities must complete in well under a second.
+
+        The naive O(N*D) scalar implementation hit ~10s here; the
+        vectorised / capped-grid implementation is ~150ms.  Asserting
+        a generous 3s ceiling locks the perf class without flaking on
+        slow CI runners.
+        """
+        import time
+        from datetime import datetime, timedelta
+        N = 5_000
+        nodes = []
+        base = datetime(2025, 1, 1)
+        for i in range(N):
+            s = base + timedelta(days=i % 365)
+            f = s + timedelta(days=10)
+            nodes.append({
+                'ID': str(i),
+                'Duration': 10, 'TimeUnits': 'days',
+                'Start': s.strftime('%Y-%m-%d'),
+                'Finish': f.strftime('%Y-%m-%d'),
+                'PercentComplete': 50 if i % 3 == 0 else 0,
+            })
+        t0 = time.time()
+        r = compute_earned_schedule(nodes, '2025-06-30')
+        elapsed = time.time() - t0
+        assert elapsed < 3.0, (
+            f'compute_earned_schedule on 5K activities took {elapsed:.2f}s '
+            '-- expected <3s.  Did a refactor reintroduce the per-date loop?')
+        assert r['SPI_t_model'] > 0
+        assert r['actualTimeDays'] > 0
 
 
 # =====================================================================

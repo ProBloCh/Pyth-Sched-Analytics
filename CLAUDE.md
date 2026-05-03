@@ -430,16 +430,38 @@ Pushes to `main` trigger automatic deployment to Azure production. Treat
 
 ### High priority (use data already flowing in)
 
-- **Calendar-aware scheduling in the solver:** `/completion/monte-carlo`
-  now supports a full working-calendar (`completion/calendar.py`,
-  `hours_per_day` / `working_days` / `holidays`) via vectorised
-  cumulative-sum + searchsorted advancement.  The solver CPM
-  (`solver/dag.py`) still treats durations as abstract time units.
-  Extending `solver/dag.run_cpm` to accept the same `WorkingCalendar`
-  would make `/solver/*` output match real-world dates.
-- **Hard constraint enforcement:** `max_end_date` and `max_budget` are
-  parsed but never enforced in the optimizer.  These could be added as
-  penalty terms or hard bounds in L-BFGS-B.
+- **Calendar-aware scheduling inside the solver CPM (full parity):**
+  `/solver/sensitivity` and `/solver/optimize` now expose an additive,
+  opt-in `calendar.makespan_end_date` mapping (gated on
+  `project_context.start_date` plus any calendar field) that converts
+  the abstract makespan to a real end date via the same vectorised
+  `WorkingCalendar` used by `/completion/monte-carlo`
+  (`solver/calendar_map.py`).  This is the **edge mapping** only --
+  the response-side translation of one abstract scalar to one ISO
+  date.  The solver CPM (`solver/dag.py`) itself still treats
+  durations as abstract time units, so per-activity ES/EF do **not**
+  map to dates and FF/SF lags do **not** respect non-working days.
+  Extending `run_cpm` to honour the calendar during the
+  forward/backward pass -- so per-activity dates are real and the
+  Gantt-chart view is exact -- remains the substantive gap.
+- **Soft-penalty constraint enforcement (DONE; hard enforcement
+  remains future work):** `solver/optimizer.py` applies a normalised
+  quadratic penalty (`CONSTRAINT_PENALTY_LAMBDA = 50`) for
+  `max_makespan` and `max_budget`, with gradients reusing the analytic
+  schedule and cost adjoints (no extra CPM evaluation).  Both
+  `/solver/sensitivity` and `/solver/optimize` surface a `constraints`
+  report with `{bound, final_value, violation, satisfied}` per active
+  constraint, plus a `warnings` array using one of six specific codes
+  when an `max_end_date` can't be resolved:
+  `unresolved_max_end_date_no_start`,
+  `unresolved_max_end_date_bad_start`, `malformed_max_end_date`,
+  `max_end_date_before_start`, `max_end_date_too_far_in_future`,
+  `malformed_calendar_config`.  See `docs/api/solver.md` for the full
+  code semantics.  **Note:** the penalty is **soft** -- an infeasible
+  bound produces a best-effort solution with `satisfied: false` and a
+  `violation` magnitude, not a hard refusal or a guaranteed-feasible
+  output.  True hard enforcement (Augmented Lagrangian, active-set
+  SQP, or projection) is deferred.
 - **Link type awareness in app.py graph construction:** `build_nx_graph`
   stores `type` and `lag` as edge attributes, and `calculate_critical_path`
   now uses them via solver.dag.  But other analytics (dependency grouping,
@@ -453,8 +475,23 @@ Pushes to `main` trigger automatic deployment to Azure production. Treat
 
 ### Medium priority (extend existing capabilities)
 
-- **Earned Value Management (EVM):** SPI(t), CPI, EAC metrics.  Requires
-  execution data (actual start/finish/cost), not just the plan.
+- **Earned Value Management (EVM) — Earned Schedule (DONE; uncertainty
+  bands deferred):** `/evm/analyze` now returns an
+  `actual.earnedSchedule` block with the Lipke (2003) `ES`, `SPI(t) =
+  ES / AT`, and `TEAC(t) = max(AT, PD / SPI_t_model)`, alongside the
+  existing cost-based SPI/CPI/EAC.  `compute_earned_schedule` in
+  `evm/metrics.py` samples cumulative PV at every activity Start/Finish
+  boundary (BCWS is piecewise-linear, so linear interpolation between
+  samples is exact) and returns flags for the `not_started`,
+  `completed`, `no_baseline`, and `status_before_start` edge cases.
+  The cost-based SPI fields are unchanged (additive only).
+  **Note:** the returned ES / SPI(t) / TEAC are **deterministic point
+  estimates**, which sits awkwardly in a codebase whose identity is
+  fat-tailed overruns (Birnbaum-Saunders, Pareto, dragon kings).
+  For uncertainty bands on finish dates use
+  `/completion/monte-carlo`'s P10/P50/P80 percentiles.  Composing ES
+  with the five-tier risk model to produce `TEAC_p10` / `TEAC_p50` /
+  `TEAC_p80` is a meaningful follow-up but not in this PR.
 - **Reference class integration:** The user's PMJ paper demonstrates RCF
   uplifts for O&G offshore projects (P10: 89% cost, 72% schedule).  The
   reference class dataset lives in a separate app; the solver should

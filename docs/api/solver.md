@@ -71,20 +71,79 @@ Content-Type: application/json
     "phase": "construction",          // Optional. Phase for default weights. One of:
                                       //   "planning", "design", "procurement",
                                       //   "construction", "commissioning". Default: "construction".
+    "start_date": "2026-01-05",       // Optional. ISO date.  When supplied alongside
+                                      //   any `calendar.*` field, the response includes
+                                      //   a `calendar` object mapping makespan to a
+                                      //   real end date (see [Calendar Mapping](#calendar-mapping)).
     "calendar": {
-      "hours_per_day": 8.0,           // Optional. Parsed but not yet applied. Default: 8.0.
-      "working_days": [1,2,3,4,5]     // Optional. Parsed but not yet applied. Default: Mon-Fri.
+      "hours_per_day": 8.0,           // Optional. Default: 8.0.
+      "working_days": [1,2,3,4,5],    // Optional. ISO weekdays Mon=1..Sun=7. Default: Mon-Fri.
+      "holidays": [                   // Optional. ISO 'YYYY-MM-DD' strings or
+        "2026-01-19", "2026-02-16"    //   {"date": "..."} objects.  Drives the
+      ]                               //   calendar mapping when present.
     },
     "resource_capacities": {          // Optional. Per-pool capacity. Default: {"default": 10}.
       "default": 10
     },
-    "constraints": {
-      "max_end_date": "2025-12-31",   // Optional. Parsed but not yet enforced.
-      "max_budget": 5000000.0         // Optional. Parsed but not yet enforced.
+    "constraints": {                  // All fields optional; see Hard Constraints below.
+      "max_makespan": 200.0,          // Numeric, in solver time units (typically working hours).
+                                      //   Most explicit form -- skips ambiguity.
+      "max_end_date": "2026-12-31",   // ISO date OR a number.  When a number it is treated
+                                      //   as max_makespan.  When ISO it requires a project
+                                      //   start_date (above) to be resolvable.
+      "max_budget": 5000000.0         // Optional. Same units as the cost objective.
     }
   }
 }
 ```
+
+### Hard Constraints (soft-penalty enforcement)
+
+> **Naming caveat.** The constraint mechanism here is a **soft
+> penalty**, not a hard refusal.  An infeasible bound produces a
+> best-effort solution with `satisfied: false` and a `violation`
+> magnitude in the response -- not a guaranteed-feasible output and
+> not an error.  Strict hard enforcement (Augmented Lagrangian,
+> active-set SQP, or projection onto the feasible set) is on the
+> roadmap but not in this implementation.  Callers that require a
+> guaranteed bound should treat `satisfied: false` as "infeasible"
+> and reject the result themselves.
+
+When `constraints.max_makespan` (or a resolvable `max_end_date`) and / or
+`constraints.max_budget` are supplied, the optimizer adds a quadratic
+penalty term to the scalarised objective:
+
+```
+P_makespan = lambda * max(0, makespan - max_makespan)^2 / max_makespan^2
+P_budget   = lambda * max(0, cost     - max_budget)^2   / max_budget^2
+```
+
+`lambda = 50` (see `solver/optimizer.py::CONSTRAINT_PENALTY_LAMBDA`).
+The penalty is normalised by the bound so it is dimensionless: a 100%
+overshoot adds `lambda` to the weighted objective.  Gradients reuse
+the analytic schedule and cost gradients, so there is no extra CPM
+evaluation cost.
+
+The optimize / sensitivity response includes a `constraints` object
+reporting `{bound, final_value, violation, satisfied}` per active
+constraint (see [Constraints Report](#constraints-report)).
+
+If `max_end_date` cannot be resolved to a numeric bound (ISO without a
+`start_date`, malformed value, end before start, etc.) the constraint
+is silently skipped and the response includes a `warnings` array
+entry with one of these specific codes:
+
+| Code | Meaning |
+|---|---|
+| `unresolved_max_end_date_no_start` | ISO date supplied without a project `start_date` |
+| `unresolved_max_end_date_bad_start` | `start_date` is not parseable as ISO |
+| `malformed_max_end_date` | Value is neither numeric nor ISO-parseable, or is numeric but non-positive |
+| `max_end_date_before_start` | Both dates parse but `end <= start` |
+| `max_end_date_too_far_in_future` | Span between `start_date` and `max_end_date` exceeds 10 years (3650 calendar days); rejected to bound `WorkingCalendar` allocation. Pass `constraints.max_makespan` numerically for longer horizons. |
+| `malformed_calendar_config` | Both dates parse and `end > start`, but `hours_per_day` is non-numeric / non-finite / non-positive, or every day in the span is non-working |
+
+This matches the historic "parsed-but-not-enforced" semantics for
+legacy callers that pass an unresolvable constraint.
 
 ### Phase-Dependent Default Weights
 
@@ -134,14 +193,17 @@ Content-Type: application/json
 | Key | Type | Presence | Description |
 |---|---|---|---|
 | `objectives` | `object` | Always | Current objective values keyed by discipline. |
-| `makespan` | `float` | Always | Project duration (critical path length). |
+| `makespan` | `float` | Always | Project duration (critical path length, in solver time units). |
 | `critical_path` | `array<string>` | Always | Activity IDs on the critical path. |
 | `sensitivity` | `array<object>` | Always | Per-activity sensitivity rankings (see [Sensitivity Entry](#sensitivity-entry)). Sorted by `composite_sensitivity` descending. |
 | `analysis` | `object` | Always | Conflict/synergy analysis (see [Analysis](#analysis)). |
+| `constraints` | `object \| null` | Always | Per-constraint feasibility report at the **current baseline** (no optimisation has been performed).  `null` when no `max_makespan` / `max_budget` was supplied or the bound couldn't be resolved; otherwise see [Constraints Report](#constraints-report). |
 | `config` | `object` | Always | Echo of active config: `{disciplines, weights}`. |
 | `computation_ms` | `float` | Always | Wall-clock milliseconds. |
 | `cache_hit` | `boolean` | Always | `true` if served from cache. |
 | `stochastic` | `object` | Conditional | Monte Carlo results. **Present only when** `stochastic: true`. See [Stochastic](#stochastic). |
+| `calendar` | `object` | Conditional | Calendar mapping from `makespan` to a real end date. **Present only when** the request supplies a parseable `project_context.start_date` together with at least one calendar field. See [Calendar Mapping](#calendar-mapping). |
+| `warnings` | `array<object>` | Conditional | Non-fatal advisory messages.  See [Hard Constraints](#hard-constraints) for the full list of warning codes. |
 
 #### `objectives` Object
 
@@ -241,6 +303,9 @@ Content-Type: application/json
 | `computation_ms` | `float` | Always | Wall-clock milliseconds. |
 | `cache_hit` | `boolean` | Always | `true` if served from cache. |
 | `stochastic` | `object` | Conditional | Monte Carlo results on optimized state. **Present only when** `stochastic: true`. See [Stochastic](#stochastic). |
+| `constraints` | `object \| null` | Always | Per-constraint feasibility report at the **post-optimisation** state.  `null` when no `max_makespan` / `max_budget` was supplied or the bound couldn't be resolved; otherwise see [Constraints Report](#constraints-report). |
+| `calendar` | `object` | Conditional | Calendar mapping from final `makespan` to a real end date.  Same shape as the sensitivity-endpoint `calendar`.  See [Calendar Mapping](#calendar-mapping). |
+| `warnings` | `array<object>` | Conditional | Non-fatal advisory messages.  See [Hard Constraints](#hard-constraints) for the full list of warning codes. |
 
 #### Activity Change
 
@@ -428,3 +493,109 @@ All solver endpoints share the same error format.
 {"error": "monte_carlo_samples must be 1-1000"}
 {"error": "disciplines must be a list of strings"}
 ```
+
+---
+
+## Constraints Report
+
+Returned on `/solver/sensitivity` and `/solver/optimize` when at least
+one hard constraint was supplied.  Each entry reports the bound, the
+final value (whether or not the constraint was a discipline of the run
+-- cost is computed analytically when not in disciplines), the absolute
+violation, and a `satisfied` boolean.
+
+```jsonc
+"constraints": {
+  "max_makespan": {
+    "bound":       30.0,
+    "final_value": 26.4,
+    "violation":   0.0,
+    "satisfied":   true
+  },
+  "max_budget": {
+    "bound":       1000.0,
+    "final_value": 2244.0,
+    "violation":   1244.0,
+    "satisfied":   false
+  }
+}
+```
+
+`satisfied` uses a `1e-6 * max(bound, 1.0)` tolerance to absorb
+floating-point round-off.  The penalty is soft (quadratic, see [Hard
+Constraints](#hard-constraints)) so an infeasible bound results in a
+best-effort solution with `satisfied: false`, not an error.
+
+---
+
+## Calendar Mapping (response-side / edge mapping only)
+
+> **Scope caveat.** This is the **edge mapping** -- a single
+> abstract-makespan-to-ISO-date conversion at the response boundary.
+> The solver's internal CPM (`solver/dag.py`) still treats every
+> `Duration` as an abstract time unit, so per-activity ES/EF do
+> NOT come back as real dates and FF/SF lags do NOT respect
+> non-working days during the forward/backward pass.  Consumers
+> that need per-activity calendar dates (e.g. for a Gantt-chart
+> view) must do their own per-activity mapping or wait for the
+> compute-side parity (deferred; see `CLAUDE.md`'s "Calendar-aware
+> scheduling inside the solver CPM" note).
+
+The solver's CPM operates in abstract time units (whatever `Duration`
+units the request supplied).  Real-world deployments need to know
+**when** the optimised plan finishes.  When the request supplies a
+`project_context.start_date` **and** at least one calendar field
+(`hours_per_day`, `working_days`, or `holidays`), the response
+includes a `calendar` block mapping the final `makespan` to a real
+end date via the same `WorkingCalendar` used by
+`/completion/monte-carlo`.  Gating matches the completion endpoint
+exactly so the two endpoint families behave consistently --
+`start_date` alone (with no calendar fields) does **not** enable the
+mapping.
+
+```jsonc
+"calendar": {
+  "makespan_end_date_ms":   1771804800000.0,
+  "makespan_end_date":      "2026-02-23",
+  "project_start_date":     "2026-01-05",
+  "calendar_hours_per_day": 8.0,
+  "calendar_working_days":  [1, 2, 3, 4, 5],
+  "holidays_count":         2,
+  "makespan_working_hours": 264.0,           // makespan converted to hours
+  "time_units":             "Hours",         // dominant TimeUnits across nodes
+  "mixed_time_units":       false,           // always present (boolean);
+                                             //   true when activities carry
+                                             //   heterogeneous TimeUnits
+  "horizon_exhausted":      false            // always present (boolean);
+                                             //   true when the working-hour
+                                             //   target exceeded the
+                                             //   precomputed calendar
+                                             //   horizon and the end_date
+                                             //   was clipped at the
+                                             //   boundary (consumers
+                                             //   should treat the date as
+                                             //   a lower bound).
+}
+```
+
+### TimeUnits handling
+
+The `makespan` value the solver returns is in whatever units the
+request's `Duration` fields use (Hours, Days, Weeks, etc.).  Before
+mapping to a calendar, the response converts makespan to **working
+hours** via `evm.helpers.convert_to_hours` using the **dominant**
+`TimeUnits` across all activities (mode of node `TimeUnits`,
+default `Hours`).  The reported `time_units` field tells you which
+unit was used for the conversion; `makespan_working_hours` is the
+post-conversion value handed to the `WorkingCalendar`.
+
+When activities carry heterogeneous `TimeUnits` (mixing e.g. Hours
+and Days), the mapping uses the dominant unit and emits a
+`mixed_time_units: true` flag so downstream consumers can detect the
+data-quality issue.  In that case the underlying `makespan` itself
+may already be inconsistent (the solver is unit-blind on input), so
+prefer normalising `Duration` to a single unit upstream.
+
+The mapping is purely additive: existing callers that don't supply
+both `start_date` and a calendar field see a byte-identical response
+shape with the `calendar` key absent.

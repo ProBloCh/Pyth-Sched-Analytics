@@ -107,6 +107,24 @@ class ProjectContext:
     resource_capacities: dict = field(default_factory=lambda: {'default': 10})
     max_end_date: str = None
     max_budget: float = None
+    # Resolved numeric constraints in the same time units as the
+    # solver's makespan (whatever Duration units the request supplied).
+    # Populated by from_dict via _resolve_max_makespan; None means the
+    # constraint either wasn't supplied or couldn't be parsed.
+    max_makespan: float = None
+    # How max_makespan was resolved.  None when no bound was supplied.
+    # 'numeric'           -- caller passed an explicit numeric value
+    #                        (max_makespan or numeric max_end_date),
+    #                        already in the solver's time units.
+    # 'iso_working_hours' -- resolved from an ISO max_end_date + ISO
+    #                        start_date, expressed in working hours.
+    #                        Callers must convert this to the schedule's
+    #                        dominant TimeUnits before comparing to
+    #                        dag_state.makespan; run_sensitivity /
+    #                        run_optimize do this in solver/core.py.
+    max_makespan_source: str = None
+    start_date: str = None
+    holidays: list = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d):
@@ -114,14 +132,189 @@ class ProjectContext:
             return cls()
         calendar = d.get('calendar', {})
         constraints = d.get('constraints', {})
+        start_date = (d.get('start_date')
+                      or calendar.get('start_date')
+                      or (d.get('project') or {}).get('start_date'))
+        max_makespan, max_makespan_source = _resolve_max_makespan(
+            constraints.get('max_makespan'),
+            constraints.get('max_end_date'),
+            start_date,
+            calendar.get('hours_per_day', 8.0),
+            calendar.get('working_days', [1, 2, 3, 4, 5]),
+            calendar.get('holidays') or [],
+        )
         return cls(
             hours_per_day=calendar.get('hours_per_day', 8.0),
             working_days=calendar.get('working_days', [1, 2, 3, 4, 5]),
             phase=d.get('phase', 'construction'),
             resource_capacities=d.get('resource_capacities', {'default': 10}),
             max_end_date=constraints.get('max_end_date'),
-            max_budget=constraints.get('max_budget'),
+            max_budget=_safe_constraint(constraints.get('max_budget')),
+            max_makespan=max_makespan,
+            max_makespan_source=max_makespan_source,
+            start_date=start_date,
+            holidays=calendar.get('holidays') or [],
         )
+
+
+# Hard cap on the number of calendar days the WorkingCalendar in
+# _resolve_max_makespan will allocate.  Mirrors completion.calendar's
+# estimate_horizon_days ceiling.  Exposed for the warning resolver
+# (solver/core.py::_resolve_constraint_warnings) and for tests.
+MAX_ISO_HORIZON_DAYS = 3650
+
+
+def _safe_constraint(value):
+    """Coerce a constraint value to a positive float, else None."""
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(v) or v <= 0:
+        return None
+    return v
+
+
+def _resolve_max_makespan(max_makespan_raw, max_end_date_raw, start_date_raw,
+                          hours_per_day, working_days, holidays=None):
+    """Resolve a numeric max_makespan plus its source-tag.
+
+    Priority (returns ``(value, source)`` -- ``(None, None)`` when
+    unresolved):
+      1. Explicit numeric ``constraints.max_makespan`` (already in solver
+         time units; the unambiguous form).         -> ('numeric')
+      2. Numeric ``constraints.max_end_date`` (treated as time units;
+         backward-compatible with callers that passed a number here).
+                                                    -> ('numeric')
+      3. ISO ``constraints.max_end_date`` plus an ISO project
+         ``start_date``: working hours from start to end computed
+         **exactly** via the same ``WorkingCalendar`` that backs the
+         calendar mapping (honours weekends and holidays, no
+         average-week approximation).              -> ('iso_working_hours')
+
+    The source tag distinguishes the two unit conventions: numeric
+    values are already in the solver's time units (whatever the
+    request's Duration fields are in), while ISO-derived values are
+    always in working hours and must be converted before being
+    compared against ``dag_state.makespan``.
+    """
+    direct = _safe_constraint(max_makespan_raw)
+    if direct is not None:
+        return direct, 'numeric'
+    direct = _safe_constraint(max_end_date_raw)
+    if direct is not None:
+        return direct, 'numeric'
+    if max_end_date_raw is None or start_date_raw is None:
+        return None, None
+    try:
+        from datetime import datetime, timezone
+        end = datetime.fromisoformat(
+            str(max_end_date_raw).replace('Z', '+00:00'))
+        start = datetime.fromisoformat(
+            str(start_date_raw).replace('Z', '+00:00'))
+        # Normalise to UTC: naive -> assume UTC, aware -> convert.
+        # Without this, mixing tz-aware ('2026-12-31Z') with naive
+        # ('2026-01-05') would raise outside the try/except via
+        # `end - start`.  Matches evm.helpers.safe_date convention
+        # exactly: naive values are treated as UTC, tz-aware values
+        # are explicitly converted via .astimezone(timezone.utc) so
+        # the resulting UTC instant is unambiguous regardless of the
+        # caller's input offset.
+        end = (end.astimezone(timezone.utc) if end.tzinfo is not None
+               else end.replace(tzinfo=timezone.utc))
+        start = (start.astimezone(timezone.utc) if start.tzinfo is not None
+                 else start.replace(tzinfo=timezone.utc))
+    except (TypeError, ValueError):
+        return None, None
+    cal_days = (end - start).total_seconds() / 86400.0
+    if cal_days <= 0:
+        return None, None
+    # Validate hours_per_day explicitly rather than relying on
+    # ``or 8.0``: that idiom silently swaps 0 for 8.0, which masks
+    # genuinely malformed calendar configs (NaN, "0", negative).
+    try:
+        hpd = float(hours_per_day) if hours_per_day is not None else 8.0
+    except (TypeError, ValueError):
+        return None, None
+    if not np.isfinite(hpd) or hpd <= 0:
+        return None, None
+    # Resolve via the exact WorkingCalendar (matches calendar_map's
+    # mapping in the same response, honours holidays + weekday
+    # alignment).  The previous `cal_days * (wd_count/7) * hpd`
+    # approximation was off by 5-15% on short spans where weekday
+    # alignment matters (e.g. Mon -> Tue under a 5x8 calendar resolved
+    # to ~5.7h instead of 8h).
+    try:
+        from completion.calendar import WorkingCalendar
+    except ImportError:
+        return None, None
+    start_ms = start.timestamp() * 1000.0
+    end_ms = end.timestamp() * 1000.0
+    # Hard-cap horizon_days at 10 years (3650).  WorkingCalendar
+    # allocates several O(K) numpy arrays of shape (K,), so an
+    # untrusted ``max_end_date`` arbitrarily far in the future would
+    # otherwise be a DoS / memory-spike vector on the API
+    # (e.g. max_end_date='9999-12-31' -> ~3M days = ~24 MB per array
+    # times multiple arrays).  Spans beyond the cap are unrealistic
+    # for any project that the solver could meaningfully optimise;
+    # the warning resolver detects this via an independent re-check
+    # of cal_days and emits the ``max_end_date_too_far_in_future``
+    # warning.  The 3650 ceiling matches
+    # completion.calendar.estimate_horizon_days's max_days.
+    if cal_days > MAX_ISO_HORIZON_DAYS:
+        return None, None
+    # Horizon: cover the full span plus a one-day buffer so day-index
+    # math doesn't fall off the end on exact-boundary alignments.
+    # Clamp to MAX_ISO_HORIZON_DAYS so the actual WorkingCalendar
+    # allocation never exceeds the documented cap (the cal_days
+    # check above bounds the input span; the clamp here bounds the
+    # output horizon, accounting for the +2 buffer at boundary
+    # cases like cal_days == 3650).
+    horizon_days = min(int(cal_days) + 2, MAX_ISO_HORIZON_DAYS)
+    cal = WorkingCalendar.build(
+        hours_per_day=hpd,
+        working_days=working_days,
+        holidays=holidays or [],
+        start_ms=start_ms,
+        horizon_days=horizon_days,
+    )
+    # WorkingCalendar.build floors start_ms to UTC midnight, so the
+    # cumulative `work_hours_before` array starts counting from
+    # midnight of start_day -- not from start_ms itself.  When
+    # start_ms has a time-of-day (e.g. tz-aware '2026-01-05T00:00:00-05:00'
+    # converts to '2026-01-05T05:00:00Z'), we must subtract the
+    # intraday working portion already accrued before start_ms,
+    # otherwise the resolved bound is overstated by up to hours_per_day.
+    # Mirrors the (work_before + intraday) accrual that
+    # advance_working_ms uses internally.
+    def _intraday_hours(epoch_offset_ms, day_idx):
+        if day_idx < 0 or day_idx >= cal.K:
+            return 0.0
+        if not bool(cal.is_working[day_idx]):
+            return 0.0
+        if epoch_offset_ms <= 0:
+            return 0.0
+        return min(epoch_offset_ms / 3_600_000.0, hpd)
+
+    end_day_idx = int((end_ms - cal.epoch_start_ms) // 86_400_000)
+    end_day_idx = max(0, min(end_day_idx, cal.K))
+    end_intraday = _intraday_hours(
+        end_ms - (cal.epoch_start_ms + end_day_idx * 86_400_000),
+        end_day_idx)
+
+    start_day_idx = 0  # calendar built so epoch_start_ms == midnight of start_day
+    start_intraday = _intraday_hours(
+        start_ms - cal.epoch_start_ms, start_day_idx)
+
+    accrued_to_end = float(cal.work_hours_before[end_day_idx]) + end_intraday
+    accrued_to_start = (float(cal.work_hours_before[start_day_idx])
+                        + start_intraday)
+    working_hours = accrued_to_end - accrued_to_start
+    if working_hours > 0:
+        return working_hours, 'iso_working_hours'
+    return None, None
 
 
 def _safe_float(value, default, lo=0.0, hi=1e12):

@@ -114,6 +114,24 @@ so no key conversion is required on the JS side.
       "plannedCompletedHours":  40.0,
       "actualCompletedHours":   40.0
     },
+    "earnedSchedule": {                       // Lipke (2003) time-based EVM
+      "earnedScheduleDays":  10.0,            // ES: where on the plan the
+                                              //   current EV would have been earned
+      "actualTimeDays":      14.0,            // AT: status_date - project_start
+      "plannedDurationDays": 32.0,            // PD: project_finish - project_start
+      "SPI_t":               0.714,           // ES / AT  -- raw, may be Inf
+      "SPI_t_model":         0.714,           //   stabilised: clamp(SPI_t, MIN_SPI, MAX_SPI)
+                                              //   when finite, else 1.0 (matches the
+                                              //   non-finite convention used by SPI_model
+                                              //   and CPIcum_model)
+      "earnedScheduleDate":  "2025-01-11",    // ISO date of ES on the plan
+      "TEAC_days":           44.8,            // Time-based EAC = max(AT, PD/SPI_t_model)
+      "TEAC_date":           "2025-02-15",    // project_start + TEAC_days
+      "projectStartDate":    "2025-01-01",
+      "projectFinishDate":   "2025-02-02",
+      "flags":               {}               // not_started, completed,
+                                              //   no_baseline, status_before_start
+    },
     "sectorScheduleOverrun":    0.25,        // From project.sector lookup
     "scheduleMultiplier":       1.0,
     "slipDays":                 0,
@@ -174,6 +192,50 @@ activity and each date:
    on planned dates, cap by `PercentComplete`.
 4. **Future (`day > statusDate`)**: use `predictedStart` /
    `predictedEnd`; full credit once past the predicted end.
+
+### Earned Schedule (Lipke 2003)
+
+> **Uncertainty caveat.** The returned `ES` / `SPI(t)` / `TEAC` are
+> **deterministic point estimates**.  This sits awkwardly in a system
+> whose research foundation (Natarajan PMJ 2022, Flyvbjerg JMIS 2022)
+> emphasises fat-tailed overruns -- a single `TEAC_date` value should
+> not be read as a forecast.  For uncertainty bands on finish dates
+> use `/completion/monte-carlo`'s P10/P50/P80 percentiles, which
+> compose the same five-tier risk model
+> (triangular → normal → Birnbaum-Saunders → Pareto) used elsewhere
+> in the codebase.  Composing ES with that ensemble to produce
+> `TEAC_p10` / `TEAC_p50` / `TEAC_p80` is a meaningful follow-up but
+> not yet implemented.
+
+The cost-based `SPI = EV / PV` collapses to 1.0 at completion regardless
+of how late the project actually finished, because once all work is
+earned both EV and PV equal BAC.  Earned Schedule fixes this by
+projecting EV horizontally onto the planned PV curve to find the **time**
+at which the work currently earned should have been completed.
+
+```
+ES        = date on the planned curve where cumulative PV first equals current EV
+AT        = (status_date - project_start) in calendar days
+SPI(t)    = ES / AT                       // stays < 1 if late, even at finish
+TEAC(t)   = max(AT, PD / SPI_t_model)     // Lipke's IEAC(t); clamped >= AT
+```
+
+**TEAC uses `SPI_t_model` (clamped), not raw `SPI_t`.**  This mirrors
+how `compute_eac` uses `CPIcum_model` / `SPI_model` and avoids
+pathological outputs when the raw SPI(t) is Inf (status_date at
+project_start with non-zero EV) or near zero (very small ES).
+Consumers reproducing TEAC should clamp SPI(t) to
+`Bounds.MIN_SPI..MAX_SPI` before dividing.
+
+Implemented in `evm/metrics.py::compute_earned_schedule`.  Surfaced on
+`actual.earnedSchedule` (additive; cost-SPI fields are unchanged).
+Project start / finish dates are inferred as the earliest activity
+`Start` and the latest activity `Finish`; the BCWS curve is sampled at
+every Start/Finish boundary so linear interpolation between samples is
+exact (BCWS is piecewise-linear in time).  The PV curve is built in a
+single vectorised numpy pass for O(N+D) cost; the date grid is capped
+at `_ES_MAX_DATES = 500` for very large projects (uniform subsample
+preserves the first / last and keeps interpolation error bounded).
 
 ### EAC tiers
 

@@ -20,6 +20,9 @@ from __future__ import annotations
 import logging
 import math
 
+from datetime import timedelta
+import numpy as np
+
 from .helpers import (
     Bounds, clamp, safe_date, convert_to_hours,
     normalize_percent_complete, difference_in_calendar_days,
@@ -142,6 +145,353 @@ def compute_eac(bac: float, cpi: float, spi: float = 1.0,
     lower = max(ac, bac * Bounds.MIN_EAC_FACTOR)
     upper = bac * (2.5 if pct > 50.0 else Bounds.MAX_EAC_FACTOR)
     return clamp(eac, lower, upper)
+
+
+# ---------------------------------------------------------------------------
+# Earned Schedule (Lipke 2003)
+# ---------------------------------------------------------------------------
+#
+# The standard SPI = EV / PV degenerates to 1.0 at project completion
+# regardless of how late the project actually finished, because once all
+# work is earned both EV and PV equal BAC.  Earned Schedule (Lipke,
+# "Schedule Is Different", The Measurable News, 2003) fixes this by
+# projecting EV horizontally onto the planned PV curve to find the
+# **time** at which the work currently earned should have been completed.
+#
+#   ES   = the date on which planned PV first equals current EV
+#   AT   = elapsed time since project start (the actual time)
+#   SPI(t) = ES / AT   -- a time-based SPI; stays <1 if the project is
+#                         late, even at completion
+#   TEAC(t) = AT + (PD - ES) / SPI(t) = PD / SPI(t)   (when AT > 0)
+#
+# This is purely additive to the existing cost-based EVM metrics and
+# does not change any existing field in the response.
+#
+# ---------------------------------------------------------------------------
+
+# Cap the date grid for very large projects to keep ES O(N + D) bounded.
+# 500 points across the project horizon is far finer than any chart can
+# usefully display; PV is monotone so the linear-interp error between
+# samples is small even with subsampling.  See evm/distributions.py
+# (_significant_dates) for the same pattern.
+_ES_MAX_DATES = 500
+
+
+def _significant_evm_dates(nodes, must_include=None):
+    """Sorted unique list of activity Start / Finish dates, capped.
+
+    BCWS is piecewise-linear in time: each activity contributes a linear
+    ramp from Start to Finish.  Sampling BCWS at every Start/Finish
+    boundary captures every breakpoint, so linear interpolation between
+    samples is exact for projects up to ``_ES_MAX_DATES`` activities.
+    Larger projects subsample the grid uniformly, accepting a small
+    interpolation error in exchange for bounded compute.
+
+    ``must_include`` is an optional iterable of dates (e.g. the EVM
+    status_date) that the caller needs preserved in the grid even if
+    capping would otherwise drop them.  Including them here -- before
+    the cap -- guarantees ``len(result) <= _ES_MAX_DATES`` while still
+    letting AT readings line up with a sample.  Without this, a
+    later insertion would push the count to ``_ES_MAX_DATES + 1``
+    and break the broadcast-size ceiling in ``_vectorised_pv_curve``.
+    """
+    out = set()
+    for n in nodes or []:
+        s = safe_date(n.get('Start'))
+        f = safe_date(n.get('Finish'))
+        if s is not None:
+            out.add(s.replace(hour=0, minute=0, second=0, microsecond=0))
+        if f is not None:
+            out.add(f.replace(hour=0, minute=0, second=0, microsecond=0))
+    must = set()
+    for d in (must_include or []):
+        dt = safe_date(d)
+        if dt is not None:
+            must.add(dt.replace(hour=0, minute=0, second=0, microsecond=0))
+    out |= must
+
+    sorted_dates = sorted(out)
+    if len(sorted_dates) > _ES_MAX_DATES:
+        idx = np.linspace(0, len(sorted_dates) - 1,
+                          _ES_MAX_DATES).astype(int)
+        kept = {sorted_dates[i] for i in idx}
+        # Project first/last must survive the swap below: ES uses them
+        # to compute project_start, project_finish, and PD; dropping
+        # either would corrupt all downstream calculations on large
+        # capped projects.  ``linspace(0, N-1, K)`` always includes
+        # index 0 and N-1 so they're in ``kept`` initially -- we just
+        # have to refuse to drop them in the swap.
+        protected = set(must)
+        if sorted_dates:
+            protected.add(sorted_dates[0])
+            protected.add(sorted_dates[-1])
+        # Guarantee the must-include dates survive the subsample by
+        # swapping them in for an arbitrary kept neighbour (chosen
+        # deterministically from the sorted interior to keep behaviour
+        # reproducible across runs).
+        for m in must:
+            if m in kept:
+                continue
+            droppable = next(
+                (k for k in sorted(kept) if k not in protected), None)
+            if droppable is not None:
+                kept.discard(droppable)
+                kept.add(m)
+                # Once swapped in, ``m`` itself becomes protected so
+                # it isn't picked as a droppable on a later iteration.
+                protected.add(m)
+        sorted_dates = sorted(kept)
+    return sorted_dates
+
+
+def _vectorised_pv_curve(nodes, dates, hours_per_day, working_days_per_week):
+    """Cumulative planned hours at each ``date`` -- one vectorised pass.
+
+    Each activity contributes a linearly-ramped slab between its Start
+    and Finish dates: ``planned_hrs * clip((d - start) / (finish - start),
+    0, 1)``.  Degenerate spans (``finish <= start``, including
+    milestones with ``finish == start``) are handled as a step
+    function -- the scalar reference ``compute_bcws_hours`` gives full
+    credit when ``sd_time >= f``, and the vectorised path matches by
+    using ``(d >= f).astype(float)`` for those activities.
+
+    We stack activity arrays once, broadcast against the (D,) date
+    grid, and reduce along the activity axis -- replacing the O(N*D)
+    Python loop the scalar version did when called per date.  Memory
+    is **O(N*D)** during the broadcast (D is capped to 500 by
+    ``_significant_evm_dates``, keeping the array bounded in
+    practice), with output O(D).
+
+    Returns an (D,) numpy array of cumulative hours, aligned with the
+    input ``dates`` list.
+    """
+    starts_ms = []
+    finishes_ms = []
+    planned_hrs = []
+    for n in nodes or []:
+        dur_raw = n.get('Duration', n.get('duration', 0))
+        if dur_raw in (0, '0'):
+            continue
+        s = safe_date(n.get('Start'))
+        f = safe_date(n.get('Finish'))
+        # Mirror the dual-key TimeUnits fallback used by
+        # compute_duration_weighted and the completion paths so a
+        # node carrying ``timeUnits`` (camelCase) doesn't silently
+        # default to 'Hours' here -- which would compute ES PV/EV
+        # in the wrong unit.
+        time_units = (n.get('TimeUnits')
+                      or n.get('timeUnits') or 'Hours')
+        h = convert_to_hours(
+            dur_raw, time_units,
+            hours_per_day, working_days_per_week)
+        if s is None or f is None or h <= 0:
+            continue
+        starts_ms.append(s.timestamp() * 1000.0)
+        finishes_ms.append(f.timestamp() * 1000.0)
+        planned_hrs.append(h)
+
+    D = len(dates)
+    if not planned_hrs or D == 0:
+        return np.zeros(D, dtype=np.float64)
+
+    s_arr = np.asarray(starts_ms, dtype=np.float64)         # (N,)
+    f_arr = np.asarray(finishes_ms, dtype=np.float64)       # (N,)
+    p_arr = np.asarray(planned_hrs, dtype=np.float64)       # (N,)
+    d_arr = np.array(
+        [d.timestamp() * 1000.0 for d in dates], dtype=np.float64)  # (D,)
+
+    # Build the per-activity contribution matrix in a single (N, D)
+    # buffer to keep peak memory at one such array (~40 MB at N=10K,
+    # D=500: 10_000 * 500 * 8 bytes = 40_000_000).  An earlier draft
+    # built ``linear``, ``step``, and ``frac`` as three independent
+    # (N, D) arrays plus the boolean intermediate, tripling the peak.
+    span = f_arr - s_arr
+    span_safe = np.where(span > 0, span, 1.0)
+    frac = (d_arr[None, :] - s_arr[:, None]) / span_safe[:, None]
+    np.clip(frac, 0.0, 1.0, out=frac)
+
+    # Step function for finish <= start (milestones and degenerate
+    # f == s data): overwrite only those rows with the (d >= f) step
+    # so the matching scalar `sd_time >= f` semantic is preserved.
+    # Building the step submatrix only for the degenerate rows keeps
+    # the extra allocation O(n_degenerate * D), typically tiny.
+    deg_mask = span <= 0
+    if np.any(deg_mask):
+        deg_idx = np.where(deg_mask)[0]
+        frac[deg_idx] = (
+            d_arr[None, :] >= f_arr[deg_idx, None]
+        ).astype(np.float64)
+
+    pv = (frac * p_arr[:, None]).sum(axis=0)
+    return pv
+
+
+def compute_earned_schedule(nodes, status_date, hours_per_day: float = 8.0,
+                            working_days_per_week: float = 5.0) -> dict:
+    """Lipke (2003) Earned Schedule, SPI(t), and time-based EAC.
+
+    Returns a dict with:
+        earnedScheduleDays   : ES in calendar days from project start
+        actualTimeDays       : AT (status_date - project_start) in days
+        plannedDurationDays  : PD (project_finish - project_start) in days
+        SPI_t                : raw  ES / AT  (Inf when AT == 0 and ES > 0)
+        SPI_t_model          : clamped to evm Bounds.MIN_SPI..MAX_SPI
+        earnedScheduleDate   : ISO date when current EV was planned
+        TEAC_days            : PD / SPI(t), clamped >= AT  (Lipke
+                               Independent Estimate at Completion (time))
+        TEAC_date            : project_start + TEAC_days, ISO
+        flags                : diagnostics (no_baseline / completed /
+                               not_started / status_before_start)
+
+    Uses calendar days throughout to match the project's planned-date
+    arithmetic in difference_in_calendar_days.  EV/PV are accumulated
+    in the same hour-units that compute_bcwp_hours / compute_bcws_hours
+    use, so the curves are dimensionally consistent for interpolation.
+    """
+    sd = safe_date(status_date)
+
+    flags = {}
+    # Preliminary scan for project start/finish to feed must_include.
+    # _significant_evm_dates is cheap (single pass over nodes) but we
+    # only need its first/last elements at this point.
+    bare = _significant_evm_dates(nodes)
+    if not bare:
+        flags['no_baseline'] = True
+        return _empty_es(flags)
+    project_start = bare[0]
+    project_finish = bare[-1]
+    pd_days = max(
+        difference_in_calendar_days(project_finish, project_start), 0.0)
+
+    if sd is None:
+        sd = project_start
+        flags['status_date_missing'] = True
+
+    sd_mid = sd.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Build the date grid with status_date guaranteed in -- before
+    # capping -- so len(significant) <= _ES_MAX_DATES holds even when
+    # status_date isn't a natural breakpoint and would otherwise have
+    # required a post-cap insertion.
+    significant = _significant_evm_dates(nodes, must_include=[sd_mid])
+
+    ev_hours = compute_bcwp_hours(
+        nodes, hours_per_day, working_days_per_week)
+
+    # Sample cumulative PV at every breakpoint via a single vectorised
+    # numpy pass.  Builds one (N, D) frac matrix in place (clip +
+    # scatter), so peak memory is bounded by a single (N*D*8) byte
+    # array; D is capped to _ES_MAX_DATES = 500 by
+    # _significant_evm_dates so for N=10K that's a ~40 MB peak
+    # (10_000 * 500 * 8 = 40_000_000 bytes), well within the per-
+    # request budget.  Replaces the previous scalar loop that called
+    # compute_bcws_hours per date in pure Python and hit a wall on
+    # 10K-activity projects.
+    pv_arr = _vectorised_pv_curve(
+        nodes, significant, hours_per_day, working_days_per_week)
+    pv_curve = list(zip(significant, pv_arr.tolist()))
+    pv_total = pv_curve[-1][1] if pv_curve else 0.0
+
+    # Compute the unclamped calendar-day difference first so we can
+    # distinguish "status exactly at project_start" (raw == 0, flag
+    # NOT set, AT == 0) from "status strictly before project_start"
+    # (raw < 0, flag SET, AT clamped to 0).  Without this split, the
+    # flag would also fire on the kickoff-day case.
+    raw_at_days = difference_in_calendar_days(sd_mid, project_start)
+    at_days = max(raw_at_days, 0.0)
+    if raw_at_days < 0:
+        flags['status_before_start'] = True
+
+    # ES: smallest date at which cumulative PV >= EV.  Linear interp
+    # between samples (PV is piecewise-linear so this is exact).
+    es_days = 0.0
+    es_date = project_start
+    if ev_hours <= 0:
+        flags['not_started'] = True
+        es_days = 0.0
+        es_date = project_start
+    elif pv_total <= 0:
+        flags['no_baseline'] = True
+        es_days = 0.0
+        es_date = project_start
+    elif ev_hours >= pv_total:
+        flags['completed'] = True
+        es_days = pd_days
+        es_date = project_finish
+    else:
+        for k in range(len(pv_curve) - 1):
+            d0, pv0 = pv_curve[k]
+            d1, pv1 = pv_curve[k + 1]
+            if pv0 <= ev_hours <= pv1:
+                span = pv1 - pv0
+                if span > 0:
+                    frac = (ev_hours - pv0) / span
+                else:
+                    frac = 0.0
+                day_span = difference_in_calendar_days(d1, d0)
+                es_days = (
+                    difference_in_calendar_days(d0, project_start)
+                    + frac * day_span)
+                es_date = d0 + timedelta(days=frac * day_span)
+                break
+
+    # SPI(t): raw can be Inf if AT == 0 with ES > 0.  SPI_t_model is
+    # the stabilised variant: ``clamp(SPI_t, MIN_SPI, MAX_SPI)`` when
+    # finite, else 1.0 (neutral).  Mirrors the non-finite convention
+    # already in use for SPI_model and CPIcum_model in
+    # compute_evm_metrics -- not a strict clamp, since clamping Inf
+    # to MAX_SPI would produce a TEAC of PD/MAX_SPI rather than the
+    # neutral PD that consumers expect when no time has elapsed.
+    if at_days > 0:
+        spi_t = es_days / at_days
+    elif es_days > 0:
+        spi_t = math.inf
+    else:
+        spi_t = 1.0
+    spi_t_model = (clamp(spi_t, Bounds.MIN_SPI, Bounds.MAX_SPI)
+                   if math.isfinite(spi_t) else 1.0)
+
+    # Time-based EAC: Lipke IEAC(t) = PD / SPI(t), where SPI(t) is the
+    # **clamped** SPI_t_model -- not the raw SPI_t.  This stabilises
+    # against extreme values (raw can be Inf when AT=0 with EV>0, or
+    # near zero on tiny ES) the same way compute_eac uses CPIcum_model
+    # and SPI_model.  Clamped >= AT because a project that's already
+    # taken AT days cannot finish in fewer than AT days.
+    if pd_days <= 0 or spi_t_model <= 0:
+        teac_days = 0.0
+    else:
+        teac_days = max(at_days, pd_days / spi_t_model)
+    teac_date = project_start + timedelta(days=teac_days)
+
+    return {
+        'earnedScheduleDays':  es_days,
+        'actualTimeDays':      at_days,
+        'plannedDurationDays': pd_days,
+        'SPI_t':               spi_t,
+        'SPI_t_model':         spi_t_model,
+        'earnedScheduleDate':  es_date.strftime('%Y-%m-%d'),
+        'TEAC_days':           teac_days,
+        'TEAC_date':           teac_date.strftime('%Y-%m-%d'),
+        'projectStartDate':    project_start.strftime('%Y-%m-%d'),
+        'projectFinishDate':   project_finish.strftime('%Y-%m-%d'),
+        'flags':               flags,
+    }
+
+
+def _empty_es(flags):
+    return {
+        'earnedScheduleDays':  0.0,
+        'actualTimeDays':      0.0,
+        'plannedDurationDays': 0.0,
+        'SPI_t':               1.0,
+        'SPI_t_model':         1.0,
+        'earnedScheduleDate':  None,
+        'TEAC_days':           0.0,
+        'TEAC_date':           None,
+        'projectStartDate':    None,
+        'projectFinishDate':   None,
+        'flags':               flags,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +620,14 @@ def compute_bcwp_hours(nodes, hours_per_day: float = 8.0,
     """Port of calculateBCWP_Hours (EVM.js 1053-1062).
 
     Simple daily snapshot: EV = sum(BAC_i * pct_i).
+
+    Reads TimeUnits with the same dual-key fallback that
+    ``_vectorised_pv_curve`` (PV side) and ``compute_duration_weighted``
+    use, so EV and PV compute in matching units when the input mixes
+    PascalCase / camelCase ``TimeUnits`` keys.  Without this,
+    compute_earned_schedule could end up with EV-in-Hours and
+    PV-in-Days for a camelCase-tagged schedule, producing a
+    nonsensical ES interpolation.
     """
     s = 0.0
     for n in nodes or []:
@@ -277,8 +635,10 @@ def compute_bcwp_hours(nodes, hours_per_day: float = 8.0,
         if dur_raw in (0, '0'):
             continue
         pct = normalize_percent_complete(n.get('PercentComplete'))
+        time_units = (n.get('TimeUnits')
+                      or n.get('timeUnits') or 'Hours')
         s += convert_to_hours(
-            dur_raw, n.get('TimeUnits', 'Hours'),
+            dur_raw, time_units,
             hours_per_day, working_days_per_week) * pct
     return s
 

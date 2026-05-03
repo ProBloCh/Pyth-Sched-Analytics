@@ -22,6 +22,7 @@ from .helpers import (
 )
 from .metrics import (
     compute_evm_metrics, compute_eac, compute_duration_weighted,
+    compute_earned_schedule,
     compute_bcws_hours, compute_bcwp_hours, compute_bac_hours,
     compute_acwp, compute_acwp_hours,
     compute_forecasted_bcwp, compute_forecasted_acwp,
@@ -271,6 +272,7 @@ def build_actual_branch(nodes, links, options):
         percent_complete_100)
 
     dw = compute_duration_weighted(nodes, status_date, hpd, dpw)
+    earned_schedule = compute_earned_schedule(nodes, status_date, hpd, dpw)
     sector_overrun = get_sector_schedule_overrun(project)
 
     planned_end = None
@@ -330,6 +332,7 @@ def build_actual_branch(nodes, links, options):
         'currency':        currency,
         'timeUnits':       'Hours',
         'durationWeightedProgress':  dw,
+        'earnedSchedule':            earned_schedule,
         'sectorScheduleOverrun':     sector_overrun,
         'scheduleMultiplier':        schedule_delay['scheduleMultiplier'],
         'slipDays':                  schedule_delay['slipDays'],

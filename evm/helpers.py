@@ -176,6 +176,84 @@ def convert_to_hours(duration, time_units, hours_per_day: float = 8.0,
     return d
 
 
+def working_hours_to_unit(hours, time_units, hours_per_day: float = 8.0,
+                          working_days_per_week: float = 5.0) -> float:
+    """Inverse of :func:`convert_to_hours`.
+
+    Convert a working-hour scalar back into the named unit -- useful
+    when a value resolved in working hours (e.g. an ISO max_end_date
+    span) needs to be expressed in the same TimeUnits the schedule is
+    authored in.  Mirrors the unit table in ``convert_to_hours``
+    one-for-one, including the ``m`` = minutes vs ``mo`` = months
+    distinction.
+
+    Returns 0.0 when ``hours`` is non-finite or non-positive, or when
+    ``hours_per_day`` / ``working_days_per_week`` are explicitly
+    malformed (non-numeric, non-finite, or non-positive).  ``None`` is
+    treated as "use default" (8 hpd / 5 dpw); zero or negative values
+    are NOT silently swapped for defaults via ``or`` -- masking those
+    would let a malformed calendar config produce a plausible-looking
+    result that disagrees with the resolver and the calendar mapping.
+    """
+    try:
+        h = float(hours)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(h) or h <= 0:
+        return 0.0
+
+    def _validate(raw, default):
+        if raw is None:
+            return default
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(v) or v <= 0:
+            return None
+        return v
+
+    hpd = _validate(hours_per_day, 8.0)
+    dpw = _validate(working_days_per_week, 5.0)
+    if hpd is None or dpw is None:
+        return 0.0
+
+    u_raw = str(time_units if time_units is not None else 'Hours').strip().lower()
+    if not u_raw:
+        return h
+
+    if u_raw in ('h', 'hr', 'hrs', 'hour', 'hours'):
+        return h
+    if u_raw in ('s', 'sec', 'secs', 'second', 'seconds'):
+        return h * 3600.0
+    if u_raw in ('min', 'mins', 'minute', 'minutes', 'm'):
+        return h * 60.0
+    if u_raw in ('d', 'day', 'days'):
+        return h / hpd
+    if u_raw in ('w', 'wk', 'wks', 'week', 'weeks'):
+        return h / (dpw * hpd)
+    if u_raw in ('mo', 'mon', 'mons', 'month', 'months'):
+        return h / (_WEEKS_PER_MONTH * dpw * hpd)
+    if u_raw in ('y', 'yr', 'yrs', 'year', 'years'):
+        return h / (_WEEKS_PER_YEAR * dpw * hpd)
+
+    c0 = u_raw[0]
+    if c0 == 'h':
+        return h
+    if c0 == 'd':
+        return h / hpd
+    if c0 == 'w':
+        return h / (dpw * hpd)
+    if c0 == 'y':
+        return h / (_WEEKS_PER_YEAR * dpw * hpd)
+    if c0 == 'm':
+        if (u_raw.startswith('mo') or u_raw.startswith('mon')
+                or u_raw.startswith('month')):
+            return h / (_WEEKS_PER_MONTH * dpw * hpd)
+        return h * 60.0
+    return h
+
+
 # ---------------------------------------------------------------------------
 # Percent complete (matches EVM.js normalizePercentComplete, lines 152-168)
 # ---------------------------------------------------------------------------

@@ -14,9 +14,11 @@ from .dag import build_dag, get_critical_path_indices
 from .objectives import compute_objectives
 from .adjoints import compute_gradients
 from .stochastic import run_ensemble
-from .optimizer import optimize
+from .optimizer import optimize, build_constraints_report
 from .pareto import run_pareto as _run_pareto
 from .analysis import compute_analysis
+from .calendar_map import map_makespan_to_date, _dominant_time_units
+from evm.helpers import working_hours_to_unit
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,7 @@ def run_sensitivity(nodes, links, solver_config_dict,
     t0 = time.time()
 
     project_ctx = ProjectContext.from_dict(project_context_dict)
+    _harmonise_makespan_units(project_ctx, nodes)
     config = SolverConfig.from_dict(solver_config_dict, phase=project_ctx.phase)
 
     logger.info("Sensitivity: %d nodes, %d links, disciplines=%s, "
@@ -63,18 +66,40 @@ def run_sensitivity(nodes, links, solver_config_dict,
     logger.info("Sensitivity done: makespan=%.1f, critical_path_len=%d, "
                 "%.1fms", dag_state.makespan, len(cp_ids), elapsed_ms)
 
+    calendar_mapping = map_makespan_to_date(
+        dag_state.makespan, project_ctx,
+        project_ctx_dict=project_context_dict, nodes=nodes)
+
+    # Sensitivity is a single-pass analysis (no optimisation), so the
+    # constraints report describes the current-baseline feasibility:
+    # how far the unmodified schedule sits from the supplied bounds.
+    # Useful as a pre-flight check before kicking off /solver/optimize.
+    constraints_report = None
+    if (project_ctx.max_makespan is not None
+            or project_ctx.max_budget is not None):
+        constraints_report = build_constraints_report(
+            dag_state, params, objectives,
+            project_ctx.max_makespan, project_ctx.max_budget)
+    warnings = _resolve_constraint_warnings(
+        project_ctx, project_context_dict)
+
     result = {
         'objectives':     {d: float(v) for d, v in objectives.items()},
         'makespan':       dag_state.makespan,
         'critical_path':  cp_ids,
         'sensitivity':    sensitivity_table,
         'analysis':       analysis,
+        'constraints':    constraints_report,
         'config': {
             'disciplines': config.disciplines,
             'weights':     config.weights,
         },
         'computation_ms': elapsed_ms,
     }
+    if calendar_mapping is not None:
+        result['calendar'] = calendar_mapping
+    if warnings:
+        result['warnings'] = warnings
 
     if stochastic:
         result['stochastic'] = {
@@ -100,6 +125,7 @@ def run_optimize(nodes, links, solver_config_dict,
     t0 = time.time()
 
     project_ctx = ProjectContext.from_dict(project_context_dict)
+    _harmonise_makespan_units(project_ctx, nodes)
     config = SolverConfig.from_dict(solver_config_dict, phase=project_ctx.phase)
 
     logger.info("Optimize: %d nodes, %d links, disciplines=%s, "
@@ -132,6 +158,9 @@ def run_optimize(nodes, links, solver_config_dict,
         })
 
     elapsed_ms = round((time.time() - t0) * 1000, 1)
+    calendar_mapping = map_makespan_to_date(
+        dag_state.makespan, project_ctx,
+        project_ctx_dict=project_context_dict, nodes=nodes)
 
     result = {
         'initial_objectives': opt['initial_objectives'],
@@ -149,6 +178,7 @@ def run_optimize(nodes, links, solver_config_dict,
         'iterations':        opt['iterations'],
         'converged':         opt['converged'],
         'history':           opt['history'],
+        'constraints':       opt.get('constraints'),
         'config': {
             'disciplines':   config.disciplines,
             'weights':       config.weights,
@@ -156,6 +186,20 @@ def run_optimize(nodes, links, solver_config_dict,
         },
         'computation_ms': elapsed_ms,
     }
+    if calendar_mapping is not None:
+        result['calendar'] = calendar_mapping
+
+    # Surface a warning when callers supplied a constraint that we
+    # couldn't resolve to a numeric bound so they don't silently get
+    # an unconstrained run.  The helper inspects the raw input to
+    # tailor the warning code/message to the actual failure mode --
+    # e.g. ISO date with no start_date, malformed string, end-before-
+    # start -- rather than emitting a single generic warning that
+    # implies the wrong cause.
+    optimize_warnings = _resolve_constraint_warnings(
+        project_ctx, project_context_dict)
+    if optimize_warnings:
+        result.setdefault('warnings', []).extend(optimize_warnings)
 
     if stochastic:
         result['stochastic'] = {
@@ -186,6 +230,15 @@ def run_pareto_endpoint(nodes, links, solver_config_dict,
     t0 = time.time()
 
     project_ctx = ProjectContext.from_dict(project_context_dict)
+    # Pareto runs ``optimizer.optimize`` per weight vector, so the
+    # hard-constraint penalty fires on every sub-call.  Without the
+    # same TimeUnits harmonisation that run_sensitivity / run_optimize
+    # apply, an ISO-resolved bound (``max_makespan_source ==
+    # 'iso_working_hours'``) would be compared against a non-Hours
+    # makespan in days/weeks units, mis-judging feasibility on every
+    # frontier point.  Mirror the same call here so all three
+    # endpoints make the same constraint-unit decision.
+    _harmonise_makespan_units(project_ctx, nodes)
     config = SolverConfig.from_dict(solver_config_dict, phase=project_ctx.phase)
     n_vec = int((solver_config_dict or {}).get('pareto_vectors', 30))
 
@@ -243,18 +296,25 @@ def _build_sensitivity_table(dag_state, params, gradients, config):
 
 
 def _empty_sensitivity(disciplines, t0):
+    """Empty-DAG response shape.  Mirrors the populated path's keys
+    (constraints / calendar / warnings) with ``None`` / absent values
+    so consumers don't see a different shape on degenerate inputs."""
     return {
         'objectives': {d: 0.0 for d in disciplines},
         'makespan': 0.0,
         'critical_path': [],
         'sensitivity': [],
         'analysis': {'conflicts_and_synergies': [], 'interventions': []},
+        'constraints': None,
         'config': {'disciplines': disciplines, 'weights': {}},
         'computation_ms': round((time.time() - t0) * 1000, 1),
     }
 
 
 def _empty_optimize(disciplines, t0):
+    """Empty-DAG response shape.  Mirrors the populated path's keys
+    (constraints / calendar / warnings) with ``None`` / absent values
+    so consumers don't see a different shape on degenerate inputs."""
     return {
         'initial_objectives': {d: 0.0 for d in disciplines},
         'final_objectives':   {d: 0.0 for d in disciplines},
@@ -264,6 +324,216 @@ def _empty_optimize(disciplines, t0):
         'iterations': 0,
         'converged': True,
         'history': [],
+        'constraints': None,
         'config': {'disciplines': disciplines, 'weights': {}},
         'computation_ms': round((time.time() - t0) * 1000, 1),
     }
+
+
+def _harmonise_makespan_units(project_ctx, nodes):
+    """Convert an ISO-resolved max_makespan from working hours into the
+    schedule's dominant TimeUnits so it matches dag_state.makespan.
+
+    The solver runs CPM on raw Duration numbers without unit
+    normalisation, so ``dag_state.makespan`` is in whatever
+    ``TimeUnits`` the schedule's activities use (typically Hours, but
+    Days / Weeks are valid too).  Numeric ``max_makespan`` /
+    ``max_end_date`` are taken at face value (caller's units), but the
+    ISO ``max_end_date`` resolution path always produces working
+    hours -- which only matches the schedule when activities are in
+    Hours.  Without this harmonisation step, a Days-units schedule
+    with an ISO max_end_date would be checked against a working-hour
+    bound, off by a factor of ``hours_per_day`` × working-day fraction.
+
+    Mutates ``project_ctx.max_makespan`` in place.  No-op when no
+    bound is set, when the source is already 'numeric', or when the
+    schedule's dominant TimeUnits resolve to Hours.
+    """
+    if (project_ctx.max_makespan is None
+            or getattr(project_ctx, 'max_makespan_source', None)
+                != 'iso_working_hours'):
+        return
+    units, _mixed = _dominant_time_units(nodes)
+    if units.strip().lower() in ('h', 'hr', 'hrs', 'hour', 'hours'):
+        # Bound is already in working hours and the schedule is too -- no
+        # conversion needed.
+        return
+    # Match _resolve_max_makespan and WorkingCalendar.build's filtering:
+    # ISO 1..7, deduplicated.  Without this, the harmonisation would
+    # use a different working-day count than the resolver did, producing
+    # an inconsistent bound (e.g. resolver used 5, harmonisation
+    # divides by 6 because of duplicates).
+    wd_count = len({int(d) for d in (project_ctx.working_days or [])
+                    if isinstance(d, (int, float))
+                    and 1 <= int(d) <= 7}) or 5
+    project_ctx.max_makespan = working_hours_to_unit(
+        project_ctx.max_makespan, units,
+        project_ctx.hours_per_day, wd_count)
+
+
+def _looks_like_iso_date(value):
+    """Heuristic: caller intended ISO when the value is non-numeric and
+    parses as a datetime."""
+    if value is None:
+        return False
+    try:
+        float(value)
+        return False  # numeric -> not ISO intent
+    except (TypeError, ValueError):
+        pass
+    try:
+        from datetime import datetime
+        datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _resolve_constraint_warnings(project_ctx, project_context_dict):
+    """Tailor warnings to the *actual* failure mode of constraint
+    resolution rather than emitting a single generic message.
+
+    Cases:
+      - ISO max_end_date supplied AND start_date missing:
+            -> ``unresolved_max_end_date_no_start``
+      - ISO max_end_date supplied AND start_date present but unparseable:
+            -> ``unresolved_max_end_date_bad_start``
+      - max_end_date supplied but neither numeric nor ISO-parseable:
+            -> ``malformed_max_end_date``
+      - Both ISO but end <= start:
+            -> ``max_end_date_before_start``
+      - Both ISO and end > start, but the span exceeds
+        ``MAX_ISO_HORIZON_DAYS`` (10 years) -- the resolver hard-caps
+        WorkingCalendar allocation as a DoS guard:
+            -> ``max_end_date_too_far_in_future``
+      - Both ISO, end > start, span within cap, but the calendar
+        config (hours_per_day, working_days) yields a non-positive
+        bound:
+            -> ``malformed_calendar_config``
+      - Anything else (max_makespan resolved cleanly): no warning.
+    """
+    # Only emit warnings when max_makespan failed to resolve.  If
+    # resolution succeeded, the caller has the bound they wanted.
+    if project_ctx.max_makespan is not None:
+        return []
+    raw = project_ctx.max_end_date
+    if raw is None:
+        return []
+
+    cdict = project_context_dict or {}
+    constraints = cdict.get('constraints') or {}
+    raw = constraints.get('max_end_date', raw)
+    start_raw = (cdict.get('start_date')
+                 or (cdict.get('calendar') or {}).get('start_date')
+                 or (cdict.get('project') or {}).get('start_date'))
+
+    iso_intent = _looks_like_iso_date(raw)
+
+    # max_end_date is non-numeric, non-ISO -> caller passed a malformed value.
+    if not iso_intent:
+        try:
+            float(raw)
+            # Numeric but non-positive (filtered earlier as None).
+            return [{
+                'code': 'malformed_max_end_date',
+                'message': ('constraints.max_end_date is numeric but '
+                            'non-positive; the constraint was ignored.'),
+            }]
+        except (TypeError, ValueError):
+            return [{
+                'code': 'malformed_max_end_date',
+                'message': ('constraints.max_end_date is neither numeric '
+                            'nor a parseable ISO date; the constraint was '
+                            'ignored.  Use a positive number (in solver time '
+                            'units) or an ISO 8601 date string with a '
+                            'project start_date.'),
+            }]
+
+    # ISO max_end_date but no start_date -> can't compute the difference.
+    if start_raw is None:
+        return [{
+            'code': 'unresolved_max_end_date_no_start',
+            'message': ('constraints.max_end_date is an ISO date but no '
+                        'project start_date was supplied; the constraint '
+                        'was ignored.  Pass either '
+                        'constraints.max_makespan (numeric) or both '
+                        'constraints.max_end_date and start_date as ISO '
+                        'dates.'),
+        }]
+
+    # Start_date supplied but unparseable.
+    if not _looks_like_iso_date(start_raw):
+        return [{
+            'code': 'unresolved_max_end_date_bad_start',
+            'message': ('constraints.max_end_date is an ISO date but '
+                        'project start_date is not parseable as ISO; '
+                        'the constraint was ignored.'),
+        }]
+
+    # Both ISO and parseable.  The remaining failure modes are:
+    #   (a) end <= start  -> max_end_date_before_start
+    #   (b) calendar config (hours_per_day / working_days) malformed
+    #       so working_hours computes to 0/NaN inside
+    #       _resolve_max_makespan -> malformed_calendar_config
+    # Distinguish them by re-parsing here and checking the date span
+    # directly rather than assuming (a).
+    try:
+        from datetime import datetime, timezone
+        end = datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
+        start = datetime.fromisoformat(str(start_raw).replace('Z', '+00:00'))
+        end = end if end.tzinfo is not None else end.replace(tzinfo=timezone.utc)
+        start = (start if start.tzinfo is not None
+                 else start.replace(tzinfo=timezone.utc))
+    except (TypeError, ValueError):
+        # Parsing failed despite _looks_like_iso_date passing -- treat
+        # as malformed (defensive; shouldn't happen in practice).
+        return [{
+            'code': 'malformed_max_end_date',
+            'message': ('constraints.max_end_date or start_date failed '
+                        'to parse as ISO 8601; the constraint was '
+                        'ignored.'),
+        }]
+    span_seconds = (end - start).total_seconds()
+    if span_seconds <= 0:
+        return [{
+            'code': 'max_end_date_before_start',
+            'message': ('constraints.max_end_date is on or before '
+                        'project start_date; the constraint was '
+                        'ignored.'),
+        }]
+    # Reject spans beyond the resolver's horizon cap with a specific
+    # code rather than letting the user think the calendar config is
+    # at fault.  Cap value imported from the resolver so the two stay
+    # in sync; default fallback keeps tests stable on import failure.
+    try:
+        from .models import MAX_ISO_HORIZON_DAYS as _CAP
+    except ImportError:
+        _CAP = 3650
+    if span_seconds / 86400.0 > _CAP:
+        return [{
+            'code': 'max_end_date_too_far_in_future',
+            'message': (
+                f'constraints.max_end_date is more than {_CAP} days '
+                f'after start_date; the constraint was ignored to '
+                f'avoid allocating an unbounded WorkingCalendar.  '
+                f'Tighten the bound or pass constraints.max_makespan '
+                f'as a numeric value in solver time units.'),
+        }]
+    # _resolve_max_makespan now resolves ISO bounds via WorkingCalendar
+    # rather than the old average-week approximation, so failure modes
+    # are: (a) bad hours_per_day (non-numeric, NaN, +/-Inf, non-positive)
+    # which is rejected explicitly inside the resolver, or (b) zero
+    # working hours over the [start, end) span (e.g. both endpoints
+    # fall on weekends with no working days between them, or every day
+    # in the span is a holiday).  Both cases produce a non-positive
+    # bound; the message names them together.
+    return [{
+        'code': 'malformed_calendar_config',
+        'message': ('constraints.max_end_date and start_date are '
+                    'both valid ISO dates and end > start, but the '
+                    'calendar configuration yields zero working '
+                    'hours: either calendar.hours_per_day is '
+                    'non-numeric / non-finite / non-positive, or '
+                    'every day in the span is non-working.  The '
+                    'constraint was ignored.'),
+    }]
