@@ -836,6 +836,70 @@ class TestHardConstraints:
         codes = [w.get("code") for w in result.get("warnings", [])]
         assert "max_end_date_before_start" in codes
 
+    def test_malformed_calendar_config_warns(self):
+        """When dates parse and end > start but the calendar config is
+        bad (working_days empty or hours_per_day = 0), the resolver
+        cannot produce a positive bound -- and the warning must say so
+        specifically rather than misdiagnose as max_end_date_before_start.
+        """
+        nodes, links = self._chain()
+        result = run_optimize(nodes, links, {"max_iterations": 20}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {
+                "hours_per_day": 8.0,
+                # All weekdays out-of-range -> wd_count falls back to 5
+                # via the `or 5` clause, so this case alone wouldn't
+                # trigger.  Use hours_per_day=0 instead.
+                "working_days": [1, 2, 3, 4, 5],
+            },
+            "constraints": {"max_end_date": "2026-12-31"},
+        })
+        # Sanity: with valid config this case resolves; verify no warn.
+        assert "malformed_calendar_config" not in [
+            w.get("code") for w in result.get("warnings", [])]
+
+        result_bad = run_optimize(nodes, links, {"max_iterations": 20}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 0, "working_days": [1, 2, 3, 4, 5]},
+            "constraints": {"max_end_date": "2026-12-31"},
+        })
+        codes = [w.get("code") for w in result_bad.get("warnings", [])]
+        assert "malformed_calendar_config" in codes
+        assert "max_end_date_before_start" not in codes
+
+    def test_duplicate_working_days_dont_inflate_bound(self):
+        """_resolve_max_makespan must dedupe working_days the same way
+        WorkingCalendar.build does, otherwise [1, 1, 2] would count as
+        3 working days instead of 2 and the resolved bound would
+        disagree with the calendar mapping in the same response."""
+        nodes, links = self._chain()
+        result_dup = run_optimize(nodes, links, {"max_iterations": 20}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0,
+                         "working_days": [1, 1, 2, 2, 3, 8, 0]},  # dups + OOR
+            "constraints": {"max_end_date": "2026-02-05"},
+        })
+        result_clean = run_optimize(nodes, links, {"max_iterations": 20}, {}, {
+            "start_date": "2026-01-05",
+            "calendar": {"hours_per_day": 8.0, "working_days": [1, 2, 3]},
+            "constraints": {"max_end_date": "2026-02-05"},
+        })
+        # Both should resolve to the same bound (3 unique ISO weekdays).
+        assert (result_dup["constraints"]["max_makespan"]["bound"]
+                == result_clean["constraints"]["max_makespan"]["bound"])
+
+    def test_empty_dag_returns_constraints_none(self):
+        """The empty-DAG fast path must include constraints=None so
+        consumers see a stable shape regardless of input size."""
+        result_opt = run_optimize([], [], {"max_iterations": 20}, {},
+                                  {"constraints": {"max_makespan": 50}})
+        assert "constraints" in result_opt
+        assert result_opt["constraints"] is None
+        result_sens = run_sensitivity([], [], {}, {},
+                                      {"constraints": {"max_budget": 1000}})
+        assert "constraints" in result_sens
+        assert result_sens["constraints"] is None
+
     def test_sensitivity_emits_constraints_report(self):
         """run_sensitivity should report current-baseline feasibility
         when bounds are supplied -- useful as a pre-flight check before

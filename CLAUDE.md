@@ -445,11 +445,14 @@ Pushes to `main` trigger automatic deployment to Azure production. Treat
   applies a normalised quadratic penalty
   (`CONSTRAINT_PENALTY_LAMBDA = 50`) for `max_makespan` and
   `max_budget`, with gradients reusing the analytic schedule and cost
-  adjoints (no extra CPM evaluation).  The response surfaces a
-  `constraints` report with `{bound, final_value, violation,
-  satisfied}` per active constraint and a `warnings` array entry
-  (`unresolved_max_end_date`) when ISO `max_end_date` cannot be
-  resolved without a `start_date`.
+  adjoints (no extra CPM evaluation).  Both `/solver/sensitivity` and
+  `/solver/optimize` surface a `constraints` report with `{bound,
+  final_value, violation, satisfied}` per active constraint, plus a
+  `warnings` array using one of five specific codes when an
+  `max_end_date` can't be resolved: `unresolved_max_end_date_no_start`,
+  `unresolved_max_end_date_bad_start`, `malformed_max_end_date`,
+  `max_end_date_before_start`, `malformed_calendar_config`.  See
+  `docs/api/solver.md` for the full code semantics.
 - **Link type awareness in app.py graph construction:** `build_nx_graph`
   stores `type` and `lag` as edge attributes, and `calculate_critical_path`
   now uses them via solver.dag.  But other analytics (dependency grouping,

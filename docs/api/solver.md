@@ -118,11 +118,21 @@ The optimize / sensitivity response includes a `constraints` object
 reporting `{bound, final_value, violation, satisfied}` per active
 constraint (see [Constraints Report](#constraints-report)).
 
-If `max_end_date` is an ISO date string but no `start_date` is supplied,
-the constraint cannot be resolved to a numeric bound; the response
-includes a `warnings` array with code `unresolved_max_end_date` and the
-constraint is silently skipped (matching the historic
-"parsed-but-not-enforced" semantics for legacy callers).
+If `max_end_date` cannot be resolved to a numeric bound (ISO without a
+`start_date`, malformed value, end before start, etc.) the constraint
+is silently skipped and the response includes a `warnings` array
+entry with one of these specific codes:
+
+| Code | Meaning |
+|---|---|
+| `unresolved_max_end_date_no_start` | ISO date supplied without a project `start_date` |
+| `unresolved_max_end_date_bad_start` | `start_date` is not parseable as ISO |
+| `malformed_max_end_date` | Value is neither numeric nor ISO-parseable, or is numeric but non-positive |
+| `max_end_date_before_start` | Both dates parse but `end <= start` |
+| `malformed_calendar_config` | Both dates parse and `end > start`, but the calendar (`hours_per_day` / `working_days`) yields a non-positive working-hour bound |
+
+This matches the historic "parsed-but-not-enforced" semantics for
+legacy callers that pass an unresolvable constraint.
 
 ### Phase-Dependent Default Weights
 
@@ -182,7 +192,7 @@ Content-Type: application/json
 | `cache_hit` | `boolean` | Always | `true` if served from cache. |
 | `stochastic` | `object` | Conditional | Monte Carlo results. **Present only when** `stochastic: true`. See [Stochastic](#stochastic). |
 | `calendar` | `object` | Conditional | Calendar mapping from `makespan` to a real end date. **Present only when** the request supplies a parseable `project_context.start_date` together with at least one calendar field. See [Calendar Mapping](#calendar-mapping). |
-| `warnings` | `array<object>` | Conditional | Non-fatal advisory messages.  Same codes as the optimize endpoint (`unresolved_max_end_date_no_start`, `unresolved_max_end_date_bad_start`, `malformed_max_end_date`, `max_end_date_before_start`). |
+| `warnings` | `array<object>` | Conditional | Non-fatal advisory messages.  See [Hard Constraints](#hard-constraints) for the full list of warning codes. |
 
 #### `objectives` Object
 
@@ -284,7 +294,7 @@ Content-Type: application/json
 | `stochastic` | `object` | Conditional | Monte Carlo results on optimized state. **Present only when** `stochastic: true`. See [Stochastic](#stochastic). |
 | `constraints` | `object \| null` | Conditional | Per-constraint feasibility report.  Present (non-null) when at least one of `max_makespan` / resolvable `max_end_date` / `max_budget` was supplied.  See [Constraints Report](#constraints-report). |
 | `calendar` | `object` | Conditional | Calendar mapping from final `makespan` to a real end date.  Same shape as the sensitivity-endpoint `calendar`.  See [Calendar Mapping](#calendar-mapping). |
-| `warnings` | `array<object>` | Conditional | Non-fatal advisory messages.  Possible codes: `unresolved_max_end_date_no_start` (ISO date supplied without a project `start_date`), `unresolved_max_end_date_bad_start` (`start_date` not parseable), `malformed_max_end_date` (neither numeric nor ISO; or numeric but non-positive), `max_end_date_before_start` (ISO end on/before ISO start). |
+| `warnings` | `array<object>` | Conditional | Non-fatal advisory messages.  See [Hard Constraints](#hard-constraints) for the full list of warning codes. |
 
 #### Activity Change
 

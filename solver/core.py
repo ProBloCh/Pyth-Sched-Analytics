@@ -284,18 +284,25 @@ def _build_sensitivity_table(dag_state, params, gradients, config):
 
 
 def _empty_sensitivity(disciplines, t0):
+    """Empty-DAG response shape.  Mirrors the populated path's keys
+    (constraints / calendar / warnings) with ``None`` / absent values
+    so consumers don't see a different shape on degenerate inputs."""
     return {
         'objectives': {d: 0.0 for d in disciplines},
         'makespan': 0.0,
         'critical_path': [],
         'sensitivity': [],
         'analysis': {'conflicts_and_synergies': [], 'interventions': []},
+        'constraints': None,
         'config': {'disciplines': disciplines, 'weights': {}},
         'computation_ms': round((time.time() - t0) * 1000, 1),
     }
 
 
 def _empty_optimize(disciplines, t0):
+    """Empty-DAG response shape.  Mirrors the populated path's keys
+    (constraints / calendar / warnings) with ``None`` / absent values
+    so consumers don't see a different shape on degenerate inputs."""
     return {
         'initial_objectives': {d: 0.0 for d in disciplines},
         'final_objectives':   {d: 0.0 for d in disciplines},
@@ -305,6 +312,7 @@ def _empty_optimize(disciplines, t0):
         'iterations': 0,
         'converged': True,
         'history': [],
+        'constraints': None,
         'config': {'disciplines': disciplines, 'weights': {}},
         'computation_ms': round((time.time() - t0) * 1000, 1),
     }
@@ -401,9 +409,42 @@ def _resolve_constraint_warnings(project_ctx, project_context_dict):
                         'the constraint was ignored.'),
         }]
 
-    # Both ISO but the dates result in a non-positive span.
+    # Both ISO and parseable.  The remaining failure modes are:
+    #   (a) end <= start  -> max_end_date_before_start
+    #   (b) calendar config (hours_per_day / working_days) malformed
+    #       so working_hours computes to 0/NaN inside
+    #       _resolve_max_makespan -> malformed_calendar_config
+    # Distinguish them by re-parsing here and checking the date span
+    # directly rather than assuming (a).
+    try:
+        from datetime import datetime, timezone
+        end = datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
+        start = datetime.fromisoformat(str(start_raw).replace('Z', '+00:00'))
+        end = end if end.tzinfo is not None else end.replace(tzinfo=timezone.utc)
+        start = (start if start.tzinfo is not None
+                 else start.replace(tzinfo=timezone.utc))
+    except (TypeError, ValueError):
+        # Parsing failed despite _looks_like_iso_date passing -- treat
+        # as malformed (defensive; shouldn't happen in practice).
+        return [{
+            'code': 'malformed_max_end_date',
+            'message': ('constraints.max_end_date or start_date failed '
+                        'to parse as ISO 8601; the constraint was '
+                        'ignored.'),
+        }]
+    if (end - start).total_seconds() <= 0:
+        return [{
+            'code': 'max_end_date_before_start',
+            'message': ('constraints.max_end_date is on or before '
+                        'project start_date; the constraint was '
+                        'ignored.'),
+        }]
     return [{
-        'code': 'max_end_date_before_start',
-        'message': ('constraints.max_end_date is on or before project '
-                    'start_date; the constraint was ignored.'),
+        'code': 'malformed_calendar_config',
+        'message': ('constraints.max_end_date and start_date are '
+                    'both valid ISO dates but the calendar '
+                    'configuration produced a non-positive working-'
+                    'hour bound (check hours_per_day and '
+                    'working_days for zero / NaN / out-of-range '
+                    'values); the constraint was ignored.'),
     }]

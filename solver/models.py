@@ -201,9 +201,25 @@ def _resolve_max_makespan(max_makespan_raw, max_end_date_raw, start_date_raw,
     cal_days = (end - start).total_seconds() / 86400.0
     if cal_days <= 0:
         return None
-    wd_count = len([d for d in (working_days or [])
-                    if isinstance(d, (int, float))]) or 5
-    working_hours = cal_days * (wd_count / 7.0) * float(hours_per_day or 8.0)
+    # Match completion.calendar.WorkingCalendar.build's filtering
+    # exactly: clamp to ISO weekdays 1..7 and deduplicate via a set.
+    # Without this, malformed/duplicated working_days lists (e.g.
+    # [1, 1, 2, 8] or [0, 1, 2, 3, 4, 5]) would inflate wd_count
+    # past 5 and disagree with the calendar that actually drives the
+    # response mapping.
+    wd_count = len({int(d) for d in (working_days or [])
+                    if isinstance(d, (int, float))
+                    and 1 <= int(d) <= 7}) or 5
+    # Validate hours_per_day explicitly rather than relying on
+    # ``or 8.0``: that idiom silently swaps 0 for 8.0, which masks
+    # genuinely malformed calendar configs (NaN, "0", negative).
+    try:
+        hpd = float(hours_per_day) if hours_per_day is not None else 8.0
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(hpd) or hpd <= 0:
+        return None
+    working_hours = cal_days * (wd_count / 7.0) * hpd
     return working_hours if working_hours > 0 else None
 
 
