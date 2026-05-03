@@ -429,6 +429,26 @@ class TestEarnedSchedule:
         assert 'SPI_t' in es
         assert 'TEAC_date' in es
 
+    def test_vectorised_pv_curve_handles_camelcase_timeunits(self):
+        """Mirror the dual-key fallback used by compute_duration_weighted:
+        a node carrying ``timeUnits`` (camelCase) must convert with the
+        right unit, not silently default to Hours.  Pre-fix the helper
+        only read ``TimeUnits`` (PascalCase), producing wrong PV in
+        ES for mixed-shape inputs."""
+        from evm.metrics import _vectorised_pv_curve, _significant_evm_dates
+        # Two-week activity expressed in days via the camelCase key.
+        nodes = [{
+            'ID': '1',
+            'Duration': 14, 'timeUnits': 'days',  # camelCase!
+            'Start': '2025-01-01', 'Finish': '2025-01-15',
+        }]
+        dates = _significant_evm_dates(nodes)
+        pv = _vectorised_pv_curve(nodes, dates, 8.0, 5.0)
+        # 14 days * 8 hpd = 112 working hours.  Pre-fix the camelCase
+        # was missed and the helper defaulted to 'Hours', returning
+        # 14 (treating 14 as already in hours).
+        assert pv[-1] == pytest.approx(112.0)
+
     def test_vectorised_pv_curve_handles_milestones(self):
         """Activities with finish == start (milestones) and degenerate
         finish < start data must match the scalar reference, which

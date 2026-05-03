@@ -274,8 +274,15 @@ def _vectorised_pv_curve(nodes, dates, hours_per_day, working_days_per_week):
             continue
         s = safe_date(n.get('Start'))
         f = safe_date(n.get('Finish'))
+        # Mirror the dual-key TimeUnits fallback used by
+        # compute_duration_weighted and the completion paths so a
+        # node carrying ``timeUnits`` (camelCase) doesn't silently
+        # default to 'Hours' here -- which would compute ES PV/EV
+        # in the wrong unit.
+        time_units = (n.get('TimeUnits')
+                      or n.get('timeUnits') or 'Hours')
         h = convert_to_hours(
-            dur_raw, n.get('TimeUnits', 'Hours'),
+            dur_raw, time_units,
             hours_per_day, working_days_per_week)
         if s is None or f is None or h <= 0:
             continue
