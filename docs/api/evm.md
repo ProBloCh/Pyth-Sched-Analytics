@@ -120,7 +120,10 @@ so no key conversion is required on the JS side.
       "actualTimeDays":      14.0,            // AT: status_date - project_start
       "plannedDurationDays": 32.0,            // PD: project_finish - project_start
       "SPI_t":               0.714,           // ES / AT  -- raw, may be Inf
-      "SPI_t_model":         0.714,           //   clamped to MIN_SPI..MAX_SPI
+      "SPI_t_model":         0.714,           //   stabilised: clamp(SPI_t, MIN_SPI, MAX_SPI)
+                                              //   when finite, else 1.0 (matches the
+                                              //   non-finite convention used by SPI_model
+                                              //   and CPIcum_model)
       "earnedScheduleDate":  "2025-01-11",    // ISO date of ES on the plan
       "TEAC_days":           44.8,            // Time-based EAC = max(AT, PD/SPI_t_model)
       "TEAC_date":           "2025-02-15",    // project_start + TEAC_days

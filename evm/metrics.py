@@ -412,7 +412,13 @@ def compute_earned_schedule(nodes, status_date, hours_per_day: float = 8.0,
                 es_date = d0 + timedelta(days=frac * day_span)
                 break
 
-    # SPI(t) - raw can be Inf if AT == 0 with ES > 0; clamp the _model.
+    # SPI(t): raw can be Inf if AT == 0 with ES > 0.  SPI_t_model is
+    # the stabilised variant: ``clamp(SPI_t, MIN_SPI, MAX_SPI)`` when
+    # finite, else 1.0 (neutral).  Mirrors the non-finite convention
+    # already in use for SPI_model and CPIcum_model in
+    # compute_evm_metrics -- not a strict clamp, since clamping Inf
+    # to MAX_SPI would produce a TEAC of PD/MAX_SPI rather than the
+    # neutral PD that consumers expect when no time has elapsed.
     if at_days > 0:
         spi_t = es_days / at_days
     elif es_days > 0:
