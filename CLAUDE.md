@@ -511,6 +511,39 @@ Pushes to `main` trigger automatic deployment to Azure production. Treat
   Flyvbjerg JMIS 2022) demands: Earned Schedule is no longer a single
   number a customer could mistake for a forecast — it's a five-tier-
   risk-model band around the deterministic midpoint.
+
+  **Residual backlog after this PR (deferred, all non-blocking):**
+  1. **Stochastic TEAC composes the MC remaining-work CPM, not Lipke
+     ES from EV/PV.**  `response.teac.deterministic` ≠
+     `/evm/analyze.actual.earnedSchedule.TEAC_date` for in-progress,
+     out-of-sequence, or status-after-completion projects.  A natural
+     follow-up would be to compute Lipke ES from MC-sampled
+     EV-vs-PV intersections (per percentile), so the stochastic TEAC
+     and EVM TEAC use the same time-base.  Acceptable today: docs and
+     `note` field call out the divergence; consumers wanting the
+     EVM-form TEAC can read it from `/evm/analyze`.
+  2. **Calendar-aware percentile dates.**  The stochastic TEAC reuses
+     the MC propagation, which respects working calendars when
+     `project_context.calendar` is supplied.  When it isn't,
+     `teac_days` are wall-clock calendar days, not working days.
+     Consistent with `evm.metrics.compute_earned_schedule` (also
+     calendar-day based by default), but a customer wanting working-
+     day TEAC would need to set the calendar.
+  3. **All-completed Lipke clamp diverges from public iso fields.**
+     For `flags.all_completed && status_date > latest ActualFinish`,
+     the `teac` block clamps to `status_date` while public
+     `expected_finish`/`p*_finish` keep the actual completion.
+     Documented as the regular-vs-edge-case relationship; both views
+     are deliberately exposed so consumers can pick the right one.
+  4. **Per-activity TEAC bands.**  `response.activity_percentiles`
+     gives per-activity P20/P50/P80 finish dates but no TEAC view
+     (no anchoring at activity-baseline-start).  Trivial extension
+     when a customer asks for it.
+  5. **Calibration-loop integration.**  `response.teac` is not yet
+     read by `/completion/register-outcome` /
+     `/completion/calibration-report`; calibration today is on raw
+     finish dates, not on the TEAC band.  Useful for closing the
+     empirical loop but not required for the band itself.
 - **Reference class integration:** The user's PMJ paper demonstrates RCF
   uplifts for O&G offshore projects (P10: 89% cost, 72% schedule).  The
   reference class dataset lives in a separate app; the solver should
