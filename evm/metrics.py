@@ -351,15 +351,40 @@ def compute_earned_schedule(nodes, status_date, hours_per_day: float = 8.0,
     sd = safe_date(status_date)
 
     flags = {}
-    # Preliminary scan for project start/finish to feed must_include.
-    # _significant_evm_dates is cheap (single pass over nodes) but we
-    # only need its first/last elements at this point.
-    bare = _significant_evm_dates(nodes)
-    if not bare:
+    # Anchor PD on the per-side extremes -- earliest parsed Start and
+    # latest parsed Finish -- not on the union sorted set of all
+    # Start/Finish breakpoints.  When a partial schedule has a late
+    # activity with a parsed Start but a missing/invalid Finish (e.g.
+    # in-progress milestone, P6 import with NULL planned-finish), the
+    # union-set approach lets that orphan Start become bare[-1] when
+    # it falls after every parsed Finish, inflating project_finish
+    # and growing PD beyond the Lipke contract (project_finish ==
+    # max(activity Finish), per the docstring).  AT = status_date -
+    # min(Start) and PV are unaffected (the vectorised PV curve
+    # filters orphans without a Finish at line ~287), but TEAC =
+    # max(AT, PD / SPI_t_model) inflates with PD, so the
+    # deterministic finish-date prediction skews later than truth.
+    # SPI_t = ES / AT can also drift in the rarer case where the
+    # orphan carries a non-zero PercentComplete: compute_bcwp_hours
+    # accumulates EV regardless of date presence (it only filters on
+    # Duration), so EV inflates while PV does not, pushing ES along
+    # the PV curve.  Mirror skew exists when an orphan Finish
+    # precedes min(parsed Start) and pulls project_start earlier.
+    parsed_starts = [
+        s.replace(hour=0, minute=0, second=0, microsecond=0)
+        for s in (safe_date(n.get('Start')) for n in (nodes or []))
+        if s is not None
+    ]
+    parsed_finishes = [
+        f.replace(hour=0, minute=0, second=0, microsecond=0)
+        for f in (safe_date(n.get('Finish')) for n in (nodes or []))
+        if f is not None
+    ]
+    if not parsed_starts or not parsed_finishes:
         flags['no_baseline'] = True
         return _empty_es(flags)
-    project_start = bare[0]
-    project_finish = bare[-1]
+    project_start = min(parsed_starts)
+    project_finish = max(parsed_finishes)
     pd_days = max(
         difference_in_calendar_days(project_finish, project_start), 0.0)
 

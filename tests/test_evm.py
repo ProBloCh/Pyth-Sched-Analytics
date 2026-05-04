@@ -345,6 +345,121 @@ class TestEarnedSchedule:
         assert r['SPI_t'] == 1.0
         assert r['flags'].get('no_baseline') is True
 
+    def test_earned_schedule_late_activity_with_missing_finish_does_not_skew_pd(self):
+        """Regression: a late activity with a parsed Start but a
+        missing/invalid Finish (in-progress milestone, P6 import with
+        NULL planned-finish) must not become the project_finish anchor.
+
+        Pre-fix the union-set of Start/Finish breakpoints made the
+        orphan Start the global max when it landed after every parsed
+        Finish, inflating project_finish and growing PD vs the Lipke
+        contract (PD = max(parsed Finish) - min(parsed Start)).  In
+        this fixture pre-fix PD = Feb 15 - Jan 1 = 45 days vs the
+        correct PD = Feb 2 - Jan 1 = 32 days.  SPI_t is unaffected
+        because the orphan is filtered from the PV curve (no Finish ->
+        excluded by _vectorised_pv_curve), but TEAC = PD / SPI_t_model
+        skews later than truth.  Post-fix project_finish is
+        max(parsed Finish) regardless of orphan Starts.
+        """
+        nodes = self._three_seq(p1=100, p2=50)
+        # Inject a fourth activity dated AFTER every Finish but with
+        # no Finish parsed (None).  Its Start is later than the
+        # latest Finish (Feb 2), so under the buggy code it would
+        # have become project_finish.
+        nodes.append({
+            'ID': '4', 'Duration': 5, 'TimeUnits': 'days',
+            'Start': '2025-02-15', 'Finish': None,
+            'PercentComplete': 0,
+        })
+        r = compute_earned_schedule(nodes, '2025-01-17')
+        # PD must reflect Jan 1 -> Feb 2 (32 days), NOT Jan 1 -> Feb 15.
+        assert r['plannedDurationDays'] == pytest.approx(32.0)
+        assert r['projectFinishDate'] == '2025-02-02'
+
+    def test_earned_schedule_no_finishes_returns_no_baseline(self):
+        """Schedule with parseable Starts but zero parseable Finishes
+        must report no_baseline -- previously the latest Start became
+        project_finish, producing a bogus PD anchored on a Start."""
+        nodes = [
+            {'ID': '1', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '2025-01-01', 'Finish': None,
+             'PercentComplete': 0},
+            {'ID': '2', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '2025-01-12', 'Finish': '',
+             'PercentComplete': 0},
+        ]
+        r = compute_earned_schedule(nodes, '2025-01-17')
+        assert r['flags'].get('no_baseline') is True
+        # Response shape must match _empty_es.
+        assert r['earnedScheduleDays'] == 0.0
+        assert r['plannedDurationDays'] == 0.0
+        assert r['SPI_t'] == 1.0
+        assert r['SPI_t_model'] == 1.0
+        assert r['TEAC_date'] is None
+        assert r['projectStartDate'] is None
+        assert r['projectFinishDate'] is None
+
+    def test_earned_schedule_no_starts_returns_no_baseline(self):
+        """Symmetric: parseable Finishes but zero parseable Starts."""
+        nodes = [
+            {'ID': '1', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': None, 'Finish': '2025-01-11',
+             'PercentComplete': 0},
+            {'ID': '2', 'Duration': 10, 'TimeUnits': 'days',
+             'Start': '', 'Finish': '2025-01-22',
+             'PercentComplete': 0},
+        ]
+        r = compute_earned_schedule(nodes, '2025-01-17')
+        assert r['flags'].get('no_baseline') is True
+        assert r['earnedScheduleDays'] == 0.0
+        assert r['plannedDurationDays'] == 0.0
+        assert r['projectStartDate'] is None
+        assert r['projectFinishDate'] is None
+
+    def test_earned_schedule_early_orphan_finish_does_not_pull_project_start(self):
+        """Mirror of the late-orphan-Start regression: an orphan Finish
+        earlier than every parsed Start must NOT become project_start.
+
+        Pre-fix the union sorted set let the orphan Finish (Dec 15)
+        become bare[0], pulling project_start to Dec 15 and growing
+        PD from Jan 1 -> Feb 2 (32 days) to Dec 15 -> Feb 2 (49 days).
+        Post-fix project_start = min(parsed_starts) regardless of
+        orphan Finishes earlier than the earliest Start.
+        """
+        nodes = self._three_seq(p1=100, p2=50)
+        # Inject an orphan Finish dated BEFORE every Start, with no
+        # Start parsed.  Pre-fix this would have become project_start.
+        nodes.append({
+            'ID': '4', 'Duration': 5, 'TimeUnits': 'days',
+            'Start': None, 'Finish': '2024-12-15',
+            'PercentComplete': 0,
+        })
+        r = compute_earned_schedule(nodes, '2025-01-17')
+        # PD must reflect Jan 1 -> Feb 2 (32 days), NOT Dec 15 -> Feb 2.
+        assert r['plannedDurationDays'] == pytest.approx(32.0)
+        assert r['projectStartDate'] == '2025-01-01'
+        assert r['projectFinishDate'] == '2025-02-02'
+
+    def test_earned_schedule_pd_unchanged_for_clean_schedule(self):
+        """No-regression invariant on the happy path: when every
+        activity has both Start and Finish, the new per-side anchor
+        derivation must produce the same outputs as the previous
+        union-set derivation.  Locks every numeric output field for
+        the canonical _three_seq fixture."""
+        nodes = self._three_seq(p1=100, p2=50)
+        r = compute_earned_schedule(nodes, '2025-01-17')
+        # Pre-fix snapshot of the canonical happy-path outputs.
+        assert r['plannedDurationDays'] == pytest.approx(32.0)
+        assert r['projectStartDate'] == '2025-01-01'
+        assert r['projectFinishDate'] == '2025-02-02'
+        assert r['actualTimeDays'] == pytest.approx(16.0)
+        assert r['earnedScheduleDays'] == pytest.approx(16.0, abs=0.5)
+        assert r['SPI_t'] == pytest.approx(1.0, abs=0.05)
+        assert r['SPI_t_model'] == pytest.approx(1.0, abs=0.05)
+        assert r['TEAC_days'] == pytest.approx(32.0, abs=2.0)
+        assert r['TEAC_date'] is not None
+        assert r['flags'].get('no_baseline') is not True
+
     def test_not_started_zero_es(self):
         nodes = self._three_seq()  # no progress
         r = compute_earned_schedule(nodes, '2025-01-15')
