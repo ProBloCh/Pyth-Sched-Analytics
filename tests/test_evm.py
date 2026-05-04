@@ -351,10 +351,15 @@ class TestEarnedSchedule:
         NULL planned-finish) must not become the project_finish anchor.
 
         Pre-fix the union-set of Start/Finish breakpoints made the
-        orphan Start the global max, shrinking PD on a partial
-        schedule and inflating SPI(t) and TEAC.  Post-fix
-        project_finish is max(parsed Finish) regardless of orphan
-        Starts later than the latest Finish.
+        orphan Start the global max when it landed after every parsed
+        Finish, inflating project_finish and growing PD vs the Lipke
+        contract (PD = max(parsed Finish) - min(parsed Start)).  In
+        this fixture pre-fix PD = Feb 15 - Jan 1 = 45 days vs the
+        correct PD = Feb 2 - Jan 1 = 32 days.  SPI_t is unaffected
+        because the orphan is filtered from the PV curve (no Finish ->
+        excluded by _vectorised_pv_curve), but TEAC = PD / SPI_t_model
+        skews later than truth.  Post-fix project_finish is
+        max(parsed Finish) regardless of orphan Starts.
         """
         nodes = self._three_seq(p1=100, p2=50)
         # Inject a fourth activity dated AFTER every Finish but with

@@ -356,9 +356,16 @@ def compute_earned_schedule(nodes, status_date, hours_per_day: float = 8.0,
     # Start/Finish breakpoints.  When a partial schedule has a late
     # activity with a parsed Start but a missing/invalid Finish (e.g.
     # in-progress milestone, P6 import with NULL planned-finish), the
-    # union-set approach would let that orphan Start become the global
-    # max and shrink PD, inflating SPI(t) and TEAC.  The Lipke contract
-    # is project_finish == max(activity Finish), per the docstring.
+    # union-set approach lets that orphan Start become bare[-1] when
+    # it falls after every parsed Finish, inflating project_finish
+    # and growing PD beyond the Lipke contract (project_finish ==
+    # max(activity Finish), per the docstring).  SPI_t = ES/AT is
+    # unaffected -- the orphan has no Finish so the vectorised PV
+    # curve filters it out (no contribution to ES, AT, or PV total)
+    # -- but TEAC = max(AT, PD / SPI_t_model) inflates with PD, so
+    # the deterministic finish-date prediction skews later than
+    # truth.  Mirror skew exists when an orphan Finish precedes
+    # min(parsed Start) and pulls project_start earlier.
     parsed_starts = [
         s.replace(hour=0, minute=0, second=0, microsecond=0)
         for s in (safe_date(n.get('Start')) for n in (nodes or []))
