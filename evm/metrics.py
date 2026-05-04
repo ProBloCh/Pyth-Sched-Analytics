@@ -351,15 +351,29 @@ def compute_earned_schedule(nodes, status_date, hours_per_day: float = 8.0,
     sd = safe_date(status_date)
 
     flags = {}
-    # Preliminary scan for project start/finish to feed must_include.
-    # _significant_evm_dates is cheap (single pass over nodes) but we
-    # only need its first/last elements at this point.
-    bare = _significant_evm_dates(nodes)
-    if not bare:
+    # Anchor PD on the per-side extremes -- earliest parsed Start and
+    # latest parsed Finish -- not on the union sorted set of all
+    # Start/Finish breakpoints.  When a partial schedule has a late
+    # activity with a parsed Start but a missing/invalid Finish (e.g.
+    # in-progress milestone, P6 import with NULL planned-finish), the
+    # union-set approach would let that orphan Start become the global
+    # max and shrink PD, inflating SPI(t) and TEAC.  The Lipke contract
+    # is project_finish == max(activity Finish), per the docstring.
+    parsed_starts = [
+        s.replace(hour=0, minute=0, second=0, microsecond=0)
+        for s in (safe_date(n.get('Start')) for n in (nodes or []))
+        if s is not None
+    ]
+    parsed_finishes = [
+        f.replace(hour=0, minute=0, second=0, microsecond=0)
+        for f in (safe_date(n.get('Finish')) for n in (nodes or []))
+        if f is not None
+    ]
+    if not parsed_starts or not parsed_finishes:
         flags['no_baseline'] = True
         return _empty_es(flags)
-    project_start = bare[0]
-    project_finish = bare[-1]
+    project_start = min(parsed_starts)
+    project_finish = max(parsed_finishes)
     pd_days = max(
         difference_in_calendar_days(project_finish, project_start), 0.0)
 
