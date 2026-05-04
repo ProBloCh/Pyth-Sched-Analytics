@@ -416,6 +416,30 @@ class TestEarnedSchedule:
         assert r['projectStartDate'] is None
         assert r['projectFinishDate'] is None
 
+    def test_earned_schedule_early_orphan_finish_does_not_pull_project_start(self):
+        """Mirror of the late-orphan-Start regression: an orphan Finish
+        earlier than every parsed Start must NOT become project_start.
+
+        Pre-fix the union sorted set let the orphan Finish (Dec 15)
+        become bare[0], pulling project_start to Dec 15 and growing
+        PD from Jan 1 -> Feb 2 (32 days) to Dec 15 -> Feb 2 (49 days).
+        Post-fix project_start = min(parsed_starts) regardless of
+        orphan Finishes earlier than the earliest Start.
+        """
+        nodes = self._three_seq(p1=100, p2=50)
+        # Inject an orphan Finish dated BEFORE every Start, with no
+        # Start parsed.  Pre-fix this would have become project_start.
+        nodes.append({
+            'ID': '4', 'Duration': 5, 'TimeUnits': 'days',
+            'Start': None, 'Finish': '2024-12-15',
+            'PercentComplete': 0,
+        })
+        r = compute_earned_schedule(nodes, '2025-01-17')
+        # PD must reflect Jan 1 -> Feb 2 (32 days), NOT Dec 15 -> Feb 2.
+        assert r['plannedDurationDays'] == pytest.approx(32.0)
+        assert r['projectStartDate'] == '2025-01-01'
+        assert r['projectFinishDate'] == '2025-02-02'
+
     def test_earned_schedule_pd_unchanged_for_clean_schedule(self):
         """No-regression invariant on the happy path: when every
         activity has both Start and Finish, the new per-side anchor

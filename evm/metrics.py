@@ -359,13 +359,17 @@ def compute_earned_schedule(nodes, status_date, hours_per_day: float = 8.0,
     # union-set approach lets that orphan Start become bare[-1] when
     # it falls after every parsed Finish, inflating project_finish
     # and growing PD beyond the Lipke contract (project_finish ==
-    # max(activity Finish), per the docstring).  SPI_t = ES/AT is
-    # unaffected -- the orphan has no Finish so the vectorised PV
-    # curve filters it out (no contribution to ES, AT, or PV total)
-    # -- but TEAC = max(AT, PD / SPI_t_model) inflates with PD, so
-    # the deterministic finish-date prediction skews later than
-    # truth.  Mirror skew exists when an orphan Finish precedes
-    # min(parsed Start) and pulls project_start earlier.
+    # max(activity Finish), per the docstring).  AT = status_date -
+    # min(Start) and PV are unaffected (the vectorised PV curve
+    # filters orphans without a Finish at line ~287), but TEAC =
+    # max(AT, PD / SPI_t_model) inflates with PD, so the
+    # deterministic finish-date prediction skews later than truth.
+    # SPI_t = ES / AT can also drift in the rarer case where the
+    # orphan carries a non-zero PercentComplete: compute_bcwp_hours
+    # accumulates EV regardless of date presence (it only filters on
+    # Duration), so EV inflates while PV does not, pushing ES along
+    # the PV curve.  Mirror skew exists when an orphan Finish
+    # precedes min(parsed Start) and pulls project_start earlier.
     parsed_starts = [
         s.replace(hour=0, minute=0, second=0, microsecond=0)
         for s in (safe_date(n.get('Start')) for n in (nodes or []))
