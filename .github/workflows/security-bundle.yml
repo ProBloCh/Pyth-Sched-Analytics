@@ -1,0 +1,198 @@
+name: Security Bundle
+
+# Builds the federal-cyber intake bundle described in security/INTAKE.md:
+#   - CycloneDX SBOMs (Python deps + container)
+#   - Signed OCI image (cosign keyless / Sigstore) pushed to GHCR
+#   - SCA / SAST / secrets scan reports (Trivy, pip-audit, Bandit, Semgrep, Gitleaks)
+#   - SHA-256 manifest of every artifact
+#
+# Triggered by tag push (v*) or manual dispatch. Does not deploy.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to bundle (branch, tag, or sha)'
+        required: true
+        default: 'main'
+
+permissions:
+  contents: write        # release upload
+  packages: write        # GHCR push
+  id-token: write        # cosign keyless OIDC
+  security-events: write # SARIF upload to GitHub Security tab
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install audit tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install cyclonedx-bom pip-audit bandit semgrep
+
+      - name: Prepare artifacts directory
+        run: mkdir -p artifacts
+
+      # ---- Source / dependency scans (run before container build) -------------
+
+      - name: CycloneDX SBOM (Python requirements)
+        run: |
+          cyclonedx-py requirements \
+            -i requirements.txt \
+            -o artifacts/sbom-python.cdx.json \
+            --output-format JSON
+
+      - name: pip-audit (CVE scan against PyPI advisory DB)
+        run: pip-audit -r requirements.txt -f json -o artifacts/pip-audit.json || true
+
+      - name: Bandit (Python SAST)
+        run: |
+          bandit -r . \
+            -x ./tests,./Reference,./venv,./.venv \
+            -f json -o artifacts/bandit.json || true
+
+      - name: Semgrep (SAST, OWASP Top 10 + Python rules)
+        run: |
+          semgrep \
+            --config p/python \
+            --config p/owasp-top-ten \
+            --sarif --output artifacts/semgrep.sarif \
+            --error=false \
+            . || true
+
+      - name: Gitleaks (secrets scan)
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          config-path: ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_SUMMARY: 'false'
+        continue-on-error: true
+
+      # ---- Container build, sign, scan ----------------------------------------
+
+      - name: Compute image reference
+        id: meta
+        run: |
+          REF="${{ github.event.inputs.ref || github.ref_name }}"
+          IMAGE="ghcr.io/${{ github.repository }}:${REF}"
+          echo "image=${IMAGE,,}" >> "$GITHUB_OUTPUT"
+          echo "ref=${REF}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image (with build provenance + SBOM attestations)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless / Sigstore Fulcio + Rekor)
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: CycloneDX SBOM (container image)
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          syft "${IMAGE}@${DIGEST}" \
+            -o cyclonedx-json=artifacts/sbom-container.cdx.json
+
+      - name: Trivy image scan (SARIF, for GitHub Security tab)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: artifacts/trivy.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          ignore-unfixed: false
+        continue-on-error: true
+
+      - name: Trivy image scan (JSON, for VEX triage)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}
+          format: json
+          output: artifacts/trivy.json
+        continue-on-error: true
+
+      - name: Upload SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: artifacts/trivy.sarif
+          category: trivy-image
+        continue-on-error: true
+
+      # ---- Manifest + release -------------------------------------------------
+
+      - name: Write bundle manifest and checksums
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          REF: ${{ steps.meta.outputs.ref }}
+        run: |
+          {
+            echo "Pyth-Sched-Analytics — federal cyber intake bundle"
+            echo "Ref:           ${REF}"
+            echo "Commit:        ${GITHUB_SHA}"
+            echo "Workflow run:  ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "Image:         ${IMAGE}"
+            echo "Image digest:  ${DIGEST}"
+            echo "Built (UTC):   $(date -u +%FT%TZ)"
+            echo
+            echo "Verify image signature:"
+            echo "  cosign verify ${IMAGE}@${DIGEST} \\"
+            echo "    --certificate-identity-regexp 'https://github.com/${GITHUB_REPOSITORY}/.github/workflows/security-bundle.yml@.*' \\"
+            echo "    --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+          } > artifacts/MANIFEST.txt
+          (cd artifacts && sha256sum -- * > SHA256SUMS)
+
+      - name: Upload bundle as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-bundle-${{ steps.meta.outputs.ref }}
+          path: artifacts/
+          retention-days: 90
+
+      - name: Attach bundle to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          fail_on_unmatched_files: false
