@@ -105,6 +105,13 @@ except Exception as _paths_err:
     logging.warning("Paths package failed to load: %s. "
                     "Path endpoints will be unavailable.", _paths_err)
 
+try:
+    from interface import interface_bp
+    app.register_blueprint(interface_bp)
+except Exception as _interface_err:
+    logging.warning("Interface package failed to load: %s. "
+                    "Interface endpoints will be unavailable.", _interface_err)
+
 ###############################################################################
 # Redis Cache Setup                                                           #
 ###############################################################################

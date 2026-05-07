@@ -39,14 +39,49 @@ EAC, duration-weighted progress, schedule-delay prediction, and
 time-phased cumulative + period distributions) ported from the JS
 `Reference/EVM.js`; output shape mirrors `window.evmMetrics` so
 downstream consumers (notably `Completionprediction.js` reading
-`.actual.CPIcum`) work unchanged.  Tests: 343 across 7 test files,
-including a JS-vs-Python diff harness
-(`tests/test_evm_diff.py` + `tests/diff_harness/run_js_evm.js`) that
-runs the JS reference implementation under Node.js on shared fixtures
-(basic / complete / overrun / complex / with_holidays) and asserts
-every scalar metric agrees within `1e-6` relative tolerance and
-predicted dates within 24 h, including holiday-skipping via the full
-working-calendar path.
+`.actual.CPIcum`) work unchanged.
+
+`paths/` (9 modules: `__init__`, `_constants`, `routes`, `enumerate`,
+`distances`, `calendar_slack`, `diversity`, `driving_graph`,
+`subpath_patterns`) is a fifth Flask Blueprint serving five POST
+endpoints plus a health check, all ported from `Reference/PathScripts.js`.
+`/paths/enumerate` returns the critical / near-critical path corpus
+(exact DFS for small DAGs, longest-first best-search for large ones,
+with structural-diversity / independence selectors).
+`/paths/driving-graph` returns CPM-derived deterministic driving chains
+with predecessor-ranking explainability.  `/paths/distances` returns
+shortest / longest distance-to-start and -to-end maps.
+`/paths/calendar-slack` projects CPM ES/EF onto ISO dates via the
+working-calendar path.  `/paths/recurring-subpaths` mines contiguous
+"key work glue" corridors that recur across the corpus, anchored at
+outlier nodes in centrality (betweenness, in/out-degree from the
+post-cycle-break DAG) or salience (risk, importance, overrun-
+probability).  Anchor identification uses median + MAD z-scores (with
+mean+stdev fallback when MAD degenerates), candidates are scored by
+`supp + junc + sal − maxpen` with per-node sigma-then-mean for the
+salience component, and a fallback window-scan fires when fewer than
+`fallback_min_anchors` exist or anchor-pair extraction yields nothing.
+
+`interface/` (3 modules: `__init__`, `analytics`, `routes`) is a sixth
+Flask Blueprint serving `/interface/analytics` (boundary-crossing
+intelligence) plus `/interface/health`.  Source-agnostic over Cybereum-
+native `{nodes, links}` payloads regardless of origin (P6 XER, MSP XML,
+native authoring) -- only requires that nodes carry the chosen
+`grouping_field`.  Auto-resolves the grouping field via fallback chain
+`WBS_Path → WBS_Name → WBS → WBS_ID` when omitted.  Returns per-group
+hotspot rows with composite score in `[0, 100]`, cross-group dependency
+matrix, and top-N highest-risk activities per hotspot for downstream
+LLM grounding.  Engine is pure pandas/numpy with no Flask deps;
+re-callable via `compute_interface_analytics`.
+
+Tests: **803 across 9 test files**, including a JS-vs-Python diff
+harness (`tests/test_evm_diff.py` + `tests/diff_harness/run_js_evm.js`,
+plus `tests/test_paths_diff.py` + `tests/diff_harness/run_js_paths.js`)
+that runs the JS reference implementations under Node.js on shared
+fixtures and asserts numerical equivalence within `1e-6` relative
+tolerance.  EVM diff covers basic / complete / overrun / complex /
+with_holidays fixtures with predicted dates within 24 h including
+holiday-skipping via the full working-calendar path.
 
 ## Four Principles
 
@@ -223,16 +258,21 @@ this as the canonical convention across blueprints:
   must accept `Duration` sentinels `('', None, 0, '0')` as `0.0` (matches
   `solver/dag.py::build_dag`, `completion/`, `evm/`).
 
-### Architecture: app.py + solver/ package
+### Architecture: app.py + blueprint packages
 
-Descriptive analytics lives in `app.py` (single file). Prescriptive analytics
-lives in `solver/` (10-module Flask Blueprint). The solver is registered in
-`app.py` via two lines after `CORS(app, ...)`:
+Descriptive analytics lives in `app.py` (single file).  Each prescriptive
+or specialised capability lives in its own Flask Blueprint package
+registered in `app.py` after `CORS(app, ...)` via the same defensive
+`try/except` wrapper:
 
 ```python
 from solver import solver_bp
 app.register_blueprint(solver_bp)
+# ...similarly for completion_bp, evm_bp, paths_bp, interface_bp
 ```
+
+The wrapper logs a warning and continues if a package fails to import,
+so a partial install never knocks the whole service offline.
 
 **`app.py` rules:** Read and understand the relevant functions before editing —
 changes to imports, module-level state, or shared helpers affect the entire
@@ -241,9 +281,47 @@ file.
 **`solver/` rules:** The package has clear module boundaries (models, dag,
 objectives, adjoints, stochastic, optimizer, pareto, analysis, core, routes).
 Changes to shared interfaces (e.g., `DAGState`, `ActivityParams`,
-`compute_gradients` signatures) ripple across modules. The `routes.py` uses
+`compute_gradients` signatures) ripple across modules.  The `routes.py` uses
 a lazy import for caching functions from `app.py` to avoid circular
 dependencies — do not convert this to a top-level import.
+
+**`paths/` rules:** Module boundaries: `routes` (HTTP), `enumerate` (the
+two enumeration strategies + dispatcher), `distances`, `calendar_slack`,
+`diversity` (independence / structural-diversity selectors),
+`driving_graph` (CPM-derived chains + explainability),
+`subpath_patterns` (recurring corridor mining), `_constants`
+(`MAX_NODES = 20_000`, leaf module so `routes.py` and
+`subpath_patterns.py` can both reference it without an import cycle).
+The `routes.py` lazy-imports cache functions from `app.py` for the same
+reason as `solver/`.  `find_all_paths` exposes an opt-in
+`return_internal_state=True` that surfaces the live `DAGState` +
+`id_to_idx` for in-process consumers (used by `subpath_patterns.py` to
+avoid a second `build_dag` call); JSON-emitting callers must leave the
+default `False` to keep the response shape stable.  The truncation
+contract on `paths/enumerate.py` is **load-bearing**:
+`enumerate_all_paths_exact` and `enumerate_longest_paths_first` return
+`(paths, truncated)` tuples; `find_all_paths` surfaces `corpus_truncated`
+as the OR of three independent counters (per-node DFS cap, longest-first
+budget exit + tracker eviction, heap-trim drops).  Don't reintroduce the
+old heuristic (`method == 'longest_first'` or `len(raw) >= max_paths`) —
+it was a false-positive on organic drains and a false-negative on
+small-corpus exhaustive runs.
+
+**`interface/` rules:** Three modules: `routes` (HTTP), `analytics`
+(pandas/numpy engine — no Flask deps), `__init__` (re-exports the
+blueprint plus `InterfaceConfig`, `HotspotWeights`,
+`compute_interface_analytics` so the engine is callable directly without
+HTTP).  Source-agnostic over `{nodes, links}` payloads regardless of
+origin.  `grouping_field` is configurable per request; when omitted the
+engine walks `WBS_Path → WBS_Name → WBS → WBS_ID` and picks the first
+populated field, with a warning on partial population.  Engine returns
+an internal `_hotspot_records` handle that the routes layer uses to
+attach `top_incoming` / `top_outgoing` activity samples to each hotspot
+row — not part of the API surface, do NOT expose it.  Composite hotspot
+score uses min-max normalisation per group; constant or empty series
+score zero (single-bucket schedules report no hotspots rather than
+crash).  `/graph-metrics` and `/interface/analytics` are complementary
+lenses, not competitors — don't fold interface logic into graph-metrics.
 
 ### Multi-Resolution Pipeline
 

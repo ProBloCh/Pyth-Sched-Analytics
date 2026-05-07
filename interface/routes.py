@@ -43,7 +43,7 @@ import hashlib
 import json
 import logging
 import math
-from typing import Any, Dict, List
+from typing import Any
 
 import numpy as np
 from flask import Blueprint, request, jsonify
@@ -166,8 +166,14 @@ def _coerce_weights(raw) -> tuple[HotspotWeights | None, Any]:
                 "w_distinct_succ", "w_risk"):
         if key not in raw:
             continue
+        v_raw = raw[key]
+        # Reject bool -- ``float(True) == 1.0`` would otherwise let
+        # JSON ``true`` slip past type validation as a unit weight.
+        if isinstance(v_raw, bool):
+            return None, (jsonify({
+                "error": f"weights.{key} must be a number (got bool)"}), 400)
         try:
-            v = float(raw[key])
+            v = float(v_raw)
         except (TypeError, ValueError):
             return None, (jsonify({
                 "error": f"weights.{key} must be a number"}), 400)
@@ -179,8 +185,22 @@ def _coerce_weights(raw) -> tuple[HotspotWeights | None, Any]:
 
 
 def _coerce_int(value, default, field, *, min_val=None, max_val=None):
+    """Return ``(int, None)`` or ``(None, jsonify-err)``.
+
+    Mirrors the bool/float guards in paths/routes.py::_coerce_int so
+    JSON ``true`` and ``1.9`` don't silently coerce past type
+    validation.
+    """
     if value is None:
         return default, None
+    # Reject bool first -- isinstance(True, int) is True in Python.
+    if isinstance(value, bool):
+        return None, (jsonify({
+            "error": f"{field} must be an integer (got bool)"}), 400)
+    # Reject float -- int(1.9) silently truncates.
+    if isinstance(value, float):
+        return None, (jsonify({
+            "error": f"{field} must be an integer (got float)"}), 400)
     try:
         v = int(value)
     except (TypeError, ValueError):
@@ -288,6 +308,10 @@ def analytics():
     if get_fn and key is not None:
         cached = get_fn(key)
         if cached is not None:
+            # Copy the dict so the cache_hit mutation can never bleed
+            # back into an in-memory store (Redis returns a fresh dict
+            # on every get; an LRU shim would not).
+            cached = dict(cached)
             cached["cache_hit"] = True
             return jsonify(cached)
 

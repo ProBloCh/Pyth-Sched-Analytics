@@ -238,7 +238,7 @@ class TestEnumerateLongestFirst:
         the critical path first."""
         nodes, links = parallel_schedule
         state, idx = build_dag(nodes, links, default_duration=0.0)
-        paths = enumerate_longest_paths_first(
+        paths, _truncated = enumerate_longest_paths_first(
             state, idx['A'], idx['F'],
             max_paths=10, critical_mask=state.critical_mask,
         )
@@ -255,6 +255,130 @@ class TestEnumerateLongestFirst:
         # B finishes at 7, D (FS) starts at 7, D finishes at 10.
         dur = path_duration(state, (idx['A'], idx['B'], idx['D']))
         assert dur == 10.0
+
+    def test_longest_first_drains_organically(self, parallel_schedule):
+        """When max_paths exceeds the true number of source->sink
+        paths, longest-first must drain the heap and report
+        truncated=False -- the strategy was sampled but the corpus
+        ended up exhaustive (round 14 fix to corpus_truncated)."""
+        nodes, links = parallel_schedule
+        state, idx = build_dag(nodes, links, default_duration=0.0)
+        # Only 4 distinct A->F paths in this fixture; ask for 50.
+        paths, truncated = enumerate_longest_paths_first(
+            state, idx['A'], idx['F'],
+            max_paths=50, critical_mask=state.critical_mask,
+        )
+        assert len(paths) == 4
+        assert truncated is False
+
+    def test_longest_first_truncates_on_budget_exit(self, parallel_schedule):
+        """When the heap is non-empty at exit because the
+        ``max_expansions`` budget ran out, truncated must be True."""
+        nodes, links = parallel_schedule
+        state, idx = build_dag(nodes, links, default_duration=0.0)
+        # Force an immediate budget exit so the heap still has the
+        # initial start_path entry waiting -- no path will ever land
+        # in the tracker.
+        paths, truncated = enumerate_longest_paths_first(
+            state, idx['A'], idx['F'],
+            max_paths=10, critical_mask=state.critical_mask,
+            max_expansions=1,
+        )
+        assert truncated is True
+
+    def test_longest_first_truncates_on_tracker_eviction(
+        self, parallel_schedule,
+    ):
+        """When the Top-K tracker fills and evicts a real completion
+        (or rejects a new completion because the tracker is full of
+        better paths), truncated must be True even though the heap
+        drains organically (Copilot review #604, round 15:
+        enumerate.py:499)."""
+        nodes, links = parallel_schedule
+        state, idx = build_dag(nodes, links, default_duration=0.0)
+        # 4 distinct A->F paths, ask for only 1 -- the tracker evicts
+        # at least once (longer paths displace shorter, or shorter
+        # paths get rejected against the seated longest).
+        paths, truncated = enumerate_longest_paths_first(
+            state, idx['A'], idx['F'],
+            max_paths=1, critical_mask=state.critical_mask,
+        )
+        assert len(paths) == 1
+        assert truncated is True
+
+    def test_longest_first_truncates_on_heap_trim(self):
+        """When the blow-up guard slices frontier states, truncated
+        must be True even when the search ultimately drains the
+        remaining heap (Copilot review #604, round 15:
+        enumerate.py:499)."""
+        # Wide fan-out from a single source so the per-expansion push
+        # rate exceeds 4 * max_paths quickly.  Three layers of fan-out
+        # before sink: many candidate prefixes survive on the heap,
+        # max_paths=2 means heap > 8 forces a trim.
+        nodes = [{'ID': 'S'}]
+        links = []
+        # Layer 1: 30 children of S.
+        for i in range(30):
+            nid = f"L1_{i}"
+            nodes.append({'ID': nid})
+            links.append({'source': 'S', 'target': nid})
+        # Layer 2: each L1 has 3 children that all converge on E.
+        nodes.append({'ID': 'E'})
+        for i in range(30):
+            for j in range(3):
+                mid = f"L2_{i}_{j}"
+                nodes.append({'ID': mid})
+                links.append({'source': f"L1_{i}", 'target': mid})
+                links.append({'source': mid, 'target': 'E'})
+        state, idx = build_dag(nodes, links, default_duration=1.0)
+        paths, truncated = enumerate_longest_paths_first(
+            state, idx['S'], idx['E'],
+            max_paths=2, critical_mask=state.critical_mask,
+        )
+        # 30 * 3 = 90 distinct paths exist; we asked for 2.  Either
+        # the heap-trim or tracker-eviction signal fires (often both).
+        assert truncated is True
+
+    def test_exact_not_truncated_when_capped_at_real_count(
+        self, parallel_schedule,
+    ):
+        """When exact DFS returns exactly max_paths AND no further
+        unique suffixes are pending, the corpus is exhaustive --
+        truncated must be False even though len(out) == max_paths
+        (round 14: was previously a heuristic false-positive)."""
+        nodes, links = parallel_schedule
+        state, idx = build_dag(nodes, links, default_duration=0.0)
+        paths, truncated = enumerate_all_paths_exact(
+            state, idx['A'], idx['F'], max_paths=4,
+        )
+        assert len(paths) == 4
+        assert truncated is False
+
+    def test_exact_truncated_when_below_real_count(self, parallel_schedule):
+        """Exact DFS asked for fewer paths than exist must report
+        truncated=True."""
+        nodes, links = parallel_schedule
+        state, idx = build_dag(nodes, links, default_duration=0.0)
+        paths, truncated = enumerate_all_paths_exact(
+            state, idx['A'], idx['F'], max_paths=2,
+        )
+        assert len(paths) == 2
+        assert truncated is True
+
+    def test_find_all_paths_corpus_truncated_false_on_organic_drain(
+        self, parallel_schedule,
+    ):
+        """Smoke-test the dispatcher's corpus_truncated wiring: a
+        small DAG run through exact DFS that returns the full set
+        should flag corpus_truncated=False, not the previous
+        len(raw) >= max_paths heuristic."""
+        nodes, links = parallel_schedule
+        result = find_all_paths(
+            nodes, links, 'A', 'F', max_paths=4,
+        )
+        assert result['method'] == 'exact'
+        assert len(result['paths']) == 4
+        assert result['corpus_truncated'] is False
 
 
 # =====================================================================
