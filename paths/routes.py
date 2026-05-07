@@ -886,13 +886,15 @@ def recurring_subpaths():
     nodes = data['nodes']
     links = data.get('links', [])
 
-    # Precomputed corpus.  ``paths`` absent (key not in body) means
-    # "enumerate"; ``paths == []`` means "explicit empty corpus" --
-    # those two collapse semantically once both produce an empty
-    # response, but the route must NOT re-enumerate when the caller
-    # explicitly sent an empty list.
-    paths_provided = 'paths' in data
-    paths = data.get('paths') if paths_provided else None
+    # Precomputed corpus.  ``paths`` absent OR explicit ``null`` both
+    # mean "enumerate" (JSON ``null`` is the canonical "no value"
+    # signal; rejecting it as malformed would surprise callers who
+    # build payloads programmatically).  ``paths == []`` is distinct:
+    # it means "explicit empty corpus, do NOT re-enumerate" -- a
+    # caller-controlled no-op rather than an absent field.
+    raw_paths_field = data.get('paths')
+    paths_provided = 'paths' in data and raw_paths_field is not None
+    paths = raw_paths_field if paths_provided else None
 
     # Mutual-exclusion guard: precomputed paths cannot coexist with
     # enumeration kwargs.  Listing the conflicting kwarg names in the
@@ -976,6 +978,16 @@ def recurring_subpaths():
         # descriptive message.
         return jsonify({'error': str(exc)}), 400
 
+    # Pre-normalise path IDs to strings exactly once -- the cache key,
+    # the route's hop-validation block, and the original ``paths`` value
+    # passed downstream all need the same string form.  Doing it once
+    # here is meaningfully faster on large corpora than re-calling
+    # ``str(x)`` per check.
+    norm_paths = (
+        None if paths is None
+        else [[str(x) for x in p] for p in paths]
+    )
+
     # Cache key with id-alias / numeric-ID normalisation.  Equivalent
     # payloads (``{'id': 1}`` vs ``{'ID': '1'}``) must share an entry,
     # otherwise one of the two request shapes always misses the cache
@@ -983,10 +995,6 @@ def recurring_subpaths():
     get_fn, set_fn = _cache()
     key = None
     if get_fn or set_fn:
-        norm_paths = (
-            None if paths is None
-            else [[str(x) for x in p] for p in paths]
-        )
         key = _cache_key('recurring-subpaths', {
             'nodes': [_normalise_node_for_cache(n) for n in nodes],
             'links': [_normalise_link_for_cache(ln) for ln in links],
@@ -1001,7 +1009,10 @@ def recurring_subpaths():
     if get_fn and key is not None:
         cached = get_fn(key)
         if cached is not None:
-            cached = dict(cached)  # don't mutate the cache entry
+            # Copy the dict so the cache_hit mutation can never bleed
+            # back into the in-memory store (Redis returns a fresh
+            # dict on every get; an LRU shim would not).
+            cached = dict(cached)
             cached['cache_hit'] = True
             return jsonify(cached)
 
@@ -1012,7 +1023,7 @@ def recurring_subpaths():
     # corpus before its own build_dag call).
     dag_state = None
     id_to_idx = None
-    if paths_provided and len(paths) > 0:
+    if paths_provided and len(norm_paths) > 0:
         try:
             dag_state, id_to_idx = build_dag(nodes, links, default_duration=0.0)
         except Exception as exc:
@@ -1022,19 +1033,20 @@ def recurring_subpaths():
                 'error': 'Failed to build DAG from nodes/links'}), 500
         idx_to_id = {i: nid for nid, i in id_to_idx.items()}
         known = set(id_to_idx.keys())
-        dag_edges = set()
-        for u in range(dag_state.n):
-            for v in dag_state.succ[u]:
-                dag_edges.add((idx_to_id[u], idx_to_id[int(v)]))
-        for i, p in enumerate(paths):
-            for nid in p:
-                if str(nid) not in known:
+        dag_edges = {
+            (idx_to_id[u], idx_to_id[int(v)])
+            for u in range(dag_state.n)
+            for v in dag_state.succ[u]
+        }
+        for i, sp in enumerate(norm_paths):
+            for nid in sp:
+                if nid not in known:
                     return jsonify({
                         'error': (
                             f'paths[{i}] references unknown node ID: {nid!r}'
                         )}), 400
-            for j in range(len(p) - 1):
-                hop = (str(p[j]), str(p[j + 1]))
+            for j in range(len(sp) - 1):
+                hop = (sp[j], sp[j + 1])
                 if hop not in dag_edges:
                     return jsonify({
                         'error': (
