@@ -3,14 +3,18 @@ paths/routes.py - Flask Blueprint for path analysis services.
 
 Endpoints (mirrors the solver/completion/evm blueprint pattern):
 
-    POST /paths/enumerate      -- enumerate all / longest-first paths
-                                  + structural-diversity / independence filter
-    POST /paths/driving-graph  -- CPM-derived deterministic driving chains
-                                  with predecessor-ranking explainability
-    POST /paths/distances      -- shortest/longest distance-to-start and
-                                  distance-to-end maps
-    POST /paths/calendar-slack -- CPM + calendar-projected ISO dates
-    GET  /paths/health         -- liveness probe
+    POST /paths/enumerate          -- enumerate all / longest-first paths
+                                      + structural-diversity / independence filter
+    POST /paths/driving-graph      -- CPM-derived deterministic driving chains
+                                      with predecessor-ranking explainability
+    POST /paths/distances          -- shortest/longest distance-to-start and
+                                      distance-to-end maps
+    POST /paths/calendar-slack     -- CPM + calendar-projected ISO dates
+    POST /paths/recurring-subpaths -- recurring corridor mining over the
+                                      critical / near-critical corpus,
+                                      anchored at outlier nodes in
+                                      centrality / salience
+    GET  /paths/health             -- liveness probe
 
 All POST endpoints accept the same ``{nodes, links}`` payload shape as
 /solver and /completion.  Extra fields are endpoint-specific (see
