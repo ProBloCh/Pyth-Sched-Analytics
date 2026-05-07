@@ -35,6 +35,7 @@ import numpy as np
 from flask import Blueprint, request, jsonify
 
 from solver.dag import build_dag
+from ._constants import MAX_NODES
 from .distances import distances_to_start, distances_to_end, near_critical_mask
 from .calendar_slack import compute_calendar_slack
 from .enumerate import (
@@ -46,6 +47,7 @@ from .diversity import (
     select_independent_near_critical, select_structurally_diverse,
 )
 from .driving_graph import DrivingGraphConfig, extract_driving_graph
+from .subpath_patterns import SubpathConfig, mine_recurring_subpaths
 
 
 logger = logging.getLogger(__name__)
@@ -58,7 +60,6 @@ paths_bp = Blueprint('paths', __name__, url_prefix='/paths')
 # ---------------------------------------------------------------------------
 
 MAX_PAYLOAD_BYTES = 10 * 1024 * 1024
-MAX_NODES = 20_000
 MAX_LINKS = 100_000
 
 
@@ -193,12 +194,25 @@ def _serialise(obj):
 
 def _coerce_int(value, default, field, min_val=None, max_val=None):
     """Return ``(int, None)`` or ``(None, jsonify-err)``.  Keeps bad client
-    input from turning into a 500."""
+    input from turning into a 500.
+
+    Rejects ``bool`` (``int(True) == 1`` would silently coerce JSON
+    ``true`` past type validation) and ``float`` (``int(1.9) == 1``
+    would silently narrow the documented integer contract).
+    """
     if value is None:
         if default is None:
             return None, None  # treat as "unset" so caller can drop it
         v = default
     else:
+        # Reject bool first -- isinstance(True, int) is True in Python.
+        if isinstance(value, bool):
+            return None, (jsonify({
+                'error': f'{field} must be an integer (got bool)'}), 400)
+        # Reject float -- int(1.9) silently truncates.
+        if isinstance(value, float):
+            return None, (jsonify({
+                'error': f'{field} must be an integer (got float)'}), 400)
         try:
             v = int(value)
         except (TypeError, ValueError):
@@ -219,6 +233,11 @@ def _coerce_float(value, default, field, min_val=None, max_val=None):
             return None, None
         v = default
     else:
+        # Reject bool -- ``float(True) == 1.0`` would otherwise let
+        # JSON ``true`` slip past type validation.
+        if isinstance(value, bool):
+            return None, (jsonify({
+                'error': f'{field} must be a number (got bool)'}), 400)
         try:
             v = float(value)
         except (TypeError, ValueError):
@@ -375,6 +394,19 @@ _DIVERSITY_BOUNDS = {
     'max_per_family': (1, 200),
     'candidate_multiplier': (1, 50),
     'candidate_cap': (1, 50_000),
+}
+
+# Recurring-subpath mining bounds.  Mirrors SubpathConfig.__post_init__
+# in paths/subpath_patterns.py so direct Python callers and HTTP callers
+# reject the same inputs.  Keep the two in sync.
+_SUBPATH_BOUNDS = {
+    'Lmin': (2, MAX_NODES),
+    'Lmax': (2, MAX_NODES),
+    'top_k': (1, 200),
+    'max_anchor_pairs': (1, 200_000),
+    'fallback_min_anchors': (0, 1_000),
+    'anchor_z_threshold': (0.0, 10.0),
+    'fallback_salience_threshold': (-10.0, 10.0),
 }
 
 
@@ -783,6 +815,279 @@ def calendar_slack():
 
 
 # ---------------------------------------------------------------------------
+# POST /paths/recurring-subpaths
+# ---------------------------------------------------------------------------
+
+# Top-level enumeration kwargs that must NOT coexist with a precomputed
+# ``paths`` corpus -- silently ignoring them whenever ``paths`` was set
+# let stale request payloads mine the wrong corpus with a 200 response.
+_ENUMERATION_KWARGS = ('start_id', 'end_id', 'max_paths', 'branch_balanced')
+
+
+def _normalise_id(value):
+    """Coerce a node-ID-shaped value to its canonical string form.
+
+    Cache keys must hash equivalently for equivalent inputs, so int IDs
+    and string IDs need to land on the same key.  ``None`` passes
+    through so callers can distinguish "absent" from "present-as-string".
+    """
+    if value is None:
+        return None
+    return str(value)
+
+
+def _normalise_node_for_cache(n):
+    """Cache-key shape: collapse the ``id`` alias into ``ID`` and coerce
+    ID-typed values to strings so int-IDs and string-IDs hash identically.
+    """
+    out = dict(n)
+    if 'id' in out and 'ID' not in out:
+        out['ID'] = out.pop('id')
+    elif 'id' in out and 'ID' in out:
+        # Both present -- prefer 'ID' but drop the alias from the key.
+        out.pop('id')
+    if 'ID' in out:
+        out['ID'] = _normalise_id(out['ID'])
+    return out
+
+
+def _normalise_link_for_cache(ln):
+    out = dict(ln)
+    if 'source' in out:
+        out['source'] = _normalise_id(out['source'])
+    if 'target' in out:
+        out['target'] = _normalise_id(out['target'])
+    return out
+
+
+@paths_bp.route('/recurring-subpaths', methods=['POST', 'OPTIONS'])
+def recurring_subpaths():
+    """Mine recurring subpaths over the critical / near-critical corpus.
+
+    Request body:
+        {
+          "nodes": [...], "links": [...],
+          "paths":          optional precomputed corpus (list of list of
+                            node IDs; mutually exclusive with the four
+                            enumeration kwargs below),
+          "start_id":       optional, forwarded to find_all_paths,
+          "end_id":         optional, forwarded to find_all_paths,
+          "max_paths":      optional int (1..MAX_PATHS_TO_RETURN),
+          "branch_balanced": optional bool (default False),
+          "config":         optional SubpathConfig overrides.
+        }
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'})
+    data, err = _parse_request()
+    if err:
+        return err
+
+    nodes = data['nodes']
+    links = data.get('links', [])
+
+    # Precomputed corpus.  ``paths`` absent (key not in body) means
+    # "enumerate"; ``paths == []`` means "explicit empty corpus" --
+    # those two collapse semantically once both produce an empty
+    # response, but the route must NOT re-enumerate when the caller
+    # explicitly sent an empty list.
+    paths_provided = 'paths' in data
+    paths = data.get('paths') if paths_provided else None
+
+    # Mutual-exclusion guard: precomputed paths cannot coexist with
+    # enumeration kwargs.  Listing the conflicting kwarg names in the
+    # error helps the caller find the stale field in their payload.
+    if paths_provided:
+        conflicts = [k for k in _ENUMERATION_KWARGS if k in data]
+        if conflicts:
+            return jsonify({'error': (
+                f"'paths' and enumeration kwargs ({', '.join(conflicts)}) "
+                f"are mutually exclusive"
+            )}), 400
+
+    # Top-level paths shape validation.  Runs BEFORE cache-key
+    # normalisation so malformed entries can't alias to a cached valid
+    # request via str() coercion (e.g. ``paths: ['AB']`` would otherwise
+    # hash the same as ``paths: [['A', 'B']]``).
+    if paths_provided:
+        if not isinstance(paths, list):
+            return jsonify({'error': 'paths must be a list'}), 400
+        for i, p in enumerate(paths):
+            if isinstance(p, (str, bytes, bytearray)):
+                return jsonify({
+                    'error': f'paths[{i}] must be a list of node IDs'}), 400
+            if not isinstance(p, list):
+                return jsonify({
+                    'error': f'paths[{i}] must be a list of node IDs'}), 400
+            if len(p) < 2:
+                return jsonify({
+                    'error': f'paths[{i}] must contain at least 2 node IDs'}), 400
+
+    # Top-level max_paths -- bool/float guard via _coerce_int.
+    max_paths, err_ = _coerce_int(
+        data.get('max_paths'), None, 'max_paths',
+        min_val=1, max_val=MAX_PATHS_TO_RETURN,
+    )
+    if err_:
+        return err_
+
+    # Top-level branch_balanced (default False so support counts stay
+    # unbiased; caller can opt back into branch balancing explicitly).
+    branch_balanced, err_ = _coerce_bool(
+        data.get('branch_balanced'), False, 'branch_balanced',
+    )
+    if err_:
+        return err_
+
+    # Config validation.  ``Lmax`` has Optional[int] annotation which
+    # the generic dispatcher doesn't recognise, so coerce it explicitly
+    # before delegating the rest to _coerce_dataclass_overrides.
+    config_raw = data.get('config')
+    if config_raw is not None and not isinstance(config_raw, dict):
+        return jsonify({'error': 'config must be an object'}), 400
+    config_overrides_input = dict(config_raw) if config_raw else {}
+    lmax_provided = 'Lmax' in config_overrides_input
+    lmax_value = None
+    if lmax_provided:
+        lmax_raw = config_overrides_input.pop('Lmax')
+        if lmax_raw is not None:
+            lmax_value, err_ = _coerce_int(
+                lmax_raw, None, 'config.Lmax',
+                min_val=_SUBPATH_BOUNDS['Lmax'][0],
+                max_val=_SUBPATH_BOUNDS['Lmax'][1],
+            )
+            if err_:
+                return err_
+
+    cfg_overrides, err_ = _coerce_dataclass_overrides(
+        config_overrides_input, SubpathConfig, 'config',
+        bounds=_SUBPATH_BOUNDS,
+    )
+    if err_:
+        return err_
+    if lmax_provided:
+        cfg_overrides['Lmax'] = lmax_value
+
+    try:
+        cfg = SubpathConfig(**cfg_overrides)
+    except (ValueError, TypeError) as exc:
+        # Cross-field validation lives in SubpathConfig.__post_init__
+        # (e.g. Lmax >= Lmin).  Surface as 400 with the engine's
+        # descriptive message.
+        return jsonify({'error': str(exc)}), 400
+
+    # Cache key with id-alias / numeric-ID normalisation.  Equivalent
+    # payloads (``{'id': 1}`` vs ``{'ID': '1'}``) must share an entry,
+    # otherwise one of the two request shapes always misses the cache
+    # and re-runs the full mining pipeline.
+    get_fn, set_fn = _cache()
+    key = None
+    if get_fn or set_fn:
+        norm_paths = (
+            None if paths is None
+            else [[str(x) for x in p] for p in paths]
+        )
+        key = _cache_key('recurring-subpaths', {
+            'nodes': [_normalise_node_for_cache(n) for n in nodes],
+            'links': [_normalise_link_for_cache(ln) for ln in links],
+            'paths': norm_paths,
+            'paths_provided': paths_provided,
+            'start_id': _normalise_id(data.get('start_id')),
+            'end_id': _normalise_id(data.get('end_id')),
+            'max_paths': max_paths,
+            'branch_balanced': branch_balanced,
+            'config': cfg_overrides or None,
+        })
+    if get_fn and key is not None:
+        cached = get_fn(key)
+        if cached is not None:
+            cached = dict(cached)  # don't mutate the cache entry
+            cached['cache_hit'] = True
+            return jsonify(cached)
+
+    # Build a DAG once for route-level hop validation when paths are
+    # supplied -- avoids paying the build cost a second time inside
+    # mine_recurring_subpaths via the dag_state passthrough.  Skipped
+    # entirely for empty / absent paths (mine short-circuits on empty
+    # corpus before its own build_dag call).
+    dag_state = None
+    id_to_idx = None
+    if paths_provided and len(paths) > 0:
+        try:
+            dag_state, id_to_idx = build_dag(nodes, links, default_duration=0.0)
+        except Exception as exc:
+            logger.exception(
+                '/paths/recurring-subpaths build_dag failed: %s', exc)
+            return jsonify({
+                'error': 'Failed to build DAG from nodes/links'}), 500
+        idx_to_id = {i: nid for nid, i in id_to_idx.items()}
+        known = set(id_to_idx.keys())
+        dag_edges = set()
+        for u in range(dag_state.n):
+            for v in dag_state.succ[u]:
+                dag_edges.add((idx_to_id[u], idx_to_id[int(v)]))
+        for i, p in enumerate(paths):
+            for nid in p:
+                if str(nid) not in known:
+                    return jsonify({
+                        'error': (
+                            f'paths[{i}] references unknown node ID: {nid!r}'
+                        )}), 400
+            for j in range(len(p) - 1):
+                hop = (str(p[j]), str(p[j + 1]))
+                if hop not in dag_edges:
+                    return jsonify({
+                        'error': (
+                            f'paths[{i}] hop {hop[0]}->{hop[1]} is not a '
+                            f'valid DAG edge (cycle-broken back-edges are '
+                            f'not enumerable)'
+                        )}), 400
+
+    # Enumerate kwargs are forwarded only when the caller didn't supply
+    # a precomputed corpus (mutual-exclusion check above ensures this).
+    enumerate_kwargs = None
+    if not paths_provided:
+        enumerate_kwargs = {'branch_balanced': branch_balanced}
+        if 'start_id' in data:
+            enumerate_kwargs['start_id'] = data['start_id']
+        if 'end_id' in data:
+            enumerate_kwargs['end_id'] = data['end_id']
+        if max_paths is not None:
+            enumerate_kwargs['max_paths'] = max_paths
+
+    try:
+        result = mine_recurring_subpaths(
+            nodes, links,
+            paths=paths,
+            config=cfg,
+            enumerate_kwargs=enumerate_kwargs,
+            dag_state=dag_state,
+            id_to_idx=id_to_idx,
+        )
+    except ValueError as exc:
+        # Engine validation (per-hop, shape) reaching the route is a
+        # safety net -- the route's own validation should have caught
+        # it.  Still surface as 400 with the engine's message.
+        return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        logger.exception('/paths/recurring-subpaths failed: %s', exc)
+        return jsonify({'error': 'Internal recurring-subpaths error'}), 500
+
+    if 'error' in result:
+        # Engine surfaced a client-input error (e.g. start/end not in
+        # schedule via find_all_paths).  Mirror the other paths routes
+        # by returning 400.
+        result['cache_hit'] = False
+        return jsonify(_serialise(result)), 400
+
+    result['cache_hit'] = False
+    payload = _serialise(result)
+    if set_fn and key is not None:
+        set_fn(key, payload)
+    return jsonify(payload)
+
+
+# ---------------------------------------------------------------------------
 # GET /paths/health
 # ---------------------------------------------------------------------------
 
@@ -796,6 +1101,7 @@ def health():
             '/paths/driving-graph',
             '/paths/distances',
             '/paths/calendar-slack',
+            '/paths/recurring-subpaths',
         ],
         'limits': {
             'max_nodes': MAX_NODES,

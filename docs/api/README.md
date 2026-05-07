@@ -26,6 +26,7 @@ from any consumer (MCP, agent, third-party).
 | 9 | "Calibrate the forecast against actual outcomes -- register, report, and look up reference-class priors." | `POST /completion/register-outcome`, `GET /completion/calibration-report`, `GET /completion/reference-classes` | Shipped, unwired (foundation of the recursive self-improvement roadmap) |
 | 10 | "How is cost + schedule actually performing vs plan? CPI/SPI, EAC/ETC/TCPI, Earned Schedule, sector overrun." | `POST /evm/analyze` | Wired (`EVM.js` async wrappers) |
 | 11 | "Which interventions across cost / schedule / risk / resources / quality move the project most? Run sensitivity, optimize, sweep the Pareto frontier -- with hard constraints (`max_makespan`, `max_budget`) under soft-penalty enforcement and stochastic-event entries (Black Swan / Dragon King / SRA / cost-schedule joint)." | `POST /solver/sensitivity`, `POST /solver/optimize`, `POST /solver/pareto` | Shipped, unwired |
+| 12 | "Which group boundaries (WBS / Contract / Phase / Asset / Discipline / Location / custom field) are the hottest sources of cross-cutting risk?" | `POST /interface/analytics` | Wired (LLM consumer: `OpenAIController.GenerateInterfaceRecoveryBoard`); JS wrapper `InterfaceHotspots.js` exists, not yet surfaced in views |
 
 ## Endpoints
 
@@ -42,10 +43,12 @@ from any consumer (MCP, agent, third-party).
 | `/completion/calibration-report` | GET | [completion.md](completion.md#get-completioncalibration-report) | Aggregate accumulated outcomes into per-class calibration ratios + advisories |
 | `/evm/analyze` | POST | [evm.md](evm.md#post-evmanalyze) | EVM analysis: CPI/SPI/EAC + time-phased distributions |
 | `/paths/recurring-subpaths` | POST | [paths.md](paths.md#post-pathsrecurring-subpaths) | Recurring-subpath ("key work glue") mining over the critical / near-critical corpus |
+| `/interface/analytics` | POST | [interface.md](interface.md#post-interfaceanalytics) | Boundary-crossing hotspots + cross-group dependency matrix; configurable grouping (WBS, Contract, Phase, Asset, Discipline, ...) |
 | `/health` | GET | [health.md](health.md#get-health) | Main app health check |
 | `/solver/health` | GET | [health.md](health.md#get-solverhealth) | Solver module health check |
 | `/completion/health` | GET | [completion.md](completion.md#get-completionhealth) | Completion module health check |
 | `/evm/health` | GET | [evm.md](evm.md#get-evmhealth) | EVM module health check |
+| `/interface/health` | GET | [interface.md](interface.md#get-interfacehealth) | Interface module health check |
 
 ## API Stability Rules
 
