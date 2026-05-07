@@ -163,7 +163,7 @@ def enumerate_all_paths_exact(
     start_idx: int,
     end_idx: int,
     max_paths: int = MAX_PATHS_TO_RETURN,
-) -> List[Tuple[int, ...]]:
+) -> Tuple[List[Tuple[int, ...]], bool]:
     """
     Enumerate every path from start to end via DFS with suffix memoisation.
 
@@ -171,16 +171,24 @@ def enumerate_all_paths_exact(
     node and ending at ``end_idx``.  Memoising per start-node lets
     shared tails be built once, not per prefix.
 
-    Returns paths as tuples of int indices (hashable for de-dup by caller).
-    The recursion skips ``visited`` nodes to keep the JS parity --
-    DAGs can't cycle, but disconnected sub-DAGs produced by the cycle
-    breaker can re-enter a node along an alias; guarding is cheap.
+    Returns ``(paths, truncated)``: paths as tuples of int indices
+    (hashable for de-dup by caller), and a bool that is True only when
+    enumeration actually stopped early -- either the per-node
+    ``MAX_PATHS_PER_NODE`` cap fired during DFS, or the final cap to
+    ``max_paths`` left additional unique paths un-emitted.  Hitting
+    ``max_paths`` exactly with no further suffixes available is
+    exhaustive and reports ``truncated=False``.
     """
     if state.n == 0 or start_idx < 0 or end_idx < 0:
-        return []
+        return [], False
 
     succ = state.succ
     memo: Dict[int, List[Tuple[int, ...]]] = {}
+    # Set to True the moment any per-node accumulator hits
+    # MAX_PATHS_PER_NODE -- at that point we've abandoned suffixes
+    # we would otherwise have emitted, so the corpus is no longer
+    # exhaustive.
+    cap_fired = [False]
 
     # Iterative DFS with explicit stack -- Python recursion tops out
     # around 1,000 frames and real schedules comfortably exceed that.
@@ -210,6 +218,7 @@ def enumerate_all_paths_exact(
                 if nbr == end_idx:
                     acc.append((node, end_idx))
                     if len(acc) >= MAX_PATHS_PER_NODE:
+                        cap_fired[0] = True
                         break
                     continue
                 if nbr in path_set:
@@ -218,6 +227,7 @@ def enumerate_all_paths_exact(
                     for suf in memo[nbr]:
                         acc.append((node,) + suf)
                         if len(acc) >= MAX_PATHS_PER_NODE:
+                            cap_fired[0] = True
                             break
                     if len(acc) >= MAX_PATHS_PER_NODE:
                         break
@@ -241,6 +251,7 @@ def enumerate_all_paths_exact(
                 for suf in acc:
                     pacc.append((parent,) + suf)
                     if len(pacc) >= MAX_PATHS_PER_NODE:
+                        cap_fired[0] = True
                         break
                 stack[-1] = (parent, pci, pacc)
 
@@ -248,16 +259,21 @@ def enumerate_all_paths_exact(
 
     all_suffixes = dfs(start_idx)
     # De-dup and cap to max_paths.  Suffixes are already tuples so set-ok.
+    # Track whether we *stopped* before consuming all unique suffixes --
+    # hitting max_paths exactly with no leftover paths is exhaustive.
     seen = set()
     out: List[Tuple[int, ...]] = []
+    final_cap_fired = False
     for p in all_suffixes:
         if p in seen:
             continue
+        if len(out) >= max_paths:
+            final_cap_fired = True
+            break
         seen.add(p)
         out.append(p)
-        if len(out) >= max_paths:
-            break
-    return out
+    truncated = cap_fired[0] or final_cap_fired
+    return out, truncated
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +283,7 @@ def enumerate_all_paths_exact(
 class _PathTracker:
     """Top-K longest paths via min-heap eviction.  Matches JS PathTracker."""
 
-    __slots__ = ('max_paths', 'paths', '_heap', '_counter')
+    __slots__ = ('max_paths', 'paths', '_heap', '_counter', 'dropped')
 
     def __init__(self, max_paths: int):
         self.max_paths = max_paths
@@ -276,6 +292,14 @@ class _PathTracker:
         # ordering when durations tie.
         self._heap: List[Tuple[float, int, Tuple[int, ...]]] = []
         self._counter = 0
+        # Count of *real* path drops -- either we evicted an existing
+        # tracked completion to make room for a longer one, or we
+        # rejected the new completion because the tracker was already
+        # full of better candidates.  Duplicate-add skips do NOT count
+        # (same path, no information lost).  Read by
+        # ``enumerate_longest_paths_first`` to set the truncation
+        # signal even when the heap drains.
+        self.dropped = 0
 
     def __len__(self):
         return len(self.paths)
@@ -297,9 +321,14 @@ class _PathTracker:
             if self._heap:
                 min_dur, _ct, min_sig = self._heap[0]
                 if duration <= min_dur:
+                    # New candidate rejected -- a real completion path
+                    # the search would otherwise have surfaced.
+                    self.dropped += 1
                     return False
                 heapq.heappop(self._heap)
                 self.paths.pop(min_sig, None)
+                # Old completion evicted in favour of the new one.
+                self.dropped += 1
         self.paths[path] = duration
         self._counter += 1
         heapq.heappush(self._heap, (duration, self._counter, path))
@@ -325,7 +354,7 @@ def enumerate_longest_paths_first(
     critical_mask: Optional[np.ndarray] = None,
     branch_balanced: bool = True,
     max_expansions: int = DEFAULT_MAX_EXPANSIONS,
-) -> List[Tuple[int, ...]]:
+) -> Tuple[List[Tuple[int, ...]], bool]:
     """
     Best-first search ordered by estimated duration.
 
@@ -339,9 +368,29 @@ def enumerate_longest_paths_first(
     ``_BRANCH_MAX_PER`` states in flight, further pushes on that branch
     get their priority multiplied by ``_BRANCH_PENALTY`` to keep sibling
     branches competitive.
+
+    Returns ``(paths, truncated)``.  ``truncated`` is True when any of
+    the three sampling events fired during the search:
+
+    * **Budget exit.**  The loop exited with the heap non-empty
+      because the no-improvement counter (``no_improvement_cap``) or
+      the global ``max_expansions`` cap fired.
+    * **Tracker eviction or rejection.**  The Top-K tracker dropped a
+      real completion path -- either evicting an existing tracked
+      path in favour of a longer one, or rejecting the new candidate
+      because the tracker was already full of better paths.  Both
+      mean a viable end-to-end path was reached but not returned.
+    * **Heap trim.**  The blow-up guard (``len(heap) > max_paths * 4``)
+      sliced frontier states out of the priority queue.  Dropped
+      states could have completed into real paths that the search now
+      will never explore.
+
+    A graph whose heap drains organically with no eviction and no
+    trim (e.g. a single-branch DAG with one path to the end) reports
+    ``truncated=False`` even on the longest-first strategy.
     """
     if state.n == 0 or start_idx < 0 or end_idx < 0:
-        return []
+        return [], False
 
     if critical_mask is None:
         critical_mask = state.critical_mask
@@ -408,6 +457,18 @@ def enumerate_longest_paths_first(
     no_improvement_cap = 2000
     expansions_since_improve = 0
 
+    # Three independent truncation events feed the returned signal:
+    #   - budget_exit: loop exited with the heap non-empty because the
+    #     no-improvement counter or max_expansions cap fired.
+    #   - tracker.dropped: a completion path was evicted to make room
+    #     for a longer one, OR a completion was rejected because the
+    #     tracker was already full of better candidates.
+    #   - heap_trim_dropped: the blow-up guard sliced frontier states
+    #     out of the heap.  Each dropped state could have produced a
+    #     real path that we never expanded.
+    # All three indicate the returned corpus is a sample, not exhaustive.
+    budget_exit = False
+    heap_trim_dropped = 0
     while heap and expansions < max_expansions:
         _pe, _pc, _pl, _ct, path, est, crit = heapq.heappop(heap)
         _branch_dec(path)
@@ -415,6 +476,7 @@ def enumerate_longest_paths_first(
         if tracker.is_full():
             expansions_since_improve += 1
             if expansions_since_improve >= no_improvement_cap:
+                budget_exit = True
                 break
 
         # Skip memoised if we've seen this exact path with >= est.
@@ -452,17 +514,30 @@ def enumerate_longest_paths_first(
         # Trim: heap blow-up guard (JS line 3472).  Re-derive branch_counts
         # from survivors so penalties don't count dropped states.
         if len(heap) > max_paths * 4:
+            before = len(heap)
             heap.sort()
             del heap[max_paths * 2:]
             heapq.heapify(heap)
+            heap_trim_dropped += before - len(heap)
             branch_counts.clear()
             for entry in heap:
                 _branch_inc(entry[4])
 
+    # If we exited the loop because expansions hit max_expansions while
+    # the heap was non-empty, that's also a budget-cap exit.
+    if heap and expansions >= max_expansions:
+        budget_exit = True
+
+    truncated = (
+        budget_exit
+        or tracker.dropped > 0
+        or heap_trim_dropped > 0
+    )
+
     # Sort results by duration desc; tie-break by path length.
     items = tracker.items()
     items.sort(key=lambda kv: (-kv[1], len(kv[0])))
-    return [p for p, _d in items]
+    return [p for p, _d in items], truncated
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +554,7 @@ def find_all_paths(
     link_threshold: int = LINK_THRESHOLD,
     include_durations: bool = True,
     branch_balanced: bool = True,
+    return_internal_state: bool = False,
 ) -> dict:
     """
     Enumerate paths from ``start_id`` to ``end_id``.
@@ -487,8 +563,38 @@ def find_all_paths(
     matching JS ``findAllPaths``.  Returns paths as lists of node IDs
     (strings) so the API shape stays consumer-friendly.
 
-    Returns ``{'paths': [...], 'durations': [...], 'method': 'exact'|'longest_first',
-               'raw_path_count': int, 'start_id': str, 'end_id': str}``.
+    Returns a dict with keys:
+      ``paths``            : list of paths, each a list of node-ID strings
+      ``durations``        : per-path durations (when ``include_durations``)
+      ``method``           : 'exact' | 'longest_first' | 'none'
+      ``raw_path_count``   : int -- count of paths the chosen strategy
+                             produced (post-cap, pre-trim).
+      ``corpus_truncated`` : bool -- True only when enumeration
+                             actually dropped paths.  For exact DFS:
+                             a per-node ``MAX_PATHS_PER_NODE`` cap
+                             fired during DFS, or the final
+                             ``max_paths`` cut left additional unique
+                             paths un-emitted.  For longest-first:
+                             the heap exited non-empty due to a
+                             budget cap, OR the Top-K tracker
+                             evicted/rejected a real completion
+                             path, OR the heap-trim guard sliced
+                             frontier states.  A graph that drains
+                             organically with no drops (e.g. a
+                             single-branch DAG) reports ``False``
+                             regardless of strategy.  Callers running
+                             frequency-style metrics over the result
+                             should treat True as sampling-dependent.
+      ``start_id``, ``end_id`` : the resolved boundary IDs (as strings).
+      ``makespan_hours``   : float, project finish in hours.
+      ``_dag_state``, ``_id_to_idx`` : present ONLY when called with
+                             ``return_internal_state=True``.  Live
+                             ``DAGState`` + index map -- non-serialisable
+                             and heavy.  Intended as a private reuse hint
+                             for in-process consumers (e.g. a follow-up
+                             metric pass that would otherwise rebuild
+                             the same DAG); JSON-emitting callers should
+                             leave the default ``False``.
     """
     state, id_to_idx = build_dag(nodes, links, default_duration=0.0)
     s = str(start_id)
@@ -515,10 +621,12 @@ def find_all_paths(
     is_large = (state.n > node_threshold) or (len(links) > link_threshold)
 
     if not is_large:
-        raw = enumerate_all_paths_exact(state, start_idx, end_idx, max_paths)
+        raw, enum_truncated = enumerate_all_paths_exact(
+            state, start_idx, end_idx, max_paths,
+        )
         method = 'exact'
     else:
-        raw = enumerate_longest_paths_first(
+        raw, enum_truncated = enumerate_longest_paths_first(
             state, start_idx, end_idx,
             max_paths=max_paths,
             branch_balanced=branch_balanced,
@@ -539,12 +647,33 @@ def find_all_paths(
         path_ids = [path_ids[i] for i in order]
         durations = [durations[i] for i in order]
 
-    return {
+    # ``corpus_truncated`` reflects whether enumeration *actually*
+    # stopped early.  For exact DFS that means a per-node
+    # ``MAX_PATHS_PER_NODE`` cap fired or the final ``max_paths``
+    # cut left additional unique paths un-emitted.  For longest-first
+    # that means the heap still had candidates when expansions hit the
+    # no-improvement / max_expansions budget.  A single-branch DAG
+    # whose only path is enumerated and the heap drains organically
+    # reports ``truncated=False`` even on the longest-first strategy,
+    # and an exact DFS that returns exactly ``max_paths`` when only
+    # ``max_paths`` real paths exist also reports ``False``.
+    corpus_truncated = bool(enum_truncated)
+    out = {
         'paths': path_ids,
         'durations': durations,
         'method': method,
         'raw_path_count': len(raw),
+        'corpus_truncated': corpus_truncated,
         'start_id': s,
         'end_id': e,
         'makespan_hours': float(state.makespan),
     }
+    # Live DAG state is heavy and non-JSON-serialisable.  Expose it
+    # only when the caller explicitly opts in via
+    # ``return_internal_state=True`` -- otherwise existing Python
+    # callers that forward / cache the whole result wouldn't be
+    # surprised by the round-10 perf hint (Copilot review #604).
+    if return_internal_state:
+        out['_dag_state'] = state
+        out['_id_to_idx'] = id_to_idx
+    return out
