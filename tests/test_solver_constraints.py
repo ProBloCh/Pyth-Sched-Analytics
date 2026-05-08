@@ -149,3 +149,92 @@ def test_no_constraints_with_flag_returns_200(client):
     assert resp.status_code == 200
     body = resp.get_json()
     assert body.get('constraints') is None
+
+
+# ---------------------------------------------------------------------------
+# Symmetric coverage: max_budget violations should behave like max_makespan
+# ---------------------------------------------------------------------------
+
+def _budget_violating_payload(extra_constraints=None):
+    """Same chain as _violating_payload but the bound that fails is
+    cost-side -- the resource_count * resource_rate * duration term
+    integrates to ~33000, so we cap budget at 100 to guarantee a
+    violation regardless of how the optimiser crashes durations."""
+    constraints = {"max_budget": 100.0}
+    if extra_constraints:
+        constraints.update(extra_constraints)
+    return {
+        "nodes": [
+            {"ID": "0", "Duration": 0},
+            {"ID": "1", "Duration": 10},
+            {"ID": "2", "Duration": 15},
+            {"ID": "3", "Duration": 8},
+        ],
+        "links": [
+            {"source": "0", "target": "1"},
+            {"source": "1", "target": "2"},
+            {"source": "2", "target": "3"},
+        ],
+        "solver_config": {"max_iterations": 5},
+        "activity_metadata": {
+            "1": {"baseline_cost": 10000, "resource_count": 5,
+                  "resource_rate": 100},
+            "2": {"baseline_cost": 15000, "resource_count": 5,
+                  "resource_rate": 100},
+            "3": {"baseline_cost": 8000, "resource_count": 5,
+                  "resource_rate": 100},
+        },
+        "project_context": {"constraints": constraints},
+    }
+
+
+def test_optimize_budget_violation_with_flag_returns_409(client):
+    resp = client.post(
+        '/solver/optimize',
+        json=_budget_violating_payload({'fail_on_violation': True}),
+    )
+    assert resp.status_code == 409
+    body = resp.get_json()
+    assert body['error'] == 'constraint_violation'
+    assert 'max_budget' in body['violated']
+    assert body['constraints']['max_budget']['satisfied'] is False
+
+
+def test_optimize_budget_violation_without_flag_returns_200(client):
+    resp = client.post('/solver/optimize',
+                       json=_budget_violating_payload())
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body['constraints']['max_budget']['satisfied'] is False
+
+
+# ---------------------------------------------------------------------------
+# Multi-violation determinism: ``violated`` must sort alphabetically
+# ---------------------------------------------------------------------------
+
+def test_multi_violation_409_sorts_violated_alphabetically(client):
+    """When both bounds fail, ``violated`` is sorted so consumers can
+    rely on stable iteration order across cached and fresh responses."""
+    payload = {
+        "nodes": [
+            {"ID": "0", "Duration": 0},
+            {"ID": "1", "Duration": 100},
+        ],
+        "links": [{"source": "0", "target": "1"}],
+        "solver_config": {"max_iterations": 5},
+        "activity_metadata": {
+            "1": {"baseline_cost": 1000000, "resource_count": 5,
+                  "resource_rate": 100},
+        },
+        "project_context": {
+            "constraints": {
+                "max_makespan": 10.0,
+                "max_budget": 100.0,
+                "fail_on_violation": True,
+            },
+        },
+    }
+    resp = client.post('/solver/optimize', json=payload)
+    assert resp.status_code == 409
+    body = resp.get_json()
+    assert body['violated'] == ['max_budget', 'max_makespan']

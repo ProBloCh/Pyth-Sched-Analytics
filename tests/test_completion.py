@@ -1348,6 +1348,163 @@ class TestCalibrationHitRates:
         assert not any('overconfident' in n for n in report['notes']), \
             report['notes']
 
+    def test_actual_exactly_on_p80_counts_as_hit(self, client):
+        """Project that finishes exactly on its predicted P80 day must
+        count as a hit (the percentile band is closed-upper, ``<=``)."""
+        cls = f'{self._CLASS}_eq'
+        payload = self._payload(0, '2026-12-01', {'p80_finish': '2026-12-01'})
+        payload['reference_class'] = cls
+        payload['project_id'] = f'PR22-{cls}-0'
+        client.post('/completion/register-outcome', json=payload)
+        report = client.get(
+            f'/completion/calibration-report?reference_class={cls}'
+        ).get_json()
+        rates = report['by_class'][cls]['hit_rates']
+        assert rates['p80']['hits'] == 1
+        assert rates['p80']['n'] == 1
+
+    def test_p80_advisory_uses_strict_inequality_at_lower_bound(self, client):
+        """rate == 0.70 must NOT fire the overconfident advisory.  The
+        check is strict ``<`` so a customer just inside the band stays
+        silent; tests one side of the boundary so a future relaxation
+        to ``<=`` is caught here."""
+        cls = f'{self._CLASS}_strict_low'
+        # 30 records, 21 hits -> rate exactly 0.70
+        for i in range(30):
+            actual = '2026-11-01' if i < 21 else '2027-02-01'
+            payload = self._payload(i, actual, {'p80_finish': '2026-12-01'})
+            payload['reference_class'] = cls
+            payload['project_id'] = f'PR22-{cls}-{i}'
+            client.post('/completion/register-outcome', json=payload)
+
+        report = client.get(
+            f'/completion/calibration-report?reference_class={cls}'
+        ).get_json()
+        rates = report['by_class'][cls]['hit_rates']
+        assert rates['p80']['rate'] == pytest.approx(0.7)
+        assert not any('overconfident' in n for n in report['notes']), \
+            report['notes']
+
+    def test_p80_advisory_uses_strict_inequality_at_upper_bound(self, client):
+        """rate == 0.90 must NOT fire the over-conservative advisory."""
+        cls = f'{self._CLASS}_strict_high'
+        # 30 records, 27 hits -> rate exactly 0.90
+        for i in range(30):
+            actual = '2026-11-01' if i < 27 else '2027-02-01'
+            payload = self._payload(i, actual, {'p80_finish': '2026-12-01'})
+            payload['reference_class'] = cls
+            payload['project_id'] = f'PR22-{cls}-{i}'
+            client.post('/completion/register-outcome', json=payload)
+
+        report = client.get(
+            f'/completion/calibration-report?reference_class={cls}'
+        ).get_json()
+        rates = report['by_class'][cls]['hit_rates']
+        assert rates['p80']['rate'] == pytest.approx(0.9)
+        assert not any('over-conservative' in n for n in report['notes']), \
+            report['notes']
+
+    def test_mixed_percentile_records_have_independent_n(self, client):
+        """Two records: one carries the full p50/p80/p95 band, the
+        other carries only the required p80.  Each percentile counter
+        must reflect ONLY the records that supplied that percentile --
+        a missing field never inflates another percentile's n.
+
+        (``p80_finish`` is required by ``validate_outcome``, so the
+        narrowest record still carries it; the test exercises the
+        independence of p50 and p95 from p80's count.)
+        """
+        cls = f'{self._CLASS}_mixed'
+        # Record 0: full band.
+        p1 = {
+            'project_id': f'PR22-{cls}-0',
+            'reference_class': cls,
+            'predicted': {
+                'baseline_finish': '2026-06-01T00:00:00Z',
+                'p50_finish': '2026-09-01T00:00:00Z',
+                'p80_finish': '2026-12-01T00:00:00Z',
+                'p95_finish': '2027-03-01T00:00:00Z',
+            },
+            'actual': {'finish': '2026-08-01T00:00:00Z'},  # hits p50, p80, p95
+        }
+        # Record 1: only p80_finish (the minimum required band).
+        p2 = {
+            'project_id': f'PR22-{cls}-1',
+            'reference_class': cls,
+            'predicted': {
+                'baseline_finish': '2026-06-01T00:00:00Z',
+                'p80_finish': '2026-12-01T00:00:00Z',
+            },
+            'actual': {'finish': '2026-11-01T00:00:00Z'},  # hits p80
+        }
+        client.post('/completion/register-outcome', json=p1)
+        client.post('/completion/register-outcome', json=p2)
+        report = client.get(
+            f'/completion/calibration-report?reference_class={cls}'
+        ).get_json()
+        rates = report['by_class'][cls]['hit_rates']
+        # p80 counts BOTH records.
+        assert rates['p80']['n'] == 2, rates
+        assert rates['p80']['hits'] == 2
+        # p50 and p95 count only Record 0.
+        assert rates['p50']['n'] == 1, rates
+        assert rates['p95']['n'] == 1, rates
+        # p10 / p20 are not present in either record -> absent.
+        assert 'p10' not in rates and 'p20' not in rates
+
+    def test_baseline_only_record_creates_no_hit_rates(self, client):
+        """A record with neither p50/p80/p95 should not appear under
+        hit_rates at all (only the overrun-ratio path is exercised --
+        and even that needs a P80 anchor, so this record contributes
+        nothing).  Catches an off-by-one where an empty predicted
+        block could create a class entry with empty hit_rates."""
+        cls = f'{self._CLASS}_baseline_only'
+        p = {
+            'project_id': f'PR22-{cls}-0',
+            'reference_class': cls,
+            'predicted': {
+                'baseline_finish': '2026-06-01T00:00:00Z',
+                # P80 still required by validate_outcome, so we must
+                # include it -- but record a baseline-aligned P80 so
+                # the overrun-ratio path is degenerate.
+                'p80_finish': '2026-06-01T00:00:00Z',
+            },
+            'actual': {'finish': '2026-06-01T00:00:00Z'},
+        }
+        client.post('/completion/register-outcome', json=p)
+        report = client.get(
+            f'/completion/calibration-report?reference_class={cls}'
+        ).get_json()
+        # P80 still recorded (has the field); but P10/P20/P50/P95 are
+        # absent.
+        rates = report['by_class'][cls].get('hit_rates', {})
+        assert set(rates.keys()) == {'p80'}, rates
+
+    def test_hit_rates_isolated_per_reference_class(self, client):
+        """Multiple reference classes must each have their own
+        hit_rates block; a P80 hit in class A must not appear in class
+        B's counters."""
+        cls_a = f'{self._CLASS}_iso_a'
+        cls_b = f'{self._CLASS}_iso_b'
+        # Class A: 1 hit (actual before p80).
+        pa = self._payload(0, '2026-11-01', {'p80_finish': '2026-12-01'})
+        pa['reference_class'] = cls_a
+        pa['project_id'] = f'PR22-{cls_a}-0'
+        client.post('/completion/register-outcome', json=pa)
+        # Class B: 1 miss (actual after p80).
+        pb = self._payload(0, '2027-02-01', {'p80_finish': '2026-12-01'})
+        pb['reference_class'] = cls_b
+        pb['project_id'] = f'PR22-{cls_b}-0'
+        client.post('/completion/register-outcome', json=pb)
+
+        # Ask for the full report (no class filter); each class
+        # carries its own counters.
+        report = client.get('/completion/calibration-report').get_json()
+        assert report['by_class'][cls_a]['hit_rates']['p80']['hits'] == 1
+        assert report['by_class'][cls_b]['hit_rates']['p80']['hits'] == 0
+        assert report['by_class'][cls_a]['hit_rates']['p80']['n'] == 1
+        assert report['by_class'][cls_b]['hit_rates']['p80']['n'] == 1
+
     def test_p80_well_calibrated_no_warning(self, client):
         # 30 records, 24 hit before P80 (80 %) -- spot on the expected
         # rate, no warning either side.

@@ -112,3 +112,83 @@ def test_options_preflight_bypasses_auth(auth_client):
     """CORS preflight must reach Flask-CORS without an API key."""
     resp = auth_client.options(PROTECTED_ENDPOINT)
     assert resp.status_code in (200, 204), resp.status_code
+
+
+# ---------------------------------------------------------------------------
+# CORS allowlist actually filters the cross-origin headers.  Without
+# this guard, a future regression that re-introduced wildcard CORS
+# would only show up in production.
+#
+# CORS resolution happens at app import time (flask-cors reads the
+# resources= dict once).  We reload the app module under the relevant
+# env to exercise each branch.
+# ---------------------------------------------------------------------------
+
+def _reload_app_with_cors(monkeypatch, value):
+    """Reload ``app`` so CORS picks up the new PYTH_CORS_ORIGINS."""
+    import importlib
+
+    import app as app_mod
+    monkeypatch.setenv('PYTH_AUTH_DISABLED', 'true')
+    monkeypatch.setenv('PYTH_CORS_ORIGINS', value)
+    importlib.reload(app_mod)
+    app_mod.app.config['TESTING'] = True
+    return app_mod.app.test_client()
+
+
+def test_cors_allowlist_admits_listed_origin(monkeypatch):
+    client = _reload_app_with_cors(monkeypatch, 'https://app.example.com')
+    resp = client.options(
+        PROTECTED_ENDPOINT,
+        headers={
+            'Origin': 'https://app.example.com',
+            'Access-Control-Request-Method': 'POST',
+        },
+    )
+    assert resp.headers.get('Access-Control-Allow-Origin') == 'https://app.example.com'
+
+
+def test_cors_allowlist_rejects_unlisted_origin(monkeypatch):
+    client = _reload_app_with_cors(monkeypatch, 'https://app.example.com')
+    resp = client.options(
+        PROTECTED_ENDPOINT,
+        headers={
+            'Origin': 'https://evil.example.com',
+            'Access-Control-Request-Method': 'POST',
+        },
+    )
+    # No ACAO header for an origin outside the allowlist; the browser
+    # will treat this as a cross-origin failure and refuse the
+    # follow-up POST.
+    assert resp.headers.get('Access-Control-Allow-Origin') is None
+
+
+def test_cors_empty_allowlist_blocks_all_cross_origin(monkeypatch):
+    """PYTH_CORS_ORIGINS unset -> same-origin only.  No browser
+    cross-origin request gets the allow header."""
+    client = _reload_app_with_cors(monkeypatch, '')
+    resp = client.options(
+        PROTECTED_ENDPOINT,
+        headers={
+            'Origin': 'https://anywhere.example.com',
+            'Access-Control-Request-Method': 'POST',
+        },
+    )
+    assert resp.headers.get('Access-Control-Allow-Origin') is None
+
+
+def test_cors_wildcard_opt_in(monkeypatch):
+    """Literal '*' is the explicit dev opt-in -- regression guard so a
+    future refactor doesn't accidentally drop the ability to set it."""
+    client = _reload_app_with_cors(monkeypatch, '*')
+    resp = client.options(
+        PROTECTED_ENDPOINT,
+        headers={
+            'Origin': 'https://anywhere.example.com',
+            'Access-Control-Request-Method': 'POST',
+        },
+    )
+    # flask-cors reflects the request origin or returns '*' depending
+    # on configuration; either is a successful wildcard allow.
+    acao = resp.headers.get('Access-Control-Allow-Origin')
+    assert acao in ('*', 'https://anywhere.example.com'), acao
