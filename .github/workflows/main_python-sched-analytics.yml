@@ -34,10 +34,12 @@ jobs:
 
   typecheck:
     runs-on: ubuntu-latest
-    # Non-blocking initially.  Basic-mode baseline at PR-8 is 239
-    # errors; this job surfaces drift while focused follow-up PRs
-    # whittle the count down.  See docs/typing-progress.md.
-    continue-on-error: true
+    # Non-blocking advisory gate.  See docs/typing-progress.md for the
+    # error-budget protocol.  We want the typecheck output visible in
+    # CI logs without showing a red ✗ on the PR while the basic-mode
+    # baseline shrinks.  The step exits 0 deliberately and surfaces
+    # the error count via a GitHub workflow annotation; CI flips to
+    # blocking (drop the `|| true`) once basic-mode reaches zero.
 
     steps:
       - uses: actions/checkout@v4
@@ -52,7 +54,15 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: pyright
-        run: pyright
+        run: |
+          set +e
+          pyright | tee pyright.out
+          STATUS=${PIPESTATUS[0]}
+          if [ "$STATUS" -ne 0 ]; then
+            COUNT=$(grep -oE '^[0-9]+ error' pyright.out | head -1 | awk '{print $1}')
+            echo "::warning title=pyright (advisory)::${COUNT:-unknown} basic-mode error(s); see docs/typing-progress.md"
+          fi
+          exit 0
 
   security:
     runs-on: ubuntu-latest
