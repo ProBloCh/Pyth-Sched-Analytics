@@ -98,3 +98,47 @@ known-first-party = [
 [tool.bandit]
 exclude_dirs = ["tests", "Reference", ".venv", "venv"]
 skips = []  # No blanket skips -- annotate with `# nosec <code>` instead.
+
+# -----------------------------------------------------------------------------
+# Coverage
+# -----------------------------------------------------------------------------
+# CI runs `pytest --cov`; fail_under (below) gates merge.  Baseline as
+# of PR-7 is 84 % across production source only (8_273 statements,
+# 1_338 missed; tests excluded so the number reflects how well tests
+# cover the app rather than themselves).  Threshold is held one point
+# below to absorb routine refactors without ratcheting downward
+# unnoticed.  Bump protocol: any PR that raises coverage may also
+# raise `fail_under` by the floor of the new percentage minus one.
+# Lowering the threshold requires an explicit justification in the PR
+# description.
+# -----------------------------------------------------------------------------
+
+[tool.coverage.run]
+source = [
+    "app",
+    "auth",
+    "_cache_version",
+    "multi_resolution_pipeline",
+    "solver",
+    "completion",
+    "evm",
+    "paths",
+    "interface",
+]
+omit = [
+    "tests/*",
+    "Reference/*",
+    ".venv/*",
+    "venv/*",
+]
+
+[tool.coverage.report]
+fail_under = 83
+show_missing = false
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

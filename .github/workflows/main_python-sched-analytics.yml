@@ -88,12 +88,22 @@ jobs:
       - name: Install dependencies
         run: |
           source venv/bin/activate
-          pip install -r requirements.txt
+          pip install -r requirements.txt -r requirements-dev.txt
 
-      - name: Run tests
+      - name: Run tests with coverage
+        # --cov-fail-under is read from pyproject.toml [tool.coverage.report].
+        # See docs/roadmap-to-10.md PR-7 for the threshold-bump protocol.
         run: |
           source venv/bin/activate
-          python -m pytest tests/ -v
+          python -m pytest tests/ -v --cov --cov-report=term --cov-report=xml
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: warn
 
       - name: Zip artifact for deployment
         if: github.event_name == 'push'

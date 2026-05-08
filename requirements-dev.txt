@@ -38,3 +38,8 @@ bandit==1.9.4
 # new advisory blocks merge.  See docs/roadmap-to-10.md PR-6 for the
 # allowlist semantics.
 pip-audit==2.10.0
+
+# Coverage instrumentation for pytest.  Configured in pyproject.toml
+# [tool.coverage.*]; CI runs `pytest --cov --cov-fail-under=89`.  See
+# docs/roadmap-to-10.md PR-7 for the threshold-bump protocol.
+pytest-cov==7.1.0

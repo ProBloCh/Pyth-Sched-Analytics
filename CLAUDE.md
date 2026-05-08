@@ -176,6 +176,9 @@ bandit -r . -c pyproject.toml -ll
 # Dependency CVE scan (allowlisted advisories tracked in
 # docs/roadmap-to-10.md PR-6 follow-up)
 pip-audit -r requirements.txt
+
+# Test suite with coverage (CI gate; pyproject.toml owns fail_under)
+python -m pytest tests/ --cov --cov-report=term
 ```
 
 ### Bandit / pip-audit overrides
