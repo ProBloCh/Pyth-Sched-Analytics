@@ -212,6 +212,51 @@ def test_optimize_budget_violation_without_flag_returns_200(client):
 # Multi-violation determinism: ``violated`` must sort alphabetically
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# /solver/pareto: fail_on_violation contract.
+# ---------------------------------------------------------------------------
+# /pareto returns a frontier of Pareto-optimal points, not a single
+# constraints block, so the post-solve violation gate (which assumes
+# one ``constraints`` field) does not currently apply to /pareto.
+# This is documented behaviour: a customer who sets
+# ``fail_on_violation: true`` on a /pareto request gets the existing
+# 200 response with the full frontier, NOT a 409.
+#
+# The test below locks that contract in.  When a future PR
+# implements /pareto-aware violation handling (e.g. "fail if no point
+# satisfies the bounds"), it must update this test in the same
+# commit -- otherwise a quiet behaviour change goes out the door.
+# ---------------------------------------------------------------------------
+
+def test_pareto_fail_on_violation_currently_ignored(client):
+    payload = {
+        "nodes": [
+            {"ID": "0", "Duration": 0},
+            {"ID": "1", "Duration": 100},
+            {"ID": "2", "Duration": 80},
+        ],
+        "links": [
+            {"source": "0", "target": "1"},
+            {"source": "1", "target": "2"},
+        ],
+        "solver_config": {"max_iterations": 5, "pareto_vectors": 3},
+        # Bound that the Pareto sweep cannot satisfy at any point.
+        "project_context": {
+            "constraints": {
+                "max_makespan": 1.0,
+                "fail_on_violation": True,
+            },
+        },
+    }
+    resp = client.post('/solver/pareto', json=payload)
+    # Current contract: /pareto does NOT honour the flag; response is
+    # the regular 200 with a frontier object.  When this changes,
+    # update both the route handler and this test together.
+    assert resp.status_code == 200, (
+        'pareto endpoint started honouring fail_on_violation -- '
+        'update both the route handler and this test')
+
+
 def test_multi_violation_409_sorts_violated_alphabetically(client):
     """When both bounds fail, ``violated`` is sorted so consumers can
     rely on stable iteration order across cached and fresh responses."""

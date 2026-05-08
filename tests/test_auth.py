@@ -192,3 +192,64 @@ def test_cors_wildcard_opt_in(monkeypatch):
     # on configuration; either is a successful wildcard allow.
     acao = resp.headers.get('Access-Control-Allow-Origin')
     assert acao in ('*', 'https://anywhere.example.com'), acao
+
+
+# ---------------------------------------------------------------------------
+# Direct unit tests on auth._load_keys parsing.  Catches regressions
+# where a misconfigured PYTH_API_KEYS would silently authenticate
+# requests presenting empty / whitespace tokens.
+# ---------------------------------------------------------------------------
+
+def test_load_keys_strips_whitespace(monkeypatch):
+    from auth import _load_keys
+    monkeypatch.setenv('PYTH_API_KEYS', ' key-a , key-b ,key-c')
+    assert _load_keys() == ['key-a', 'key-b', 'key-c']
+
+
+def test_load_keys_drops_empty_entries(monkeypatch):
+    """Stray commas / empty entries between commas must not produce
+    an empty-string key (which compare_digest would never match but
+    would still inflate the configured-keys count)."""
+    from auth import _load_keys
+    monkeypatch.setenv('PYTH_API_KEYS', 'key-a,,key-b,')
+    assert _load_keys() == ['key-a', 'key-b']
+
+
+def test_load_keys_returns_empty_for_whitespace_only(monkeypatch):
+    """``PYTH_API_KEYS=' , '`` must read as fail-closed (no keys
+    configured -> 503) rather than ' ' being a usable key."""
+    from auth import _load_keys
+    monkeypatch.setenv('PYTH_API_KEYS', ' , ')
+    assert _load_keys() == []
+
+
+def test_load_keys_returns_empty_when_unset(monkeypatch):
+    from auth import _load_keys
+    monkeypatch.delenv('PYTH_API_KEYS', raising=False)
+    assert _load_keys() == []
+
+
+def test_whitespace_only_keys_trigger_503_at_request_time(monkeypatch):
+    """Integration counterpart: a deploy that set PYTH_API_KEYS to
+    a whitespace-only value must return 503 (not 200) on a protected
+    request.  Locks in the fail-closed behaviour end-to-end."""
+    monkeypatch.setenv('PYTH_AUTH_DISABLED', 'false')
+    monkeypatch.setenv('PYTH_API_KEYS', ' , ')
+    app.config['TESTING'] = True
+    resp = app.test_client().post(
+        PROTECTED_ENDPOINT,
+        json={'nodes': [], 'links': []},
+        headers={'X-API-Key': ''},
+    )
+    assert resp.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic endpoints (/test-cors, /) join the public list.
+# Enumerated separately because they're not health probes per se.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('path', ['/test-cors', '/'])
+def test_diagnostic_endpoints_are_public(auth_client, path):
+    resp = auth_client.get(path)
+    assert resp.status_code == 200, f'{path} returned {resp.status_code}'
