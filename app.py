@@ -707,7 +707,7 @@ def _cluster_risk(df: pd.DataFrame):
                 sc = silhouette_score(feats, lbl)
                 if sc > best:
                     best, k = sc, c
-        except Exception:
+        except Exception:  # nosec B112 -- KMeans rejects degenerate cluster counts; skip and try next k
             continue
 
     k = min(k, max(1, n), unique_count)
@@ -1663,5 +1663,7 @@ def unhandled(e):
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    # Enable debug mode only in development
-    app.run(host='0.0.0.0', port=port, debug=DEBUG)
+    # Enable debug mode only in development.  Binding 0.0.0.0 is intentional:
+    # production deploys (Gunicorn under Azure App Service) bind the same
+    # interface inside their container.  See pyproject.toml [tool.bandit].
+    app.run(host='0.0.0.0', port=port, debug=DEBUG)  # nosec B104

@@ -26,3 +26,15 @@ hypothesis==6.115.5
 # conservative E / F / I rule set.  CI runs `ruff check` on every push.
 # See docs/roadmap-to-10.md PR-5 for the rule-set widening plan.
 ruff==0.15.12
+
+# Static security scanner.  Configured in pyproject.toml [tool.bandit].
+# CI runs `bandit -r . -c pyproject.toml -ll` (medium+ severity) and
+# fails on any unannotated finding.  Intentional patterns annotate
+# inline with `# nosec <code>` plus rationale.
+bandit==1.9.4
+
+# Dependency CVE scanner.  CI runs against requirements.txt with
+# explicit allowlist for advisories pending the upgrade-deps PR.  Any
+# new advisory blocks merge.  See docs/roadmap-to-10.md PR-6 for the
+# allowlist semantics.
+pip-audit==2.10.0

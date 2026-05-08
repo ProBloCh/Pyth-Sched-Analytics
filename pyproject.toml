@@ -83,3 +83,18 @@ known-first-party = [
     "paths",
     "interface",
 ]
+
+# -----------------------------------------------------------------------------
+# Bandit (static security scanner)
+# -----------------------------------------------------------------------------
+# CI runs `bandit -r . -c pyproject.toml` and fails on any unannotated
+# finding at MEDIUM severity or higher.  Existing intentional patterns
+# (host='0.0.0.0' on the dev server, defensive try/except in the
+# silhouette and cache-iteration loops) are annotated inline with
+# `# nosec <code>` plus a one-line rationale.  See PR-6 in
+# docs/roadmap-to-10.md for the override protocol.
+# -----------------------------------------------------------------------------
+
+[tool.bandit]
+exclude_dirs = ["tests", "Reference", ".venv", "venv"]
+skips = []  # No blanket skips -- annotate with `# nosec <code>` instead.

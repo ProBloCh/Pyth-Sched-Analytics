@@ -169,7 +169,29 @@ curl http://localhost:8000/health
 
 # Lint (matches CI gate; pyproject.toml owns the rule set)
 ruff check .
+
+# Static security scan (matches CI gate)
+bandit -r . -c pyproject.toml -ll
+
+# Dependency CVE scan (allowlisted advisories tracked in
+# docs/roadmap-to-10.md PR-6 follow-up)
+pip-audit -r requirements.txt
 ```
+
+### Bandit / pip-audit overrides
+
+`bandit` runs at MEDIUM severity (`-ll`) in CI.  Annotate intentional
+patterns inline with `# nosec <code> -- <one-line rationale>`.  Do not
+blanket-disable a file; do not use `skips` in `[tool.bandit]`.  See
+`completion/outcomes.py` and `app.py:1475` for examples.
+
+`pip-audit` allowlists are in
+`.github/workflows/main_python-sched-analytics.yml` as
+`--ignore-vuln <ID>` entries.  Each ID is paired with an upgrade entry
+in `docs/roadmap-to-10.md` PR-6 follow-up; an entry leaves the
+allowlist only when the corresponding runtime-package upgrade ships.
+Adding a new vulnerable dependency without first removing or pairing
+the advisory blocks merge.
 
 ## Project-Specific Rules
 

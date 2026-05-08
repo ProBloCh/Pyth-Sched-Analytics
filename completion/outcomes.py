@@ -156,7 +156,7 @@ def _store():
         from app import redis_client
         if redis_client is not None:
             return (redis_client, None)
-    except Exception:
+    except Exception:  # nosec B110 -- Redis absence is non-fatal; fall back to in-process LRU
         pass
     return (None, _inproc)
 
@@ -347,7 +347,7 @@ def list_outcomes(reference_class=None, limit=_MAX_REPORT_OUTCOMES):
                 raw = (fallback or _inproc).get(k)
             if raw:
                 yield json.loads(raw)
-        except Exception:
+        except Exception:  # nosec B112 -- corrupt cache entry: skip rather than abort the report
             continue
 
 

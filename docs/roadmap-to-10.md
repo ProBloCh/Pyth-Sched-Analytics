@@ -215,6 +215,25 @@ dependency in a draft PR turns the job red.
 
 **Depends on.** PR-5 (shares `pyproject.toml`).
 
+#### PR-6 follow-up · Upgrade vulnerable runtime deps (S, prod readiness)
+
+PR-6 wired the gates and allowlisted 11 known advisories so the gate
+goes green today.  Each allowlisted CVE / PYSEC ID is paired with a
+runtime-package upgrade that must land in its own PR, with a full
+test sweep, before the allowlist entry is removed.
+
+| Advisory | Package | Current | Fix |
+|---|---|---|---|
+| `CVE-2026-27205` | `flask` | 3.0.0 | 3.1.3 |
+| `PYSEC-2024-71`, `CVE-2024-1681`, `CVE-2024-6844`, `CVE-2024-6866`, `CVE-2024-6839` | `flask-cors` | 4.0.0 | 6.0.0 |
+| `PYSEC-2024-110` | `scikit-learn` | 1.3.2 | 1.5.0 |
+| `CVE-2024-1135`, `CVE-2024-6827` | `gunicorn` | 21.2.0 | 22.0.0 |
+
+Each upgrade is its own PR; the JS-vs-Py diff harness, the full pytest
+suite, and a manual smoke test against `/graph-metrics` and
+`/solver/optimize` must pass before the corresponding `--ignore-vuln`
+entry leaves `.github/workflows/main_python-sched-analytics.yml`.
+
 ### PR-7 · Coverage threshold gate (S, test confidence)
 
 **Why.** 803 tests is high; coverage % is unknown.  A threshold gate
