@@ -179,6 +179,9 @@ pip-audit -r requirements.txt
 
 # Test suite with coverage (CI gate; pyproject.toml owns fail_under)
 python -m pytest tests/ --cov --cov-report=term
+
+# Type check (non-blocking CI gate; pyrightconfig.json owns the rules)
+pyright
 ```
 
 ### Bandit / pip-audit overrides

@@ -43,3 +43,10 @@ pip-audit==2.10.0
 # [tool.coverage.*]; CI runs `pytest --cov --cov-fail-under=89`.  See
 # docs/roadmap-to-10.md PR-7 for the threshold-bump protocol.
 pytest-cov==7.1.0
+
+# Static type checker.  Configured in pyrightconfig.json (basic mode
+# project-wide; strict for the modules listed in docs/typing-progress.md).
+# CI job is non-blocking initially -- the 239-error basic-mode baseline
+# shrinks via focused follow-up PRs, and CI starts blocking once that
+# count reaches zero.  See docs/roadmap-to-10.md PR-8.
+pyright==1.1.409

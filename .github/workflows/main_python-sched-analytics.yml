@@ -32,6 +32,28 @@ jobs:
       - name: ruff check
         run: ruff check .
 
+  typecheck:
+    runs-on: ubuntu-latest
+    # Non-blocking initially.  Basic-mode baseline at PR-8 is 239
+    # errors; this job surfaces drift while focused follow-up PRs
+    # whittle the count down.  See docs/typing-progress.md.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dev tools
+        run: pip install -r requirements-dev.txt
+
+      - name: pyright
+        run: pyright
+
   security:
     runs-on: ubuntu-latest
 
