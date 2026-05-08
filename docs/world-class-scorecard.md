@@ -8,6 +8,25 @@ recovery options, interface analytics, and CADJ-P optimization.  The remaining
 work is less about adding more analytical ambition and more about proving,
 operating, governing, and hardening what exists.
 
+## Scoring method
+
+Scores are evidence-weighted maturity scores, not feature-count scores.  A
+strong prototype can score highly on analytical ambition while still scoring
+lower on governance, calibration, and operability.  The scale is:
+
+| Score band | Meaning |
+|---:|---|
+| 0-3 | Missing, experimental, or not usable for material decisions. |
+| 4-6 | Useful capability exists, but important controls or validation are missing. |
+| 7-8 | Strong internal-platform quality with meaningful tests, docs, and deployment paths. |
+| 9 | World-class or near-world-class in that dimension, with only targeted gaps remaining. |
+| 10 | Independently defensible, calibrated, secure, observable, operationally proven, and user-consumable. |
+
+The overall score below is the unweighted mean of the ten dimensions.  That is
+intentionally stricter than a narrative/potential score: low governance or
+calibration scores should pull the platform score down even when the analytical
+engine is exceptional.
+
 ## Executive rating
 
 | Dimension | Current score | 10/10 definition | Primary gap |
@@ -23,12 +42,29 @@ operating, governing, and hardening what exists.
 | Deployment and release engineering | 7.5 | Releases are reproducible, scanned, smoke-tested, rollback-ready, and promoted through environments with clear change control. | Azure CI/CD and Docker exist, but release gates are mostly test-only and lack smoke/security/performance stages. |
 | Productization and user adoption | 7.0 | Every capability is surfaced in UX or agent workflows, with user-facing explanations, examples, and feedback loops. | Several capabilities are shipped but unwired or not yet surfaced in views. |
 
-**Overall current score: 8.2/10.**
+**Overall current score: 7.5/10.**
 
 **10/10 interpretation:** not merely “more features.” A 10/10 system is an
 empirically calibrated, secure, observable, load-tested, domain-reviewed,
 versioned, and user-consumable analytics platform whose outputs can be trusted
-in high-stakes project-control decisions.
+in high-stakes project-control decisions.  On that basis, the service is
+currently an advanced, near-world-class analytical engine, but the platform as a
+whole is not 10/10 until the operational, security, calibration, and product
+adoption gaps close.
+
+## Priority ladder
+
+The dimension checklists are intentionally comprehensive.  To avoid treating
+every checkbox as equal, use this priority ladder when planning delivery:
+
+| Priority | Workstream | Why it matters | Exit criterion |
+|---|---|---|---|
+| P0 | CI quality gates, security defaults, and observability basics | Prevents regressions and makes production behavior visible. | Pull requests run tests, lint, coverage, dependency/security scans, and emit structured runtime metrics. |
+| P0 | Durable outcome storage and calibration instrumentation | Without real outcomes, forecast quality cannot be proven. | Outcome records survive deploys/restarts and calibration dashboards show hit rates by class. |
+| P1 | Load/performance proof and capacity envelopes | Expensive analytics must be safe under realistic concurrency. | Each expensive endpoint has documented N/link/sample limits and p50/p95/p99 latency envelopes. |
+| P1 | API contracts, versioning, and post-deploy smoke tests | Consumers need stable contracts and safe releases. | OpenAPI contracts exist and deployment runs endpoint smoke tests before promotion. |
+| P1 | Practitioner review and model cards | High-stakes recommendations need defensible assumptions. | Reference-class assumptions, percentile semantics, and model limitations are signed off and published. |
+| P2 | UX/agent adoption loops and recommendation feedback | Capabilities only matter if users can act on them and the product learns from usage. | Every shipped endpoint has a surfaced consumer or explicit owner-approved reason to remain API-only. |
 
 ## Dimension-by-dimension plan to reach 10/10
 
