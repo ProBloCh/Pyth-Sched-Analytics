@@ -38,6 +38,18 @@ except ImportError:
     _NK = False
     logging.warning("NetworkKit not available - falling back to NetworkX (slower)")
 
+# Production gate: a deploy that lost NetworkKit silently degrades
+# community detection / centrality timing.  When PYTH_REQUIRE_NETWORKKIT
+# is true, fail loudly at startup so the LB marks the instance bad
+# instead of routing traffic to a slower path.  Default off so dev /
+# test environments without the C++ wheel still boot.
+if not _NK and os.getenv("PYTH_REQUIRE_NETWORKKIT", "false").lower() == "true":
+    logging.critical(
+        "NetworkKit required but not importable; refusing to start.  "
+        "Either install networkit (see requirements.txt) or unset "
+        "PYTH_REQUIRE_NETWORKKIT.")
+    raise SystemExit(78)  # EX_CONFIG
+
 import networkx as nx  # Single canonical import
 
 # Configuration
@@ -1580,6 +1592,7 @@ def health():
     health_status = {
         'status': status,
         'timestamp': datetime.now(timezone.utc).isoformat(),
+        'networkit_available': _NK,
         'instance': {
             'site': os.getenv("WEBSITE_SITE_NAME"),
             'instance_id': os.getenv("WEBSITE_INSTANCE_ID"),
