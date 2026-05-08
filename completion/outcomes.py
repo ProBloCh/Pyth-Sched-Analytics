@@ -220,7 +220,11 @@ def validate_outcome(record):
         # Validate ISO parseability for the timestamps we'll later need
         # in calibration_report.  Without this, malformed strings slip
         # through validation and silently reduce calibration signal.
-        for k in ('p80_finish', 'p50_finish', 'p95_finish', 'baseline_finish'):
+        # p10_finish / p20_finish are accepted but not required -- older
+        # records continue to validate; new records that include them
+        # enrich the per-percentile hit-rate report (PR-22).
+        for k in ('p10_finish', 'p20_finish', 'p50_finish', 'p80_finish',
+                  'p95_finish', 'baseline_finish'):
             v = pred.get(k)
             if v is not None and (not isinstance(v, str) or
                                   _parse_iso(v) is None):
@@ -351,15 +355,43 @@ def list_outcomes(reference_class=None, limit=_MAX_REPORT_OUTCOMES):
             continue
 
 
+# PR-22: per-percentile band the calibration loop hit-rates against.
+# The expected hit-rate equals the percentile itself: a well-calibrated
+# P80 should be above the actual finish 80 % of the time.
+_HIT_RATE_PERCENTILES = (
+    ('p10', 'p10_finish', 0.10),
+    ('p20', 'p20_finish', 0.20),
+    ('p50', 'p50_finish', 0.50),
+    ('p80', 'p80_finish', 0.80),
+    ('p95', 'p95_finish', 0.95),
+)
+
+# When the empirical P80 hit-rate at n >= MIN_N falls outside
+# [LOW_BOUND, HIGH_BOUND], emit a calibration advisory.  Mirrors the
+# /completion/monte-carlo calibration_warnings shape so consumers can
+# treat both surfaces uniformly.
+_HIT_RATE_MIN_N = 30
+_HIT_RATE_P80_LOW = 0.70
+_HIT_RATE_P80_HIGH = 0.90
+
+
 def calibration_report(reference_class=None):
     """Aggregate accumulated outcomes into a calibration summary.
 
     Returns dict with:
       - n: total outcome records
-      - by_class: {class_name: {n, predicted_actual_ratio_p50, p80, p95}}
+      - by_class: {class_name: {n, p50/p80/p95_ratio, mean_ratio,
+                                 hit_rates: {pX: {n, hits, rate,
+                                                   expected, score}}}}
       - notes: list of advisory strings
     """
     by_class = defaultdict(list)
+    # PR-22: per-class, per-percentile hit counters.  Outer key = class
+    # name, inner key = percentile label, value = [hits, n].  An entry
+    # for percentile P only contributes when the outcome has a
+    # `predicted.pX_finish` field; older records that only carry
+    # `p80_finish` and `baseline_finish` still produce a P80 hit-rate.
+    hit_counts = defaultdict(lambda: defaultdict(lambda: [0, 0]))
     n_total = 0
     for rec in list_outcomes(reference_class):
         n_total += 1
@@ -368,7 +400,24 @@ def calibration_report(reference_class=None):
             actual = _parse_iso(rec['actual']['finish'])
             pred_p80 = _parse_iso(rec['predicted'].get('p80_finish'))
             baseline = _parse_iso(rec['predicted'].get('baseline_finish'))
-            if actual is None or pred_p80 is None:
+            if actual is None:
+                continue
+
+            # Per-percentile hit-rate counters (PR-22).  Each percentile
+            # is independent of the others and of the overrun-ratio
+            # branch below -- a record with p10/p50/p80 set contributes
+            # to all three percentile counters even if baseline is
+            # absent.
+            for label, key, _expected in _HIT_RATE_PERCENTILES:
+                pred_pct = _parse_iso(rec['predicted'].get(key))
+                if pred_pct is None:
+                    continue
+                bucket = hit_counts[rc][label]
+                bucket[1] += 1
+                if actual <= pred_pct:
+                    bucket[0] += 1
+
+            if pred_p80 is None:
                 continue
             # If baseline is provided, ratio = overrun_actual / overrun_p80.
             # If model was well-calibrated, ratio averages near 1.0.
@@ -403,23 +452,71 @@ def calibration_report(reference_class=None):
             'mean_ratio': sum(ratios_sorted) / n,
         }
 
+    # Attach per-percentile hit-rates to whichever classes have data
+    # (PR-22).  Builds on top of `summary` so a class with only
+    # hit-rate signal (no baseline ⇒ no overrun ratios) is still
+    # represented.
+    for rc, percentile_buckets in hit_counts.items():
+        rates = {}
+        for label, _key, expected in _HIT_RATE_PERCENTILES:
+            hits, n_pred = percentile_buckets[label]
+            if n_pred == 0:
+                continue
+            rate = hits / n_pred
+            rates[label] = {
+                'n': n_pred,
+                'hits': hits,
+                'rate': rate,
+                'expected': expected,
+                # score = rate / expected; 1.0 is perfectly calibrated,
+                # > 1.0 means the percentile is conservative (more hits
+                # than the band's nominal probability), < 1.0 means
+                # the percentile is overconfident (the band misses
+                # more often than the percentile suggests).
+                'calibration_score': rate / expected if expected else None,
+            }
+        if not rates:
+            continue
+        summary.setdefault(rc, {'n': 0})['hit_rates'] = rates
+
     notes = []
     if n_total < 30:
         notes.append(
             f'Only {n_total} outcomes registered; calibration ratios '
             f'are noisy below ~30 records per class.')
     for rc, stats in summary.items():
-        if stats['mean_ratio'] > 1.3:
+        if 'mean_ratio' in stats and stats['mean_ratio'] > 1.3:
             notes.append(
                 f'{rc}: mean actual overrun is {stats["mean_ratio"]:.1f}x '
                 f'the predicted P80 -- the LinkedIn-style "P80 acts like '
                 f'P10" signature.  Consider tightening the reference-class '
                 f'percentile factors or switching to a fatter-tail class.')
-        elif stats['mean_ratio'] < 0.7:
+        elif 'mean_ratio' in stats and stats['mean_ratio'] < 0.7:
             notes.append(
                 f'{rc}: mean actual overrun is {stats["mean_ratio"]:.1f}x '
                 f'the predicted P80 -- model is too pessimistic for this '
                 f'class.  Consider relaxing the percentile factors.')
+
+        # PR-22: per-percentile hit-rate advisory.  Fires only at >=
+        # _HIT_RATE_MIN_N samples for that specific percentile (not
+        # the class-wide n) so a class with 30 P80 records but only
+        # 5 P10 records doesn't produce a noisy P10 alert.
+        p80 = stats.get('hit_rates', {}).get('p80')
+        if p80 and p80['n'] >= _HIT_RATE_MIN_N:
+            if p80['rate'] < _HIT_RATE_P80_LOW:
+                notes.append(
+                    f'{rc}: empirical P80 hit-rate is {p80["rate"]:.0%} '
+                    f'across {p80["n"]} outcomes -- below the '
+                    f'{_HIT_RATE_P80_LOW:.0%} band lower bound.  The '
+                    f'published P80 is overconfident for this reference '
+                    f'class.')
+            elif p80['rate'] > _HIT_RATE_P80_HIGH:
+                notes.append(
+                    f'{rc}: empirical P80 hit-rate is {p80["rate"]:.0%} '
+                    f'across {p80["n"]} outcomes -- above the '
+                    f'{_HIT_RATE_P80_HIGH:.0%} band upper bound.  The '
+                    f'published P80 is over-conservative for this '
+                    f'reference class.')
 
     return {
         'n': n_total,

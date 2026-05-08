@@ -716,11 +716,17 @@ image, gate it behind `EXTRAS=`.
      gives per-activity P20/P50/P80 finish dates but no TEAC view
      (no anchoring at activity-baseline-start).  Trivial extension
      when a customer asks for it.
-  5. **Calibration-loop integration.**  `response.teac` is not yet
-     read by `/completion/register-outcome` /
-     `/completion/calibration-report`; calibration today is on raw
-     finish dates, not on the TEAC band.  Useful for closing the
-     empirical loop but not required for the band itself.
+  5. **Calibration-loop integration (partially shipped).**
+     `/completion/register-outcome` accepts the full predicted band
+     (`p10_finish` / `p20_finish` / `p50_finish` / `p80_finish` /
+     `p95_finish`); `/completion/calibration-report` aggregates per-
+     percentile hit rates and emits a `[70 %, 90 %]` P80 advisory at
+     n >= 30.  See `docs/api/completion.md` "Per-percentile hit rates
+     (PR-22)".  **Still open:** the empirical-CDF transform that
+     remaps MC percentiles directly from the customer's accumulated
+     outcomes (closing the loop end-to-end) -- tracked as PR-22
+     follow-up in `docs/roadmap-to-10.md`.  Until then, the report
+     is informational; `percentile_factors` do not auto-update.
 - **Reference class integration:** The user's PMJ paper demonstrates RCF
   uplifts for O&G offshore projects (P10: 89% cost, 72% schedule).  The
   reference class dataset lives in a separate app; the solver should
