@@ -2,6 +2,12 @@
 Shared fixtures for solver tests.
 """
 
+# Disable the API-key gate for the entire test session.  Must happen
+# before ``app`` is imported by any fixture so the auth hook reads it
+# at request time and short-circuits.  See auth.py.
+import os
+os.environ.setdefault('PYTH_AUTH_DISABLED', 'true')
+
 import pytest
 
 

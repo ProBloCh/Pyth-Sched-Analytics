@@ -50,6 +50,39 @@ from any consumer (MCP, agent, third-party).
 | `/evm/health` | GET | [evm.md](evm.md#get-evmhealth) | EVM module health check |
 | `/interface/health` | GET | [interface.md](interface.md#get-interfacehealth) | Interface module health check |
 
+## Authentication
+
+Every endpoint **except the health probes** (`/health`, `/solver/health`,
+`/completion/health`, `/evm/health`, `/paths/health`,
+`/interface/health`) requires an API key in the `X-API-Key` header.
+
+```
+curl -H 'X-API-Key: your-key-here' https://host/graph-metrics ...
+```
+
+Configuration is via two env vars (read at request time):
+
+| Var | Effect |
+|---|---|
+| `PYTH_API_KEYS` | Comma-separated list of accepted keys.  Set in production. |
+| `PYTH_AUTH_DISABLED=true` | Bypass the gate entirely.  Local dev / CI only -- **never** set in production. |
+| `PYTH_CORS_ORIGINS` | Comma-separated allowlist of CORS origins.  Empty = same-origin only.  The literal `*` opts back into wildcard CORS for local dev only. |
+
+Failure modes:
+
+| Scenario | Status | Body |
+|---|---|---|
+| No `X-API-Key` and `PYTH_API_KEYS` set | 401 | `{"error":"unauthorized"}` |
+| Wrong `X-API-Key` | 401 | `{"error":"unauthorized"}` |
+| `PYTH_API_KEYS` empty/unset and auth not explicitly disabled | 503 | `{"error":"auth not configured", ...}` |
+
+The 503 ("auth not configured") path is intentional: a deploy that
+forgot to set `PYTH_API_KEYS` fails closed and shows up as unhealthy
+in the LB rather than silently exposing the API.
+
+CORS preflights (`OPTIONS`) bypass the auth gate so browsers can
+negotiate cross-origin POSTs against an allowlisted origin.
+
 ## API Stability Rules
 
 1. **Adding keys is safe.**  Consumers must tolerate unknown keys.

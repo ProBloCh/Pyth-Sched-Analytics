@@ -71,11 +71,19 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s » %(message)s"
 )
 
-# Enable CORS with explicit configuration
-CORS(app, 
-     resources={r"/*": {"origins": "*"}},
-     allow_headers=["Content-Type", "Authorization"],
+# Enable CORS with an explicit allowlist (PYTH_CORS_ORIGINS=a,b,c).
+# Empty/unset = same-origin only; the literal '*' opts into wildcard for
+# local dev only.  See auth.py for the loader.
+from auth import init_auth, load_cors_origins
+_cors_origins = load_cors_origins()
+CORS(app,
+     resources={r"/*": {"origins": _cors_origins}},
+     allow_headers=["Content-Type", "Authorization", "X-API-Key"],
      methods=["GET", "POST", "OPTIONS"])
+
+# API-key gate.  Health endpoints stay public; everything else requires
+# X-API-Key when PYTH_API_KEYS is set.  See auth.py for the policy.
+init_auth(app)
 
 try:
     from solver import solver_bp
