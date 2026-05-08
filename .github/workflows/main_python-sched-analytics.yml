@@ -84,14 +84,14 @@ jobs:
       - name: bandit
         run: bandit -r . -c pyproject.toml -ll
 
-      # Dependency CVE scan.  --ignore-vuln entries below allowlist
-      # known advisories that require a coordinated runtime-package
-      # upgrade (tracked in docs/roadmap-to-10.md PR-6 follow-up).  Any
-      # NEW advisory failing the scan blocks merge.
+      # Dependency CVE scan.  All advisories from the original
+      # PR-6 allowlist have shipped fixes; any NEW advisory failing
+      # the scan blocks merge.  When a new advisory is unavoidable
+      # (e.g. a fresh CVE before a fix is published), pair it with
+      # an upgrade entry in docs/roadmap-to-10.md PR-6 follow-up
+      # before adding a corresponding --ignore-vuln line here.
       - name: pip-audit
-        run: |
-          pip-audit -r requirements.txt \
-            --ignore-vuln CVE-2026-27205
+        run: pip-audit -r requirements.txt
 
   build:
     runs-on: ubuntu-latest
