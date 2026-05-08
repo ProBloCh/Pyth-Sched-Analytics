@@ -25,7 +25,6 @@ import os
 
 from flask import Flask, jsonify, request
 
-
 # Health + diagnostic endpoints that do NOT require auth -- consumed by
 # load balancers, uptime monitors, and the Azure Web Apps probes.
 WHITELIST_PATHS = frozenset({

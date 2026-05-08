@@ -12,8 +12,8 @@ Design-review compliance:
 """
 
 import numpy as np
-from .dag import run_cpm
 
+from .dag import run_cpm
 
 # ---------------------------------------------------------------------------
 # Schedule

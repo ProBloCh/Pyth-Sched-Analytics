@@ -16,7 +16,9 @@ import logging
 import math
 
 import numpy as np
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, jsonify, request
+
+from _cache_version import RESPONSE_SCHEMA_VERSION
 
 from .engine import run_evm_analysis
 
@@ -57,9 +59,6 @@ def _cache():
                         "without cache: %s", exc)
             _cache_fns = (None, None)
     return _cache_fns
-
-
-from _cache_version import RESPONSE_SCHEMA_VERSION
 
 
 def _cache_key(data):

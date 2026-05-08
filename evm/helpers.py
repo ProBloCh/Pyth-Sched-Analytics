@@ -9,10 +9,9 @@ verifying the downstream metrics stay identical.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone, timedelta
-from typing import Optional
 import math
-
+from datetime import datetime, timezone
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Bounds (matches EVM.js evmConfig.bounds, lines 698-711)

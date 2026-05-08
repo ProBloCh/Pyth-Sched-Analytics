@@ -31,13 +31,15 @@ downstream callers can detect the heterogeneity.
 
 from __future__ import annotations
 
-from collections import Counter
-from datetime import datetime, timezone
 import logging
 import math
+from collections import Counter
+from datetime import datetime, timezone
 
 from completion.calendar import (
-    WorkingCalendar, advance_working_ms, estimate_horizon_days,
+    WorkingCalendar,
+    advance_working_ms,
+    estimate_horizon_days,
 )
 from evm.helpers import convert_to_hours
 

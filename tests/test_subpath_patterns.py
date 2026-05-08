@@ -17,17 +17,16 @@ import pytest
 
 from paths.subpath_patterns import (
     SubpathConfig,
-    mine_recurring_subpaths,
+    _compute_node_metrics,
     _envelope_ids,
-    _strip_envelope_from_paths,
+    _extract_anchor_subpaths,
+    _identify_anchors,
     _mad_z,
     _median,
-    _identify_anchors,
-    _compute_node_metrics,
-    _extract_anchor_subpaths,
     _score_components,
+    _strip_envelope_from_paths,
+    mine_recurring_subpaths,
 )
-
 
 # =====================================================================
 # Fixtures
@@ -276,7 +275,8 @@ class TestAnchorPairExtraction:
         the round-7 optimization correctly skips downsampling and
         the test wouldn't be exercising the path it claims."""
         from paths.subpath_patterns import (
-            _MAX_ANCHORS_PER_PATH, _PER_PATH_PAIR_BUDGET,
+            _MAX_ANCHORS_PER_PATH,
+            _PER_PATH_PAIR_BUDGET,
         )
         n = _MAX_ANCHORS_PER_PATH * 3  # well over the cap
         # Pick Lmax so predicted pairs comfortably exceed the budget.
@@ -305,7 +305,7 @@ class TestAnchorPairExtraction:
         exact loop would have stayed cheap (Copilot review #604,
         subpath_patterns.py:564)."""
         from paths.subpath_patterns import (
-            _MAX_ANCHORS_PER_PATH, _PER_PATH_PAIR_BUDGET,
+            _MAX_ANCHORS_PER_PATH,
         )
         # Pick n large enough that the triangular bound alone exceeds
         # the budget: n*(n-1)/2 > _PER_PATH_PAIR_BUDGET requires
@@ -383,7 +383,8 @@ class TestScoring:
         diverges from the documented behaviour (Copilot review #604,
         subpath_patterns.py:622)."""
         from paths.subpath_patterns import (
-            _CandidateRecord, _NodeMetrics, _score_components,
+            _CandidateRecord,
+            _NodeMetrics,
         )
         # Candidate appears in 2 paths out of 100; both paths extend
         # it the same way (right neighbour 'X' -> 2 occurrences).
@@ -414,7 +415,9 @@ class TestScoring:
         explicitly so a future refactor can't silently swap them
         (Copilot review #604, tests:317)."""
         from paths.subpath_patterns import (
-            _CandidateRecord, _NodeMetrics, _score_components, _sigma,
+            _CandidateRecord,
+            _NodeMetrics,
+            _sigma,
         )
         # Three-node candidate.  z values (after metric extraction):
         #   v1: z_risk=6, z_imp=0, z_overrun=0  -> _node_salience_z = 2.0
@@ -575,7 +578,8 @@ class TestScoring:
         ``lookup.get(nid, 0.0) >= 0.0`` was always True for missing
         metrics, producing bogus anchor reasons."""
         from paths.subpath_patterns import (
-            _NodeMetrics, _is_anchor,
+            _is_anchor,
+            _NodeMetrics,
         )
         # Node 'X' has only betweenness; no risk / importance / overrun.
         m = _NodeMetrics(
@@ -783,7 +787,8 @@ class TestScoring:
         clients believe the full requested search width was used
         (Copilot review #604, subpath_patterns.py:522)."""
         from paths.subpath_patterns import (
-            mine_recurring_subpaths, _FALLBACK_LMAX_CAP,
+            _FALLBACK_LMAX_CAP,
+            mine_recurring_subpaths,
         )
         # Force fallback path: 0 anchors via uniform metrics.
         nodes = [

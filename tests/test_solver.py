@@ -8,26 +8,35 @@ models (config construction), optimizer (convergence), and analysis.
 import numpy as np
 import pytest
 
-from solver.models import (
-    SolverConfig, ProjectContext, ActivityParams,
-    build_activity_params, PHASE_WEIGHTS,
-)
-from solver.dag import build_dag, run_cpm, get_critical_path_indices
-from solver.objectives import (
-    schedule_objective, cost_objective, risk_objective,
-    quality_objective, resource_objective, compute_objectives,
-)
 from solver.adjoints import (
-    schedule_adj_dur, cost_adj_dur, cost_adj_res,
-    quality_adj_dur, resource_adj_dur, compute_gradients,
+    compute_gradients,
+    cost_adj_dur,
+    cost_adj_res,
+    quality_adj_dur,
+    resource_adj_dur,
+    schedule_adj_dur,
+)
+from solver.analysis import (
+    analyze_conflicts_and_synergies,
+    rank_interventions,
+)
+from solver.core import run_optimize, run_pareto_endpoint, run_sensitivity
+from solver.dag import build_dag, get_critical_path_indices, run_cpm
+from solver.models import (
+    ProjectContext,
+    SolverConfig,
+    build_activity_params,
+)
+from solver.objectives import (
+    compute_objectives,
+    cost_objective,
+    quality_objective,
+    resource_objective,
+    risk_objective,
+    schedule_objective,
 )
 from solver.optimizer import optimize
 from solver.stochastic import run_ensemble
-from solver.analysis import (
-    analyze_conflicts_and_synergies, rank_interventions, compute_analysis,
-)
-from solver.core import run_sensitivity, run_optimize, run_pareto_endpoint
-
 
 # =====================================================================
 # DAG / CPM
@@ -873,8 +882,9 @@ class TestHardConstraints:
         actual WorkingCalendar allocation past the documented cap.
         The clamp keeps the horizon bounded at MAX_ISO_HORIZON_DAYS.
         """
-        from solver.models import _resolve_max_makespan, MAX_ISO_HORIZON_DAYS
         from datetime import datetime, timedelta, timezone
+
+        from solver.models import MAX_ISO_HORIZON_DAYS, _resolve_max_makespan
 
         start = datetime(2026, 1, 5, tzinfo=timezone.utc)
         # Pick an end exactly MAX_ISO_HORIZON_DAYS calendar days later.

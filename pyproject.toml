@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# -----------------------------------------------------------------------------
+# Pyth-Sched-Analytics has been packaged as a flat layout (app.py +
+# blueprint packages) since inception.  The [project] block below is the
+# minimum metadata so tooling (ruff, mypy, pyright, coverage) can locate
+# the source root via standard PEP 621 discovery.  It is NOT used to
+# build a distributable wheel -- production deploys run app.py directly
+# under Gunicorn.
+# -----------------------------------------------------------------------------
+
+[project]
+name = "pyth-sched-analytics"
+version = "0.0.0"
+description = "Schedule dependency network analytics."
+requires-python = ">=3.12"
+
+[tool.setuptools]
+py-modules = ["app", "auth", "_cache_version", "multi_resolution_pipeline"]
+
+[tool.setuptools.packages.find]
+include = ["solver*", "completion*", "evm*", "paths*", "interface*"]
+exclude = ["tests*", "Reference*", "docs*"]
+
+# -----------------------------------------------------------------------------
+# Ruff
+# -----------------------------------------------------------------------------
+# Conservative initial gate.  Catches real bugs (F*) and import hygiene (I)
+# without forcing a sweeping cleanup PR for cosmetic issues.  Roadmap PR-5
+# follow-ups will progressively widen the rule set:
+#
+#   * E501 line-length is left unchecked for now -- 22 violations cluster
+#     in app.py / solver/models.py and need targeted manual line-breaks.
+#   * E402 module-level-import-not-at-top is per-file-ignored where the
+#     existing structure is load-bearing (see CLAUDE.md "Import Order Is
+#     Load-Bearing"); test files often have conditional imports.
+#   * E741 ambiguous-name (`l`, `I`) is scope-narrow cosmetic and tracked
+#     for a follow-up rename PR.
+#   * UP / B / SIM / RUF will land in a follow-up once the team is ready
+#     to autofix the typing modernisations (UP006 / UP045 / UP017).
+# -----------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [
+    "Reference",          # vendored JS reference, not Python
+    "tests/diff_harness", # JS subprocess harness, not Python
+    ".venv",
+    "venv",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = [
+    "E501",   # line-too-long: 22 violations -- defer to manual line-break PR
+    "E741",   # ambiguous-variable-name (`l` etc.): cosmetic, defer to rename PR
+]
+
+[tool.ruff.lint.per-file-ignores]
+# app.py and route shells deliberately interleave imports with thread-limit
+# env-var setup (per CLAUDE.md "Import Order Is Load-Bearing") and
+# blueprint registrations.  Keep E402 silent in those files.
+"app.py" = ["E402"]
+# Test files use conditional imports based on availability of optional
+# extras, which trips E402.
+"tests/*" = ["E402"]
+# Route files import _cache_version near the top now (post PR-5 cleanup);
+# any residual E402s in the route files are blueprint-ordering artefacts.
+"completion/monte_carlo.py" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "app",
+    "auth",
+    "_cache_version",
+    "multi_resolution_pipeline",
+    "solver",
+    "completion",
+    "evm",
+    "paths",
+    "interface",
+]

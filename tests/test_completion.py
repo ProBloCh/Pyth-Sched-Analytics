@@ -14,11 +14,14 @@ Covers:
 import pytest
 
 from completion.monte_carlo import (
-    run_completion_mc, CompletionMCConfig,
-    _parse_iso_to_ms, _ms_to_iso, _duration_to_ms,
-    _MS_PER_DAY, _MS_PER_HOUR,
+    _MS_PER_DAY,
+    _MS_PER_HOUR,
+    CompletionMCConfig,
+    _duration_to_ms,
+    _ms_to_iso,
+    _parse_iso_to_ms,
+    run_completion_mc,
 )
-
 
 # =====================================================================
 # Date / duration helpers
@@ -1344,6 +1347,7 @@ class TestLowMaxMultiplierCap:
 
     def test_caps_are_non_decreasing_for_low_cap(self):
         import numpy as np
+
         from solver.stochastic import _compute_caps
 
         # risk ordering low -> high, durations uniform
@@ -1359,6 +1363,7 @@ class TestLowMaxMultiplierCap:
 
     def test_standard_tier_not_below_cap(self):
         import numpy as np
+
         from solver.stochastic import _compute_caps
 
         # All standard-tier (risk below fat_thresh)
@@ -1374,6 +1379,7 @@ class TestLowMaxMultiplierCap:
 
     def test_default_cap_behaviour_unchanged(self):
         import numpy as np
+
         from solver.stochastic import _compute_caps
 
         # Default path (no cap): std tier lerps 2->6, pareto lerps 4->10.
@@ -1492,8 +1498,10 @@ class TestRecoveryLagUnits:
 # =====================================================================
 
 from completion.recovery import (
-    run_recovery_options, classify_crash_profile,
-    RecoveryConfig, _compute_target,
+    RecoveryConfig,
+    _compute_target,
+    classify_crash_profile,
+    run_recovery_options,
 )
 
 
@@ -2041,7 +2049,7 @@ class TestStochasticTEAC:
         clamp identically.  Catches a future divergence if either side
         moves.
         """
-        from completion.monte_carlo import _TEAC_MIN_SPI, _TEAC_MAX_SPI
+        from completion.monte_carlo import _TEAC_MAX_SPI, _TEAC_MIN_SPI
         from evm.helpers import Bounds
         assert _TEAC_MIN_SPI == Bounds.MIN_SPI
         assert _TEAC_MAX_SPI == Bounds.MAX_SPI

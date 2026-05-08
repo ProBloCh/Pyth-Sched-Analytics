@@ -36,23 +36,28 @@ import math
 from dataclasses import asdict
 
 import numpy as np
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, jsonify, request
 
+from _cache_version import RESPONSE_SCHEMA_VERSION
 from solver.dag import build_dag
+
 from ._constants import MAX_NODES
-from .distances import distances_to_start, distances_to_end, near_critical_mask
 from .calendar_slack import compute_calendar_slack
-from .enumerate import (
-    find_all_paths, MAX_PATHS_TO_RETURN,
-    NODE_THRESHOLD, LINK_THRESHOLD,
-)
+from .distances import distances_to_end, distances_to_start, near_critical_mask
 from .diversity import (
-    DiversityConfig, auto_tune_config,
-    select_independent_near_critical, select_structurally_diverse,
+    DiversityConfig,
+    auto_tune_config,
+    select_independent_near_critical,
+    select_structurally_diverse,
 )
 from .driving_graph import DrivingGraphConfig, extract_driving_graph
+from .enumerate import (
+    LINK_THRESHOLD,
+    MAX_PATHS_TO_RETURN,
+    NODE_THRESHOLD,
+    find_all_paths,
+)
 from .subpath_patterns import SubpathConfig, mine_recurring_subpaths
-
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +95,7 @@ def _cache():
     global _cache_fns
     if _cache_fns is None:
         try:
-            from app import get_cached_result, set_cached_result, redis_client
+            from app import get_cached_result, redis_client, set_cached_result
             if redis_client is None:
                 _cache_fns = (None, None)
             else:
@@ -99,9 +104,6 @@ def _cache():
             logger.info("Caching not available for /paths: %s", exc)
             _cache_fns = (None, None)
     return _cache_fns
-
-
-from _cache_version import RESPONSE_SCHEMA_VERSION
 
 
 def _cache_key(prefix: str, data) -> str:

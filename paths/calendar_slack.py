@@ -23,13 +23,14 @@ Slack (TF) is always reported in working hours, matching JS
 
 import numpy as np
 
-from solver.dag import build_dag
 from completion.calendar import (
-    WorkingCalendar, advance_working_ms, estimate_horizon_days,
+    WorkingCalendar,
+    advance_working_ms,
+    estimate_horizon_days,
 )
-from completion.monte_carlo import _parse_iso_to_ms, _ms_to_iso
+from completion.monte_carlo import _ms_to_iso, _parse_iso_to_ms
 from evm.helpers import convert_to_hours
-
+from solver.dag import build_dag
 
 # Sensible defaults when caller doesn't supply project_start / horizon.
 _DEFAULT_HOURS_PER_DAY = 8.0

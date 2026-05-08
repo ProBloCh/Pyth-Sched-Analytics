@@ -9,11 +9,13 @@ can find points on non-convex Pareto frontiers).
 
 import logging
 import time
+
 import numpy as np
 from scipy.optimize import minimize as sp_minimize
+
+from .adjoints import compute_gradients
 from .dag import run_cpm
 from .objectives import compute_objectives
-from .adjoints import compute_gradients
 
 logger = logging.getLogger(__name__)
 

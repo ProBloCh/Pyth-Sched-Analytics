@@ -19,9 +19,11 @@ import logging
 import math
 
 import numpy as np
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, jsonify, request
 
-from .core import run_sensitivity, run_optimize, run_pareto_endpoint
+from _cache_version import RESPONSE_SCHEMA_VERSION
+
+from .core import run_optimize, run_pareto_endpoint, run_sensitivity
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +71,6 @@ def _cache():
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-from _cache_version import RESPONSE_SCHEMA_VERSION
-
 
 def _cache_key(prefix, data):
     raw = json.dumps(data, sort_keys=True, default=str)

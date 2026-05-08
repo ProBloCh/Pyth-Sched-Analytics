@@ -18,20 +18,23 @@ walk then processes one activity at a time but broadcasts over all M
 samples simultaneously, keeping the inner loop in C-level NumPy.
 """
 
-from dataclasses import dataclass
 import logging
 import time
+from dataclasses import dataclass
 
 import numpy as np
 
 from solver.dag import build_dag
 from solver.stochastic import (
-    _generate_samples,
     _compute_raw_multipliers,
     _fat_tail_thresholds,
+    _generate_samples,
 )
+
 from .calendar import (
-    WorkingCalendar, advance_working_ms, estimate_horizon_days,
+    WorkingCalendar,
+    advance_working_ms,
+    estimate_horizon_days,
 )
 
 logger = logging.getLogger(__name__)
@@ -370,7 +373,9 @@ def _resolve_reference_class(config):
     defence).
     """
     from solver.reference_classes import (
-        get_reference_class, merge_class_definitions, effective_registry,
+        effective_registry,
+        get_reference_class,
+        merge_class_definitions,
     )
     custom = getattr(config, 'custom_reference_classes', None)
     registry = effective_registry(custom_classes=custom)
@@ -531,12 +536,12 @@ def _build_calibration_warnings(nodes, in_scope, risk, ref_params,
                 'code': 'infinite_mean_reference_class',
                 'severity': 'warning',
                 'message': (
-                    f'Reference class has formally infinite mean '
-                    f'(alpha <= 1; e.g. IT, Olympics).  Per Flyvbjerg / '
-                    f'Aaen 2025, ANY single percentile is unstable; the '
-                    f'P99 is reported as a hard cap, not an empirical '
-                    f'measurement.  Recommended: cap exposure rather '
-                    f'than predict the tail.'),
+                    'Reference class has formally infinite mean '
+                    '(alpha <= 1; e.g. IT, Olympics).  Per Flyvbjerg / '
+                    'Aaen 2025, ANY single percentile is unstable; the '
+                    'P99 is reported as a hard cap, not an empirical '
+                    'measurement.  Recommended: cap exposure rather '
+                    'than predict the tail.'),
             })
         # Judgement / no peer-reviewed fit -- surface the specific
         # source statement so the customer sees exactly which parts
@@ -897,6 +902,7 @@ def _maybe_build_calendar(nodes, dag_state, id_to_idx, status_ms,
 # disagree on the same project.  Importing from the canonical source
 # means a future Bounds change updates both endpoints atomically.
 from evm.helpers import Bounds as _EVM_BOUNDS
+
 _TEAC_MIN_SPI = _EVM_BOUNDS.MIN_SPI
 _TEAC_MAX_SPI = _EVM_BOUNDS.MAX_SPI
 

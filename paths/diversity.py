@@ -21,9 +21,8 @@ minimum-unique-edges to the path length distribution, matching the JS
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
-
 
 # ---------------------------------------------------------------------------
 # Config

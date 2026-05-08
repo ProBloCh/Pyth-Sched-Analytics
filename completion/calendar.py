@@ -21,11 +21,11 @@ Algorithm:
 Weekday convention: ISO (Mon=1..Sun=7), matching solver.models.ProjectContext.
 """
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import logging
-import numpy as np
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
+import numpy as np
 
 logger = logging.getLogger(__name__)
 

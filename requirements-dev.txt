@@ -21,3 +21,8 @@ py-spy==0.4.0
 # fixtures so structural invariants are exercised beyond the curated
 # fixtures.  See REMAINING_WORK 6.2.
 hypothesis==6.115.5
+
+# Linter + import sorter.  Configured in pyproject.toml with a
+# conservative E / F / I rule set.  CI runs `ruff check` on every push.
+# See docs/roadmap-to-10.md PR-5 for the rule-set widening plan.
+ruff==0.15.12

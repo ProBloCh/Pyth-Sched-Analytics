@@ -52,13 +52,13 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-from .enumerate import find_all_paths, MAX_PATHS_TO_RETURN
-from ._constants import MAX_NODES
 from solver.dag import build_dag
 
+from ._constants import MAX_NODES
+from .enumerate import MAX_PATHS_TO_RETURN, find_all_paths
 
 logger = logging.getLogger(__name__)
 

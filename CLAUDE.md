@@ -155,6 +155,9 @@ When adding new features, add corresponding tests.
 # Install dependencies
 pip install -r requirements.txt
 
+# Install dev dependencies (ruff, hypothesis, py-spy)
+pip install -r requirements-dev.txt
+
 # Run in debug mode (Flask dev server, port 5000)
 DEBUG=true python app.py
 
@@ -163,6 +166,9 @@ gunicorn --workers 2 --threads 2 --bind 0.0.0.0:8000 --timeout 120 app:app
 
 # Health check
 curl http://localhost:8000/health
+
+# Lint (matches CI gate; pyproject.toml owns the rule set)
+ruff check .
 ```
 
 ## Project-Specific Rules

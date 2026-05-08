@@ -33,8 +33,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from solver.dag import build_dag, DAGState
-
+from solver.dag import DAGState, build_dag
 
 logger = logging.getLogger(__name__)
 

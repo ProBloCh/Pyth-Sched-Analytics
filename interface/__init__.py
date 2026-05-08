@@ -8,12 +8,12 @@ grouping field (defaults to ``WBS_Path``, configurable to ``Contract``,
 ``Phase``, ``Asset``, ``Discipline``, etc.).
 """
 
-from .routes import interface_bp
 from .analytics import (
-    InterfaceConfig,
     HotspotWeights,
+    InterfaceConfig,
     compute_interface_analytics,
 )
+from .routes import interface_bp
 
 __all__ = [
     "interface_bp",

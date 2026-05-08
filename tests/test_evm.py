@@ -15,24 +15,31 @@ Locks the Python port to the JS EVM.js behaviour:
 """
 
 import math
+
 import pytest
 
+from evm.engine import run_evm_analysis
+from evm.forecast import (
+    compute_schedule_delay,
+    find_frontier_nodes,
+    time_phased_ev,
+)
 from evm.helpers import (
-    safe_date, difference_in_calendar_days,
-    convert_to_hours, normalize_percent_complete,
-    get_sector_schedule_overrun, clamp, Bounds,
+    Bounds,
+    convert_to_hours,
+    difference_in_calendar_days,
+    get_sector_schedule_overrun,
+    normalize_percent_complete,
+    safe_date,
 )
 from evm.metrics import (
-    compute_evm_metrics, compute_eac, compute_duration_weighted,
-    compute_earned_schedule,
-    compute_bcws_hours, compute_bcwp_hours, compute_bac_hours,
     compute_acwp,
+    compute_bcws_hours,
+    compute_duration_weighted,
+    compute_eac,
+    compute_earned_schedule,
+    compute_evm_metrics,
 )
-from evm.forecast import (
-    time_phased_ev, find_frontier_nodes, compute_schedule_delay,
-)
-from evm.engine import run_evm_analysis, build_forecasted_branch, build_actual_branch
-
 
 # =====================================================================
 # Helpers
@@ -584,7 +591,7 @@ class TestEarnedSchedule:
         right unit, not silently default to Hours.  Pre-fix the helper
         only read ``TimeUnits`` (PascalCase), producing wrong PV in
         ES for mixed-shape inputs."""
-        from evm.metrics import _vectorised_pv_curve, _significant_evm_dates
+        from evm.metrics import _significant_evm_dates, _vectorised_pv_curve
         # Two-week activity expressed in days via the camelCase key.
         nodes = [{
             'ID': '1',
@@ -605,8 +612,9 @@ class TestEarnedSchedule:
         step branch handles this; without it, milestones contributed 0
         at the milestone date instead of planned_hrs.
         """
-        from evm.metrics import _vectorised_pv_curve
         from datetime import datetime, timezone
+
+        from evm.metrics import _vectorised_pv_curve
         # Milestone activity: finish == start.  Use Duration=1 day so
         # it isn't filtered out by the "Duration in (0, '0')" guard.
         nodes = [{
@@ -633,10 +641,10 @@ class TestEarnedSchedule:
         happen to land on degenerate values.  Running on 100 random
         activities across hundreds of dates exercises the matrix path.
         """
-        from datetime import datetime, timedelta
         import random
-        from evm.metrics import _vectorised_pv_curve, _significant_evm_dates
-        from evm.metrics import compute_bcws_hours
+        from datetime import datetime, timedelta
+
+        from evm.metrics import _significant_evm_dates, _vectorised_pv_curve
 
         random.seed(42)
         nodes = []
@@ -671,7 +679,8 @@ class TestEarnedSchedule:
         end-date as 'droppable' because ``kept`` is a set (unordered).
         """
         from datetime import datetime, timedelta, timezone
-        from evm.metrics import _significant_evm_dates, _ES_MAX_DATES
+
+        from evm.metrics import _ES_MAX_DATES, _significant_evm_dates
 
         nodes = []
         base = datetime(2020, 1, 1)
@@ -713,7 +722,8 @@ class TestEarnedSchedule:
         _vectorised_pv_curve respects the documented size ceiling.
         """
         from datetime import datetime, timedelta, timezone
-        from evm.metrics import _significant_evm_dates, _ES_MAX_DATES
+
+        from evm.metrics import _ES_MAX_DATES, _significant_evm_dates
 
         # Build a project with many more breakpoints than the cap.
         nodes = []
@@ -1146,7 +1156,7 @@ class TestEndpointValidation:
 # ACWP was double-multiplied by the project rate when nodes carried
 # explicit CostRate.  The Python engine and JS sync path are both fixed.
 
-from evm.metrics import compute_acwp_hours, compute_forecasted_acwp_hours
+from evm.metrics import compute_acwp_hours
 
 
 class TestACWPUnitsConsistency:
@@ -1175,7 +1185,6 @@ class TestACWPUnitsConsistency:
     def test_acwp_cost_scales_with_per_node_rate(self):
         """ACWP in cost units IS sensitive to per-node CostRate
         (matches the JS calculateACWP semantic)."""
-        from evm.metrics import compute_acwp
         a = compute_acwp(self._node_with_per_node_rate(100),
                          cost_rate=1, status_date='2025-01-06')
         b = compute_acwp(self._node_with_per_node_rate(50),
@@ -1238,8 +1247,9 @@ class TestACWPUnitsConsistency:
 # =====================================================================
 
 from evm.forecast import (
-    update_predicted_values, _add_working_hours, _subtract_working_hours,
-    _build_succ_map, _build_pred_map, _topological_order,
+    _add_working_hours,
+    _subtract_working_hours,
+    update_predicted_values,
 )
 
 
@@ -1377,7 +1387,6 @@ class TestUpdatePredictedValues:
             nodes, links, status_date='2025-01-01',
             schedule_multiplier=1.0, slip_days=10, performance_delta=1.0)
         # All unstarted activities push 10 days
-        from datetime import timedelta
         original_start = safe_date(nodes[0]['Start'])
         assert nodes[0]['predictedStart'] >= original_start
 
@@ -1651,6 +1660,7 @@ class TestDurationToWorkHoursCalendar:
 
     def test_months_use_4_345_weeks(self):
         import pytest
+
         from completion.monte_carlo import _duration_to_work_hours
         # 1 month at hpd=8, dpw=5 -> 8 * 5 * 4.345 = 173.8 hrs
         assert _duration_to_work_hours(1, 'mo', 8.0, 5.0) == \
@@ -1941,6 +1951,7 @@ class TestInProcStoreThreadSafety:
 
     def test_concurrent_set_and_keys_no_crash(self):
         import threading
+
         import completion.outcomes as oc
         store = oc._InProcStore()
         errors = []
@@ -2047,6 +2058,7 @@ class TestMalformedDurationWarns:
 
     def test_dag_non_numeric_duration_warns(self, caplog):
         import logging
+
         import solver.dag as d
         d._DUR_WARNED = {'emitted': False}  # reset rate-limit flag
         with caplog.at_level(logging.WARNING, logger='solver.dag'):
@@ -2058,6 +2070,7 @@ class TestMalformedDurationWarns:
 
     def test_dag_sentinel_silent(self, caplog):
         import logging
+
         import solver.dag as d
         d._DUR_WARNED = {'emitted': False}
         with caplog.at_level(logging.WARNING, logger='solver.dag'):
@@ -2071,6 +2084,7 @@ class TestMalformedDurationWarns:
 
     def test_models_non_numeric_duration_warns(self, caplog):
         import logging
+
         import solver.models as sm
         # The rate-limit flag is function-local (reset per call), so no
         # module-level reset is needed.
@@ -2085,6 +2099,7 @@ class TestMalformedDurationWarns:
         """Each build_activity_params call gets its own warn counter so
         the 'suppressed for this build' message is accurate."""
         import logging
+
         import solver.models as sm
         with caplog.at_level(logging.WARNING, logger='solver.models'):
             # First build -- should warn
@@ -2113,7 +2128,6 @@ class TestCompletionSerialiseNonFinite:
     """
 
     def test_nan_becomes_null(self):
-        import math
         from completion.routes import _serialise
         assert _serialise(float('nan')) is None
         assert _serialise(float('inf')) is None
@@ -2122,12 +2136,12 @@ class TestCompletionSerialiseNonFinite:
 
     def test_ndarray_with_nan_becomes_null_list(self):
         import numpy as np
+
         from completion.routes import _serialise
         arr = np.array([1.0, float('nan'), float('inf'), 3.0])
         assert _serialise(arr) == [1.0, None, None, 3.0]
 
     def test_nested_dict_recurses(self):
-        import math
         from completion.routes import _serialise
         payload = {'p50': float('inf'), 'ok': 2.5,
                    'arr': [float('nan'), 4.0]}
@@ -2279,7 +2293,8 @@ class TestUTCNormalisation:
     """
 
     def test_safe_date_aware_non_utc_converts_to_utc(self):
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
+
         from evm.helpers import safe_date
         # +05:00 input -> output should be in UTC
         dt = datetime(2025, 1, 1, 12, 0, tzinfo=timezone(timedelta(hours=5)))
@@ -2290,6 +2305,7 @@ class TestUTCNormalisation:
 
     def test_safe_date_iso_with_offset_converts_to_utc(self):
         from datetime import timezone
+
         from evm.helpers import safe_date
         out = safe_date('2025-01-01T12:00:00+05:00')
         assert out.tzinfo == timezone.utc
@@ -2297,6 +2313,7 @@ class TestUTCNormalisation:
 
     def test_outcomes_parse_iso_aware_converts_to_utc(self):
         from datetime import timezone
+
         from completion.outcomes import _parse_iso
         out = _parse_iso('2025-01-01T12:00:00+05:00')
         assert out.tzinfo == timezone.utc
@@ -2534,6 +2551,7 @@ class TestAcwpLogsDirtyData:
 
     def test_first_bad_node_warns(self, caplog):
         import logging
+
         import evm.metrics as m
         # Reset the module flag so this test is deterministic even if
         # earlier tests happened to trip it.
@@ -2562,6 +2580,7 @@ class TestSerialiseNdarrayNonFinite:
 
     def test_ndarray_with_nan_becomes_null(self):
         import numpy as np
+
         from evm.routes import _serialise
         arr = np.array([1.0, float('nan'), float('inf'), -float('inf'), 3.5])
         out = _serialise(arr)
@@ -2569,6 +2588,7 @@ class TestSerialiseNdarrayNonFinite:
 
     def test_nested_ndarray_recurses(self):
         import numpy as np
+
         from evm.routes import _serialise
         payload = {'values': np.array([float('inf'), 2.0])}
         assert _serialise(payload) == {'values': [None, 2.0]}
@@ -2676,6 +2696,7 @@ class TestRecoveryFloatHoursCalendar:
 
     def test_week_scales_with_working_days_per_week(self):
         import numpy as np
+
         from completion.recovery import _compute_float_hours
 
         class _FakeDag:
@@ -2708,6 +2729,7 @@ class TestRecoveryFloatHoursCalendar:
         """Default invocation (no working_days_per_week) must produce the
         same result as the previous hardcoded 5.0 for backward compat."""
         import numpy as np
+
         from completion.recovery import _compute_float_hours
 
         class _FakeDag:

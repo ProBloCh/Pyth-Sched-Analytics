@@ -17,11 +17,9 @@ All six cache-key sites get exercised:
 """
 
 import importlib
-import json
 import sys
 
 import pytest
-
 
 CACHE_KEY_SITES = [
     # (module path, attr name, callable signature)
@@ -101,6 +99,6 @@ def test_graph_metrics_cache_key_includes_schema_version():
     import app
     src = open(app.__file__).read()
     assert expected_prefix.split(':')[0] + ':{RESPONSE_SCHEMA_VERSION}:' in src or \
-           f'f"graph:{{RESPONSE_SCHEMA_VERSION}}:' in src, (
+           'f"graph:{RESPONSE_SCHEMA_VERSION}:' in src, (
         'app.py /graph-metrics cache key no longer references '
         'RESPONSE_SCHEMA_VERSION')

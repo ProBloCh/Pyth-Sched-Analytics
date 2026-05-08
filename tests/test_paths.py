@@ -12,26 +12,36 @@ Covers:
 
 import pytest
 
-from solver.dag import build_dag
-from paths.distances import (
-    distances_to_start, distances_to_end, near_critical_mask,
-)
 from paths.calendar_slack import compute_calendar_slack
-from paths.enumerate import (
-    find_all_paths, path_duration,
-    enumerate_all_paths_exact, enumerate_longest_paths_first,
+from paths.distances import (
+    distances_to_end,
+    distances_to_start,
+    near_critical_mask,
 )
 from paths.diversity import (
-    DiversityConfig, auto_tune_config,
-    branch_signature, midpoint_signature, full_signature,
-    deviation_signature, edge_set, containment_overlap,
-    select_independent_near_critical, select_structurally_diverse,
+    DiversityConfig,
+    auto_tune_config,
+    branch_signature,
+    containment_overlap,
+    deviation_signature,
+    edge_set,
+    full_signature,
+    midpoint_signature,
+    select_independent_near_critical,
+    select_structurally_diverse,
 )
 from paths.driving_graph import (
-    DrivingGraphConfig, compute_pred_rankings, extract_driving_graph,
-    enumerate_chains_backwards,
+    DrivingGraphConfig,
+    compute_pred_rankings,
+    extract_driving_graph,
 )
-
+from paths.enumerate import (
+    enumerate_all_paths_exact,
+    enumerate_longest_paths_first,
+    find_all_paths,
+    path_duration,
+)
+from solver.dag import build_dag
 
 # =====================================================================
 # Fixtures local to this suite

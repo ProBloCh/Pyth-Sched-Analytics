@@ -7,25 +7,25 @@ and the /graph-metrics endpoint contract.
 """
 
 import json
+
 import pandas as pd
 import pytest
 
 from app import (
+    _centralities,
+    _cluster_risk,
+    _community_detection,
+    _pca,
+    analyse,
     app,
     build_nx_graph,
-    ensure_dag,
     calculate_critical_path,
-    detect_repeating_patterns,
     create_templates_from_patterns,
     define_work_packages,
+    detect_repeating_patterns,
+    ensure_dag,
     serialize_work_packages,
-    _cluster_risk,
-    _pca,
-    _centralities,
-    _community_detection,
-    analyse,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

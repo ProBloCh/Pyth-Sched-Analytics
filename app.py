@@ -5,9 +5,14 @@ Includes: Redis caching, NetworkKit acceleration, sparse matrices,
 vectorized operations, and Python 3.12 optimizations
 """
 
-import os, json, logging, hashlib, time, gc
-from functools import lru_cache
+import gc
+import hashlib
+import json
+import logging
+import os
+import time
 from datetime import datetime, timezone
+from functools import lru_cache
 
 # Set BLAS threads to prevent CPU contention with Gunicorn
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -15,18 +20,17 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from werkzeug.exceptions import HTTPException
-
 import numpy as np
 import pandas as pd
+import redis
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import shortest_path
 from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
-from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import shortest_path
-import redis
+from werkzeug.exceptions import HTTPException
 
 # NetworkKit imports with fallback
 try:
@@ -87,6 +91,7 @@ logging.basicConfig(
 # Empty/unset = same-origin only; the literal '*' opts into wildcard for
 # local dev only.  See auth.py for the loader.
 from auth import init_auth, load_cors_origins
+
 _cors_origins = load_cors_origins()
 CORS(app,
      resources={r"/*": {"origins": _cors_origins}},
@@ -287,7 +292,8 @@ def calculate_critical_path(G):
     to NetworkX dag_longest_path if the solver import fails.
     """
     try:
-        from solver.dag import build_dag as _build_dag, get_critical_path_indices
+        from solver.dag import build_dag as _build_dag
+        from solver.dag import get_critical_path_indices
         cpm_nodes = [{'ID': str(nd), 'Duration': float(G.nodes[nd].get('duration', 1))}
                      for nd in G.nodes()]
         cpm_links = []

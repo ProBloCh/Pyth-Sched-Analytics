@@ -9,16 +9,17 @@ corresponds to one API endpoint and returns a JSON-serialisable dict.
 import logging
 import time
 
-from .models import SolverConfig, ProjectContext, build_activity_params
-from .dag import build_dag, get_critical_path_indices
-from .objectives import compute_objectives
-from .adjoints import compute_gradients
-from .stochastic import run_ensemble
-from .optimizer import optimize, build_constraints_report
-from .pareto import run_pareto as _run_pareto
-from .analysis import compute_analysis
-from .calendar_map import map_makespan_to_date, _dominant_time_units
 from evm.helpers import working_hours_to_unit
+
+from .adjoints import compute_gradients
+from .analysis import compute_analysis
+from .calendar_map import _dominant_time_units, map_makespan_to_date
+from .dag import build_dag, get_critical_path_indices
+from .models import ProjectContext, SolverConfig, build_activity_params
+from .objectives import compute_objectives
+from .optimizer import build_constraints_report, optimize
+from .pareto import run_pareto as _run_pareto
+from .stochastic import run_ensemble
 
 logger = logging.getLogger(__name__)
 

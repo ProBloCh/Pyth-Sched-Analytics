@@ -19,7 +19,7 @@ import textwrap
 
 import pytest
 
-from app import app, _NK
+from app import _NK, app
 
 
 def test_health_reports_networkit_at_top_level():

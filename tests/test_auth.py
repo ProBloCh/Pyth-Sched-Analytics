@@ -15,7 +15,6 @@ import pytest
 
 from app import app
 
-
 # Endpoints used as the "any protected endpoint" probe.  Picking
 # /graph-metrics keeps the dependency surface tiny -- a malformed body
 # triggers the auth gate before validation runs.

@@ -26,11 +26,10 @@ from pathlib import Path
 import pytest
 
 from completion.recovery import (
-    classify_crash_profile, _normalise_link_lags,
+    _normalise_link_lags,
+    classify_crash_profile,
 )
-from evm.helpers import convert_to_hours
-from evm.helpers import normalize_percent_complete
-
+from evm.helpers import convert_to_hours, normalize_percent_complete
 
 HARNESS_DIR = Path(__file__).parent / 'diff_harness'
 JS_HARNESS = HARNESS_DIR / 'run_js_recovery.js'

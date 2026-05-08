@@ -13,6 +13,7 @@ NumPy-vectorised forward/backward pass operating on contiguous arrays.
 
 import collections
 import logging
+
 import numpy as np
 
 logger = logging.getLogger(__name__)

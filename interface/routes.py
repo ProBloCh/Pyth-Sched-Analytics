@@ -46,14 +46,15 @@ import math
 from typing import Any
 
 import numpy as np
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, jsonify, request
+
+from _cache_version import RESPONSE_SCHEMA_VERSION
 
 from .analytics import (
-    InterfaceConfig,
     HotspotWeights,
+    InterfaceConfig,
     compute_interface_analytics,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +88,7 @@ def _cache():
     global _cache_fns
     if _cache_fns is None:
         try:
-            from app import get_cached_result, set_cached_result, redis_client
+            from app import get_cached_result, redis_client, set_cached_result
             if redis_client is None:
                 _cache_fns = (None, None)
             else:
@@ -96,9 +97,6 @@ def _cache():
             logger.info("Caching not available for /interface: %s", exc)
             _cache_fns = (None, None)
     return _cache_fns
-
-
-from _cache_version import RESPONSE_SCHEMA_VERSION
 
 
 def _cache_key(prefix: str, data) -> str:
