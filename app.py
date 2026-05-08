@@ -1505,13 +1505,17 @@ def graph_metrics():
     
     if not nodes:
         return jsonify({'error': 'No nodes provided'}), 400
-    
-    # Generate cache key.  The v3 prefix prevents v2-cached responses
-    # (which lack the cycles_removed / warnings top-level fields added
-    # alongside the deterministic cycle-handling rewrite) from being
-    # served during a rolling deploy.
+
+    # Generate cache key.  Schema version pulled from _cache_version
+    # so a response-shape change automatically invalidates stale entries
+    # across all endpoints in lock-step.  The deterministic cycle-handling
+    # rewrite (main #26) added top-level cycles_removed / warnings keys
+    # plus altered existing values: bumping RESPONSE_SCHEMA_VERSION
+    # is what prevents pre-rewrite cached responses from being served
+    # during a rolling deploy.
+    from _cache_version import RESPONSE_SCHEMA_VERSION
     key = _sha([nodes, links])
-    redis_key = f"graph:v3:{key}"
+    redis_key = f"graph:{RESPONSE_SCHEMA_VERSION}:{key}"
     
     # Try Redis cache first
     cached_result = get_cached_result(redis_key)

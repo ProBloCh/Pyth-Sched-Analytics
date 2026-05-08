@@ -369,6 +369,17 @@ Changing the structure of values returned by analytical functions can make
 cached entries incompatible — callers may get stale or malformed data until
 the cache expires or is flushed.
 
+**Cache key schema versioning (`_cache_version.py`).** Every cache key
+across all six blueprints (`app.py` `/graph-metrics`, `solver/`,
+`completion/`, `evm/`, `paths/`, `interface/`) is prefixed with
+`RESPONSE_SCHEMA_VERSION` from `_cache_version.py`. Bump the constant
+whenever a response shape changes (rename/remove/retype/re-nest a key,
+or change a value's meaning). Adding new keys at existing nesting
+levels does NOT require a bump. The bump format is `vMAJOR.MINOR.PATCH`;
+see the docstring in `_cache_version.py` for the protocol. Version
+parity across all six call sites is enforced by
+`tests/test_cache_versioning.py`.
+
 The `POST /graph-metrics` response is consumed by a frontend
 (`CommunityGroups.js`). Renaming or removing response keys is a breaking
 change. Add new keys freely; modify or remove existing keys only with

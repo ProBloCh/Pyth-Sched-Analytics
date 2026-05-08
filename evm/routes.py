@@ -59,9 +59,12 @@ def _cache():
     return _cache_fns
 
 
+from _cache_version import RESPONSE_SCHEMA_VERSION
+
+
 def _cache_key(data):
     raw = json.dumps(data, sort_keys=True, default=str)
-    return f"evm:analyze:{hashlib.sha256(raw.encode()).hexdigest()}"
+    return f"evm:{RESPONSE_SCHEMA_VERSION}:analyze:{hashlib.sha256(raw.encode()).hexdigest()}"
 
 
 # ---------------------------------------------------------------------------

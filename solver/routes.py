@@ -70,9 +70,12 @@ def _cache():
 # Helpers
 # ---------------------------------------------------------------------------
 
+from _cache_version import RESPONSE_SCHEMA_VERSION
+
+
 def _cache_key(prefix, data):
     raw = json.dumps(data, sort_keys=True, default=str)
-    return f"solver:{prefix}:{hashlib.sha256(raw.encode()).hexdigest()}"
+    return f"solver:{RESPONSE_SCHEMA_VERSION}:{prefix}:{hashlib.sha256(raw.encode()).hexdigest()}"
 
 
 def _parse_request():

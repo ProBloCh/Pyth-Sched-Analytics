@@ -98,9 +98,12 @@ def _cache():
     return _cache_fns
 
 
+from _cache_version import RESPONSE_SCHEMA_VERSION
+
+
 def _cache_key(prefix: str, data) -> str:
     raw = json.dumps(data, sort_keys=True, default=str)
-    return f"interface:{prefix}:{hashlib.sha256(raw.encode()).hexdigest()}"
+    return f"interface:{RESPONSE_SCHEMA_VERSION}:{prefix}:{hashlib.sha256(raw.encode()).hexdigest()}"
 
 
 # ---------------------------------------------------------------------------
