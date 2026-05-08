@@ -91,7 +91,11 @@ Content-Type: application/json
       "max_end_date": "2026-12-31",   // ISO date OR a number.  When a number it is treated
                                       //   as max_makespan.  When ISO it requires a project
                                       //   start_date (above) to be resolvable.
-      "max_budget": 5000000.0         // Optional. Same units as the cost objective.
+      "max_budget": 5000000.0,        // Optional. Same units as the cost objective.
+      "fail_on_violation": false      // Optional, default false.  When true, return HTTP 409
+                                      //   instead of HTTP 200 if any bound ends up unsatisfied
+                                      //   in the response constraints block.  See "Hard-fail
+                                      //   on violation" below.
     }
   }
 }
@@ -106,8 +110,41 @@ Content-Type: application/json
 > not an error.  Strict hard enforcement (Augmented Lagrangian,
 > active-set SQP, or projection onto the feasible set) is on the
 > roadmap but not in this implementation.  Callers that require a
-> guaranteed bound should treat `satisfied: false` as "infeasible"
-> and reject the result themselves.
+> guaranteed bound should set `fail_on_violation: true` (below) so
+> the response is HTTP 409 instead of HTTP 200 with a hidden
+> infeasibility flag.
+
+#### Hard-fail on violation
+
+Set `project_context.constraints.fail_on_violation: true` to upgrade
+an infeasible result from a soft 200 to an HTTP **409 Conflict**.
+Applies to `/solver/sensitivity` and `/solver/optimize`.  Default
+`false` preserves the existing soft-penalty contract.
+
+```
+HTTP/1.1 409 Conflict
+Content-Type: application/json
+
+{
+  "error": "constraint_violation",
+  "detail": "one or more bounds were not satisfied; fail_on_violation=true was set in the request",
+  "violated": ["max_makespan"],
+  "constraints": {
+    "max_makespan": {
+      "bound":       200.0,
+      "final_value": 247.3,
+      "violation":   47.3,
+      "satisfied":   false
+    }
+  }
+}
+```
+
+The `constraints` block in the 409 body is identical to the
+`constraints` field in a 200 response.  The flag does not change the
+optimisation -- the same penalty solve runs; only the response
+status differs.  The 409 path also fires for cached results, so
+toggling the flag mid-deployment yields consistent behaviour.
 
 When `constraints.max_makespan` (or a resolvable `max_end_date`) and / or
 `constraints.max_budget` are supplied, the optimizer adds a quadratic

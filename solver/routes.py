@@ -224,6 +224,40 @@ def _validate_config(cfg):
     return None
 
 
+def _fail_on_violation(data) -> bool:
+    """Read the opt-in hard-fail flag from the request.
+
+    Lives at ``project_context.constraints.fail_on_violation`` -- next
+    to the bounds it applies to.  Default ``False`` preserves the
+    existing soft-penalty contract.
+    """
+    pc = data.get('project_context') or {}
+    cons = pc.get('constraints') or {}
+    return bool(cons.get('fail_on_violation', False))
+
+
+def _violation_response(result):
+    """If any constraint is unsatisfied, return a 409 tuple; else ``None``.
+
+    The check is data-driven from the result's own ``constraints``
+    block (built by ``solver.optimizer.build_constraints_report``), so
+    a future constraint type that lands in that block is gated for
+    free.
+    """
+    cons = result.get('constraints') or {}
+    violated = {k: v for k, v in cons.items()
+                if isinstance(v, dict) and not v.get('satisfied', True)}
+    if not violated:
+        return None
+    return jsonify({
+        'error': 'constraint_violation',
+        'detail': ('one or more bounds were not satisfied; '
+                   'fail_on_violation=true was set in the request'),
+        'constraints': cons,
+        'violated': sorted(violated.keys()),
+    }), 409
+
+
 def _serialise(obj):
     """Recursively convert numpy types to native Python for JSON."""
     if isinstance(obj, dict):
@@ -256,10 +290,15 @@ def sensitivity():
 
     get_fn, set_fn = _cache()
     key = _cache_key('sensitivity', data)
+    fail_on_violation = _fail_on_violation(data)
     if get_fn:
         cached = get_fn(key)
         if cached:
             cached['cache_hit'] = True
+            if fail_on_violation:
+                resp = _violation_response(cached)
+                if resp is not None:
+                    return resp
             return jsonify(cached)
 
     try:
@@ -274,6 +313,10 @@ def sensitivity():
         result['cache_hit'] = False
         if set_fn:
             set_fn(key, result)
+        if fail_on_violation:
+            resp = _violation_response(result)
+            if resp is not None:
+                return resp
         return jsonify(result)
     except Exception as e:
         logger.exception("Sensitivity analysis failed: %s", e)
@@ -291,10 +334,15 @@ def optimize_endpoint():
 
     get_fn, set_fn = _cache()
     key = _cache_key('optimize', data)
+    fail_on_violation = _fail_on_violation(data)
     if get_fn:
         cached = get_fn(key)
         if cached:
             cached['cache_hit'] = True
+            if fail_on_violation:
+                resp = _violation_response(cached)
+                if resp is not None:
+                    return resp
             return jsonify(cached)
 
     try:
@@ -309,6 +357,10 @@ def optimize_endpoint():
         result['cache_hit'] = False
         if set_fn:
             set_fn(key, result)
+        if fail_on_violation:
+            resp = _violation_response(result)
+            if resp is not None:
+                return resp
         return jsonify(result)
     except Exception as e:
         logger.exception("Optimisation failed: %s", e)
