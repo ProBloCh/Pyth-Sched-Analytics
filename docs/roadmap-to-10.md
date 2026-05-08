@@ -227,7 +227,7 @@ test sweep, before the allowlist entry is removed.
 | `CVE-2026-27205` | `flask` 3.0.0 → 3.1.3 | pending |
 | ~~`PYSEC-2024-71`, `CVE-2024-1681`, `CVE-2024-6844`, `CVE-2024-6866`, `CVE-2024-6839`~~ | ~~`flask-cors` 4.0.0 → 6.0.0~~ | **shipped** |
 | `PYSEC-2024-110` | `scikit-learn` 1.3.2 → 1.5.0 | pending |
-| `CVE-2024-1135`, `CVE-2024-6827` | `gunicorn` 21.2.0 → 22.0.0 | pending |
+| ~~`CVE-2024-1135`, `CVE-2024-6827`~~ | ~~`gunicorn` 21.2.0 → 22.0.0~~ | **shipped** |
 
 Each upgrade is its own PR; the JS-vs-Py diff harness, the full pytest
 suite, and a manual smoke test against `/graph-metrics` and
