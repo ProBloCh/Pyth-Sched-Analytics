@@ -595,6 +595,175 @@ All thresholds enforced in CI via `tests/test_response_payload_budget.py`
 
 ---
 
+## Methodological Backlog (research items orthogonal to the dimensions above)
+
+These are methodological upgrades — distinct from `REMAINING_WORK.md`'s
+library-upgrade list and from the dimensional milestones above.  Each
+item changes a number, not a name.  Sequenced loosely by impact-vs-
+effort; none require runtime dependencies beyond what the plan already
+pulls in (`scipy.stats` covers most distributional items; CMA-ES via
+`cma`, SVGD pure-NumPy, vine copulas via `pyvinecopulib`).
+
+### Distribution & sampling
+
+#### M1. Tier-5 upgrade: Pareto power-law → Generalized Pareto Distribution
+
+Pickands-Balkema-de Haan: exceedances over a high threshold converge
+asymptotically to GPD.  Pareto power-law is the special case ξ > 0;
+GPD generalises to ξ ≤ 0 (bounded tails) too.  Same two parameters
+(ξ, σ), strictly more flexible.  Replace `_pareto_ppf` in
+`solver/stochastic.py:144` with `_gpd_ppf`; update
+`solver/reference_classes.py` to carry ξ alongside α.  Free upgrade
+in expressiveness.  *Ref:* Pickands 1975; Coles 2001 §4.
+
+#### M2. Multilevel Monte Carlo (MLMC)
+
+Vanilla Sobol uses M samples uniformly across difficulty.  MLMC uses
+coarse approximations (triangular-only) plus correction levels (full
+5-tier); the correction has dramatically lower variance.  **3–5×
+compute reduction at fixed accuracy**, or 3–5× tighter percentile
+bands at fixed compute.  Lands in `solver/stochastic.py::run_ensemble`
+as a new sampling mode; opt-in via `config.sampling = "sobol" |
+"mlmc"`.  *Ref:* Giles 2008.
+
+#### M3. Subset simulation / importance sampling for tail probabilities
+
+Vanilla MC needs ~10⁶ samples for stable P99.9.  Subset simulation
+chains conditional events to reach the tail with ~10⁴ samples — **~10×
+variance reduction at P95+**.  Critical for the dragon-king regime
+where `_detect_extremes` (`solver/stochastic.py:393`) is undersampling.
+Maps to D2.  *Ref:* Au & Beck 2001.
+
+#### M4. Vine copulas for >2-discipline joint dependence
+
+D1.3 (Clayton/Gumbel) is bivariate.  Vine copulas decompose
+multivariate dependence into a sequence of bivariate building blocks —
+necessary for cost-schedule-quality-scope joint tail dependence and
+many-objective Pareto sweeps under stochastic objectives.  Lands in
+`solver/joint_distributions.py` (the new D1.3 module) as a third
+option.  *Ref:* Aas, Czado, Frigessi & Bakken 2009.
+
+#### M5. Skewed-t or Normal-Inverse-Gaussian at tier 2
+
+Tier 2 currently produces symmetric overruns at moderate risk.  Real
+overruns are right-skewed even at moderate risk.  Skewed-t adds one
+parameter (skew) and eliminates the artificial parameter discontinuity
+at the BS-tier kick-in.  Lands in `solver/stochastic.py:127-138`
+alongside `_bs_ppf`.  *Ref:* Azzalini & Capitanio 2003.
+
+### Risk propagation & cascade
+
+#### M6. Hawkes processes for delay cascade modeling
+
+Topological-averaging risk propagation is fundamentally *static*.  A
+delay at activity i increases the *intensity* of delays at successors
+over time — a self-exciting point process.  Hawkes captures this; the
+thinning simulator is fast.  Methodologically a step beyond the
+Bayesian-network proposal in `RW-§6.5.3` (BN encodes static
+conditional probabilities; Hawkes encodes time-dependent excitation).
+Ships as a third propagation mode (`risk_propagation = "topological" |
+"bayesian" | "hawkes"`) in `solver/analysis.py`.  *Ref:* Bacry & Muzy
+2014.
+
+#### M7. Spectral near-critical-path detection
+
+The longest path in a DAG has a spectral characterisation on a
+modified adjacency matrix (max-plus → log-sum-exp at temperature T → 0).
+One eigendecomposition gives the *full distribution* of near-critical
+paths, not just float-threshold sweeps.  O(n^2.4) instead of repeated
+DFS.  Maps to `paths/distances.py` and `paths/enumerate.py` (alongside
+the existing exact / longest-first dispatcher).  *Ref:* Akian, Bapat &
+Gaubert 2007.
+
+### Optimisation
+
+#### M8. CMA-ES for the non-smooth resource objective
+
+Resource adjoint uses FD with a `_FD_MAX_N = 500` cliff
+(`solver/adjoints.py:77`) — projects above 500 activities silently
+lose resource gradients.  CMA-ES is gradient-free, handles non-
+smooth objectives natively, and competitive with L-BFGS-B on smooth
+problems.  **Eliminates the FD cliff entirely.**  Use it as the
+resource-only inner solve; keep L-BFGS-B for smooth disciplines.
+*Ref:* Hansen & Ostermeier 2001.
+
+#### M9. Augmented Lagrangian for hard constraints
+
+Sits between soft quadratic penalty (`CONSTRAINT_PENALTY_LAMBDA = 50`)
+and `trust-constr` (`RW-§6.3.2`) / CP-SAT (D5B).  Iteratively updates
+dual variables, converges to feasibility without the gradient kinks
+of pure penalty methods, reuses existing L-BFGS-B as inner solver.
+**Cleaner middle ground** than `trust-constr` for soft-to-hard
+transition.  *Ref:* Nocedal & Wright 2006 §17.
+
+#### M10. Bayesian optimisation for small-project Pareto (ParEGO)
+
+For n < 200, Tchebycheff sweeps run ~600 CPM evaluations (30 vectors
+× 20 iterations).  ParEGO models the frontier with a Gaussian process
+and uses expected hypervolume improvement to pick the next weight
+vector — equivalent frontier coverage in **~50 evaluations**.  Drop-in
+for `solver/pareto.py` for small projects, gated on `n < 200`.
+*Ref:* Knowles 2006.
+
+### Calibration & inference
+
+#### M11. Stein Variational Gradient Descent (SVGD) for D8.2
+
+MCMC is the gold-standard for D8.2b (~100 ms/class/update); MAP is
+fast but loses uncertainty.  SVGD maintains K particles that
+adaptively approximate the posterior, **converges in 10–50 gradient
+steps**.  Better posterior than MAP, ~10× faster than MCMC.  Lands in
+`completion/outcomes.py`.  *Ref:* Liu & Wang 2016.
+
+#### M12. WAIC for data-driven tier selection
+
+The 5-tier cascade is currently fixed by risk-score percentile.  Once
+outcome data accumulates (gating on `RW-§1.1`), WAIC selects the right
+tier per activity from data — bypasses hardcoded thresholds.  Same
+five tiers, data-driven assignment.  *Ref:* Watanabe 2010.
+
+#### M13. Energy Score & Variogram Score for multivariate calibration
+
+`RW-§6.4.3` proposes CRPS (univariate).  For joint cost-schedule
+distributions (D1.3 copulas, M4 vines), the Energy Score and
+Variogram Score are the multivariate generalisations.  Same
+calibration framework, multivariate.  *Ref:* Gneiting, Stanberry,
+Grimit, Held & Johnson 2008; Scheuerer & Hamill 2015.
+
+### Numerical & infrastructure
+
+#### M14. CSR adjacency for the DAG
+
+`solver/dag.py:81-84` uses Python lists for `pred[i]` / `succ[i]`.
+On 10K+ activity projects this is the hot loop.  NumPy CSR (one
+`indices` array + one `indptr` array) **halves memory and 2–3× the
+forward/backward pass**.  Pure-Python win, zero new deps.  Aligns
+with the payload/compute budget.
+
+#### M15. KKT-residual check in adjoint validation
+
+The plan has FD-vs-analytic checks (D4.6); it doesn't have KKT-
+stationarity checks at the converged optimum.  KKT residuals catch a
+different failure mode (FD catches local errors; KKT catches global
+optimality violations).  One-line addition to `tests/test_solver.py`,
+real signal.  *Ref:* Nocedal & Wright 2006 §12.
+
+---
+
+### Deferred — interesting but premature or speculative
+
+| Item | Why deferred |
+|---|---|
+| GNN risk propagation (GraphSAGE / GAT) | Requires training corpus; gates on `RW-§1.1` outcome accumulation |
+| Persistent homology for topology-aware risk | Methodologically novel; unproven for project scheduling |
+| Wavelet decomposition of EVM curves | Interesting visualisation; small analytical lift |
+| ε-constraint Pareto (alternative to Tchebycheff) | Marginal expressiveness gain; not worth a parallel code path |
+| Disjunctive programming / time-window decomposition for >10K-activity RCPSP | Premature; CP-SAT (D5B) handles target scale today |
+| Maximum Common Subgraph mining for cross-project patterns | Needs cross-project corpus; gates on multi-tenant data infra |
+| Branch-and-Cut with project-specific cuts | Premature optimisation atop CP-SAT |
+
+---
+
 ## What this plan deliberately does NOT include
 
 - **4D BIM / spatial reasoning** — out of scope (no geometry kernel).
