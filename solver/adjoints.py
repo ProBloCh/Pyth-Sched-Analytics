@@ -70,15 +70,27 @@ def risk_adj_res(dag_state, params, project_ctx=None):
 
 
 # ---------------------------------------------------------------------------
-# Resources  (finite differences per review section 1.5)
+# Resources
+#
+# resource_adj_res is analytic via logsumexp-smoothed objective (E1).
+# resource_adj_dur is still FD because durations affect the resource
+# profile through ES/EF (CPM forward pass) -- the smoothing makes the
+# outer function differentiable but not CPM itself.  Reverse-mode AD
+# through CPM is the eventual fix; out of scope for E1.
 # ---------------------------------------------------------------------------
 
-_FD_EPS = 0.1   # perturbation size (time units)
-_FD_MAX_N = 500  # skip O(n^2) FD loop for graphs above this size
+_FD_EPS = 0.1   # perturbation size (time units) for resource_adj_dur
+_FD_MAX_N = 500  # cap on resource_adj_dur (each FD probe runs CPM)
 
 
 def resource_adj_dur(dag_state, params, project_ctx=None):
-    """dResourcePenalty/dd_i via forward finite differences."""
+    """dResourcePenalty/dd_i via finite differences over CPM.
+
+    Durations affect the resource profile through ES/EF, so each FD
+    probe must re-run CPM.  The smoothed objective (E1) is well-
+    conditioned at the existing _FD_EPS but doesn't eliminate the
+    O(n) CPM evaluations -- the cap stays.
+    """
     from .objectives import resource_objective
 
     n = dag_state.n
@@ -106,24 +118,50 @@ def resource_adj_dur(dag_state, params, project_ctx=None):
 
 
 def resource_adj_res(dag_state, params, project_ctx=None):
-    """dResourcePenalty/dr_i via forward finite differences."""
-    from .objectives import resource_objective
+    """dResourcePenalty/dr_i analytically.  No FD, no cap.
+
+    Per roadmap item E1.  The smoothed resource_objective (see
+    solver/objectives.py) is everywhere differentiable.  Chain rule:
+
+        ∂penalty/∂r_i = Σ_{k ∈ active(i)} (∂penalty/∂profile_k) · 1
+
+    where ``active(i) = [sb_i, eb_i)`` is the half-open bin range
+    covered by activity *i* (∂profile_k/∂r_i = 1 over that range,
+    0 elsewhere).
+
+    Per-bin gradient of the smoothed penalty:
+
+        ∂penalty/∂profile_k =
+            2 · softplus(profile_k - cap, β) · sigmoid(β·(profile_k - cap))
+              · bin_width
+
+    where softplus comes from numpy.logaddexp and sigmoid from
+    scipy.special.expit (numerically stable canonical primitives).
+    """
+    from scipy.special import expit
+    from .objectives import (
+        _build_resource_profile, RESOURCE_SMOOTHING_BETA,
+    )
 
     n = dag_state.n
     grad = np.zeros(n, dtype=np.float64)
-    if n > _FD_MAX_N:
-        import logging
-        logging.getLogger(__name__).info(
-            "Skipping resource resource FD gradient (n=%d > %d)", n, _FD_MAX_N)
+    built = _build_resource_profile(dag_state, params, project_ctx)
+    if built is None:
         return grad
-    base_val = resource_objective(dag_state, params, project_ctx)
+
+    profile, capacity, bin_width, activity_bins = built
+    delta = RESOURCE_SMOOTHING_BETA * (profile - capacity)
+    softplus_over_beta = np.logaddexp(0.0, delta) / RESOURCE_SMOOTHING_BETA
+    sigmoid = expit(delta)
+    per_bin_grad = 2.0 * softplus_over_beta * sigmoid * bin_width
 
     for i in range(n):
-        orig = params.resource_counts[i]
-        params.resource_counts[i] = orig + _FD_EPS
-        grad[i] = (resource_objective(dag_state, params, project_ctx)
-                    - base_val) / _FD_EPS
-        params.resource_counts[i] = orig
+        rc = params.resource_counts[i]
+        if rc <= 0:
+            continue
+        sb, eb = activity_bins[i]
+        if eb > sb:
+            grad[i] = float(per_bin_grad[sb:eb].sum())
 
     return grad
 

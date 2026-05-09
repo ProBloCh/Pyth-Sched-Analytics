@@ -19,7 +19,8 @@ from solver.objectives import (
 )
 from solver.adjoints import (
     schedule_adj_dur, cost_adj_dur, cost_adj_res,
-    quality_adj_dur, resource_adj_dur, compute_gradients,
+    quality_adj_dur, resource_adj_dur, resource_adj_res,
+    compute_gradients,
 )
 from solver.optimizer import optimize
 from solver.stochastic import run_ensemble
@@ -198,14 +199,20 @@ class TestObjectives:
         assert risk_objective(state, params) > 0.0
 
     def test_resource_objective_no_overalloc(self):
-        """No overallocation -> zero penalty."""
+        """No overallocation -> penalty below numerical noise.
+
+        Pre-E1 (np.maximum): exactly 0.0.
+        Post-E1 (logsumexp): softplus(-80) ≈ exp(-80) ≈ 1.8e-36 per
+        bin, squared and summed gives ~3e-73 -- below any meaningful
+        gradient signal.  Threshold relaxed to 1e-50.
+        """
         nodes = [{'ID': 'A', 'Duration': 10}]
         state, _ = build_dag(nodes, [])
         params = build_activity_params(nodes, {
             'A': {'resource_count': 2, 'resource_rate': 100}
         })
         ctx = ProjectContext(resource_capacities={'default': 10})
-        assert resource_objective(state, params, ctx) == 0.0
+        assert resource_objective(state, params, ctx) < 1e-50
 
     def test_compute_objectives_dispatch(self, diamond_schedule,
                                          diamond_metadata):
@@ -328,6 +335,142 @@ class TestAdjoints:
         assert 'cost' in grads
         assert 'duration' in grads['schedule']
         assert 'resources' in grads['schedule']
+
+
+# =====================================================================
+# E1 — logsumexp-smoothed resource_objective + analytic resource_adj_res
+# =====================================================================
+
+class TestE1LogsumexpResourceSmoothing:
+    """Roadmap item E1: replace ``np.maximum(profile - cap, 0)`` with
+    softplus so resource_adj_res can be analytic (no FD, no
+    _FD_MAX_N=500 cap).
+
+    Success metric (docs/exceed-alice-roadmap.md Dimension Index):
+      "_FD_MAX_N=500 cliff removed; analytic gradient ≤ 1e-5 rel of
+       FD on 50-bin profile"
+    """
+
+    def test_smoothed_objective_below_noise_when_well_below_capacity(self):
+        """Feasible profile (rc=2, cap=10 -> slack 8 in profile-units,
+        β·slack = 80) yields softplus ≈ exp(-80) ≈ 1.8e-36 per bin.
+        Squared and summed gives ~3e-71 -- well below any gradient
+        signal floor.  Threshold ≤ 1e-50 leaves a 21-decade margin.
+        """
+        nodes = [{'ID': 'A', 'Duration': 10}]
+        state, _ = build_dag(nodes, [])
+        params = build_activity_params(nodes, {
+            'A': {'resource_count': 2}
+        })
+        ctx = ProjectContext(resource_capacities={'default': 10})
+        assert resource_objective(state, params, ctx) < 1e-50
+
+    def test_smoothed_objective_nonzero_when_overallocated(self):
+        """Three parallel activities with rc=5, cap=10 -> overshoot of
+        5 per bin.  Penalty must be strictly positive.
+        """
+        nodes = [{'ID': f'A{i}', 'Duration': 10} for i in range(3)]
+        state, _ = build_dag(nodes, [])
+        params = build_activity_params(nodes, {
+            f'A{i}': {'resource_count': 5} for i in range(3)
+        })
+        ctx = ProjectContext(resource_capacities={'default': 10})
+        assert resource_objective(state, params, ctx) > 0.0
+
+    def test_smoothed_objective_smooth_at_capacity_boundary(self):
+        """Profile exactly at capacity -- the kink that np.maximum
+        leaves at zero is smoothed out by logsumexp.  The penalty
+        should be positive (softplus(0)/β = log(2)/β ≈ 0.0693 per
+        bin, squared) but small.
+        """
+        nodes = [{'ID': 'A', 'Duration': 10}]
+        state, _ = build_dag(nodes, [])
+        params = build_activity_params(nodes, {
+            'A': {'resource_count': 10}  # exactly at capacity
+        })
+        ctx = ProjectContext(resource_capacities={'default': 10})
+        v = resource_objective(state, params, ctx)
+        # log(2)/10 ≈ 0.0693 per bin; squared ≈ 4.8e-3 per bin times
+        # n_bins=10 bins (Duration=10, bin_width=1) ≈ 0.048.
+        assert 0.0 < v < 0.5
+
+    def test_resource_adj_res_analytic_matches_fd_50_bin_profile(self):
+        """E1 success metric: analytic gradient agrees with FD to
+        ≤ 1e-5 relative on a project producing a ~50-bin profile.
+        """
+        # 20 activities in a linear chain with mixed durations -> CPM
+        # makespan ~50, n_bins capped at 50.  Resource counts
+        # randomised (seeded) so profile bins vary.
+        n_act = 20
+        nodes = [{'ID': f'A{i}', 'Duration': 2 + (i % 3)}
+                 for i in range(n_act)]
+        # Deliberately overlapping: every other activity is
+        # parallel-able, generating overallocated bins.
+        links = []
+        for i in range(2, n_act):
+            links.append({'source': f'A{i-2}', 'target': f'A{i}'})
+        state, _ = build_dag(nodes, links)
+
+        rng = np.random.default_rng(seed=42)
+        rcs = rng.uniform(2.0, 7.0, n_act)
+        meta = {f'A{i}': {'resource_count': float(rcs[i])}
+                for i in range(n_act)}
+        params = build_activity_params(nodes, meta)
+        ctx = ProjectContext(resource_capacities={'default': 8})
+
+        g_an = resource_adj_res(state, params, ctx)
+
+        # Reference: forward FD with small eps (objective is smooth)
+        eps = 1e-6
+        g_fd = np.zeros(n_act)
+        base = resource_objective(state, params, ctx)
+        for i in range(n_act):
+            orig = params.resource_counts[i]
+            params.resource_counts[i] = orig + eps
+            g_fd[i] = (resource_objective(state, params, ctx)
+                       - base) / eps
+            params.resource_counts[i] = orig
+
+        # Skip activities whose FD gradient is below the FD noise
+        # floor (~eps × n_bins × float-roundoff); compare the rest in
+        # relative terms.
+        nonzero = np.abs(g_fd) > 1e-6
+        assert nonzero.any(), "fixture must produce nonzero gradients"
+        rel_err = (np.abs(g_an[nonzero] - g_fd[nonzero])
+                   / np.abs(g_fd[nonzero]))
+        assert rel_err.max() < 1e-5, \
+            f"max relative error {rel_err.max():.2e} exceeds 1e-5"
+
+    def test_resource_adj_res_no_fd_max_n_cap(self):
+        """Pre-E1 the FD path returned all zeros for n > _FD_MAX_N=500.
+        The analytic path has no such cap.  Verify by running on
+        n=600 parallel activities and confirming a populated gradient
+        comes back (>500 nonzero entries).
+        """
+        n_act = 600
+        nodes = [{'ID': f'A{i}', 'Duration': 10} for i in range(n_act)]
+        # No links -> all parallel, all overlap, all overallocate.
+        state, _ = build_dag(nodes, [])
+        meta = {f'A{i}': {'resource_count': 1.0} for i in range(n_act)}
+        params = build_activity_params(nodes, meta)
+        ctx = ProjectContext(resource_capacities={'default': 5})
+
+        g_an = resource_adj_res(state, params, ctx)
+        nonzero_count = int(np.count_nonzero(np.abs(g_an) > 1e-12))
+        assert nonzero_count > 500, \
+            f"only {nonzero_count} nonzero gradients; cap not removed?"
+
+    def test_resource_adj_res_zero_when_feasible(self):
+        """Below-capacity profile produces ~zero gradient (sigmoid
+        underflows to 0)."""
+        nodes = [{'ID': 'A', 'Duration': 10}]
+        state, _ = build_dag(nodes, [])
+        params = build_activity_params(nodes, {
+            'A': {'resource_count': 2}
+        })
+        ctx = ProjectContext(resource_capacities={'default': 10})
+        g = resource_adj_res(state, params, ctx)
+        assert np.abs(g).max() < 1e-12
 
 
 # =====================================================================
