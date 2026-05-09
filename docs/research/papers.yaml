@@ -1,0 +1,594 @@
+# Research-provenance knowledge graph for Pyth-Sched-Analytics.
+#
+# Source of truth for every paper / report / standard cited in the
+# codebase or the planning docs.  Entries are validated by
+# tools/research_graph and reconciled against the codebase via the
+# `python -m tools.research_graph sync` command (run automatically in
+# CI -- see .github/workflows/research-graph.yml).
+#
+# Schema documented in docs/research/README.md.  All `status:
+# unverified` entries should be re-checked against Crossref / arXiv
+# via `python -m tools.research_graph verify` before being relied on.
+# Citations were transcribed from earlier doc commits and the
+# planning roadmap; until verified, treat them as starting points
+# for a literature check, not authoritative.
+---
+schema_version: 1
+papers:
+
+# ===== Critical Path Method foundational =====
+- key: elmaghraby_1977
+  title: "Activity Networks: Project Planning and Control by Network Models"
+  authors: ["Elmaghraby, Salah E."]
+  year: 1977
+  venue: "Wiley-Interscience"
+  type: textbook
+  status: unverified
+  aliases: ["Elmaghraby 1977", "Elmaghraby, 1977"]
+  summary: >
+    Standard reference for precedence diagram method (PDM) including
+    finish-to-start, start-to-start, finish-to-finish and start-to-finish
+    relationships with lag.  The CPM forward/backward pass in solver/dag.py
+    follows this formulation.
+  methods: [CPM, PDM, FS_SS_FF_SF_lag]
+  cites: []
+
+- key: van_slyke_1963
+  title: "Monte Carlo Methods and the PERT Problem"
+  authors: ["Van Slyke, Richard M."]
+  year: 1963
+  venue: "Operations Research, 11(5), 839-860"
+  type: paper
+  doi: "10.1287/opre.11.5.839"
+  status: unverified
+  aliases: ["Van Slyke 1963", "Van Slyke, 1963"]
+  summary: >
+    Establishes the Criticality Index (CI): the fraction of MC samples
+    in which a given activity is on the critical path.  Implemented in
+    solver/analysis.py.
+  methods: [criticality_index, monte_carlo_pert]
+  cites: []
+
+- key: williams_1992
+  title: "Criticality in Stochastic Networks"
+  authors: ["Williams, Terry"]
+  year: 1992
+  venue: "Journal of the Operational Research Society, 43(4), 353-357"
+  type: paper
+  doi: "10.1057/jors.1992.50"
+  status: unverified
+  aliases: ["Williams 1992", "Williams, 1992"]
+  summary: >
+    Introduces the Cruciality Index: Spearman correlation between an
+    activity's duration and the project makespan across an MC ensemble.
+    Captures schedule sensitivity that the Criticality Index misses for
+    near-critical activities.
+  methods: [cruciality_index, schedule_sensitivity]
+  cites: [van_slyke_1963]
+
+# ===== Sampling & numerical foundations =====
+- key: sobol_1967
+  title: >
+    On the Distribution of Points in a Cube and the Approximate Evaluation
+    of Integrals
+  authors: ["Sobol', Ilya M."]
+  year: 1967
+  venue: "USSR Computational Mathematics and Mathematical Physics, 7(4), 86-112"
+  type: paper
+  doi: "10.1016/0041-5553(67)90144-9"
+  status: unverified
+  aliases: ["Sobol 1967", "Sobol', 1967", "Sobol, 1967"]
+  summary: >
+    Introduces the Sobol' low-discrepancy sequence.  Used by
+    solver/stochastic.py via scipy.stats.qmc.Sobol for the MC ensemble
+    and (per the roadmap) for D3.1 multi-start L-BFGS-B seeding.
+  methods: [sobol_qmc, low_discrepancy_sampling]
+  cites: []
+  sketch: docs/research/sketches/sobol_qmc.py
+
+# ===== Optimisation =====
+- key: nocedal_wright_2006
+  title: "Numerical Optimization"
+  authors: ["Nocedal, Jorge", "Wright, Stephen J."]
+  year: 2006
+  venue: "Springer Series in Operations Research and Financial Engineering, 2nd ed."
+  type: textbook
+  doi: "10.1007/978-0-387-40065-5"
+  status: unverified
+  aliases: ["Nocedal and Wright 2006", "Nocedal & Wright 2006", "Nocedal & Wright, 2006"]
+  summary: >
+    Standard reference for L-BFGS-B (Chapter 6), KKT conditions
+    (Chapter 12), augmented Lagrangian (Chapter 17), and trust-region
+    methods (Chapter 4).  Cited from solver/optimizer.py.
+  methods: [L_BFGS_B, KKT, augmented_lagrangian, trust_region]
+  cites: []
+
+- key: steuer_choo_1983
+  title: "An Interactive Weighted Tchebycheff Procedure for Multiple Objective Programming"
+  authors: ["Steuer, Ralph E.", "Choo, Eng-Ung"]
+  year: 1983
+  venue: "Mathematical Programming, 26(3), 326-344"
+  type: paper
+  doi: "10.1007/BF02591870"
+  status: unverified
+  aliases: ["Steuer and Choo 1983", "Steuer & Choo 1983", "Steuer & Choo, 1983"]
+  summary: >
+    Introduces augmented Tchebycheff scalarisation -- finds points on
+    non-convex Pareto frontiers that weighted-sum scalarisation misses.
+    Used by solver/optimizer.py for the Pareto sweep.
+  methods: [augmented_tchebycheff, multiobjective_optimization]
+  cites: []
+
+- key: hansen_ostermeier_2001
+  title: "Completely Derandomized Self-Adaptation in Evolution Strategies"
+  authors: ["Hansen, Nikolaus", "Ostermeier, Andreas"]
+  year: 2001
+  venue: "Evolutionary Computation, 9(2), 159-195"
+  type: paper
+  doi: "10.1162/106365601750190398"
+  status: unverified
+  aliases: ["Hansen and Ostermeier 2001", "Hansen & Ostermeier 2001"]
+  summary: >
+    Introduces Covariance Matrix Adaptation Evolution Strategy
+    (CMA-ES).  Cited in the roadmap deferred-items list -- demoted
+    from active backlog due to O(n^2) memory cost.
+  methods: [CMA_ES, evolution_strategies]
+  cites: []
+
+- key: knowles_2006
+  title: >
+    ParEGO: A Hybrid Algorithm with On-Line Landscape Approximation
+    for Expensive Multiobjective Optimization Problems
+  authors: ["Knowles, Joshua"]
+  year: 2006
+  venue: "IEEE Transactions on Evolutionary Computation, 10(1), 50-66"
+  type: paper
+  doi: "10.1109/TEVC.2005.851274"
+  status: unverified
+  aliases: ["Knowles 2006"]
+  summary: >
+    Bayesian-optimisation Pareto sweep using a Gaussian-process
+    surrogate of the Tchebycheff scalarisation.  Cited in the roadmap
+    deferred items -- ParEGO economics work for expensive evaluations
+    only; our microsecond CPM doesn't qualify.
+  methods: [ParEGO, bayesian_optimization, multiobjective_optimization]
+  cites: [steuer_choo_1983]
+
+# ===== Earned Schedule (EVM) =====
+- key: lipke_2003
+  title: "Schedule is Different"
+  authors: ["Lipke, Walt"]
+  year: 2003
+  venue: "The Measurable News, Summer 2003, 31-34"
+  type: paper
+  status: unverified
+  aliases: ["Lipke 2003", "Lipke, 2003", "Lipke (2003)"]
+  summary: >
+    Introduces Earned Schedule (ES): a time-based EVM measure that
+    avoids the SPI = 1 paradox at project end.  ES samples the cumulative
+    PV at every activity Start/Finish boundary; SPI(t) = ES / AT.
+    Implemented in evm/metrics.py::compute_earned_schedule and
+    surfaced in the /evm/analyze response.
+  methods: [earned_schedule, SPI_t, TEAC_t]
+  cites: []
+
+# ===== Birnbaum-Saunders distribution =====
+- key: birnbaum_saunders_1969
+  title: "A New Family of Life Distributions"
+  authors: ["Birnbaum, Z. W.", "Saunders, S. C."]
+  year: 1969
+  venue: "Journal of Applied Probability, 6(2), 319-327"
+  type: paper
+  doi: "10.2307/3212003"
+  status: unverified
+  aliases: ["Birnbaum and Saunders 1969", "Birnbaum & Saunders 1969"]
+  summary: >
+    Introduces the Birnbaum-Saunders fatigue-life distribution.
+    Adopted in solver/stochastic.py (tier 4 of the 5-tier risk model)
+    as the empirical fit for offshore O&G overruns per Natarajan PMJ 2022.
+  methods: [birnbaum_saunders, fatigue_life_distribution]
+  cites: []
+  sketch: docs/research/sketches/birnbaum_saunders.py
+
+# ===== Reference-class forecasting =====
+- key: natarajan_pmj_2022
+  title: >
+    Reference Class Forecasting for Capital Project Schedules: Empirical
+    Validation of Fat-Tailed Overrun Distributions
+  authors: ["Natarajan, A.", "et al."]
+  year: 2022
+  venue: "Project Management Journal"
+  type: paper
+  status: unverified
+  aliases: ["Natarajan 2022", "Natarajan et al. 2022", "Natarajan PMJ 2022", "Natarajan et al., PMJ 2022"]
+  summary: >
+    Empirically validates the Birnbaum-Saunders distribution for
+    offshore O&G project schedule overruns (KS p=0.89).  Introduces 2D
+    cost-schedule extreme-event clustering (Figs 15-17) and dragon-king
+    detection in joint overrun space.  Drives the BS tier choice and
+    α calibration in solver/stochastic.py and solver/reference_classes.py.
+  methods: [reference_class_forecasting, birnbaum_saunders, dragon_king_detection,
+            two_d_extreme_clustering]
+  cites: [birnbaum_saunders_1969, sornette_2009]
+  sketch: docs/research/sketches/pareto_powerlaw.py
+
+- key: flyvbjerg_jmis_2022
+  title: "How Common and How Large Are Cost Overruns in Major IT Projects?"
+  authors: ["Flyvbjerg, Bent", "et al."]
+  year: 2022
+  venue: "Journal of Management Information Systems"
+  type: paper
+  status: unverified
+  aliases: ["Flyvbjerg 2022", "Flyvbjerg et al. 2022", "Flyvbjerg JMIS 2022", "Flyvbjerg et al., JMIS 2022"]
+  summary: >
+    Establishes the Pareto power-law model of IT-project cost overruns
+    with α ≈ 2.35.  Drives the Pareto-tier α calibration formula
+    α = 2.0 + 1.5 * (1 - risk) in solver/stochastic.py.  Companion to
+    flyvbjerg_gardner_2023 for the cross-sector classification of
+    fat-tailed vs thin-tailed sectors.
+  methods: [pareto_powerlaw, fat_tail_overruns]
+  cites: []
+
+- key: flyvbjerg_bester_2021
+  title: "The Cost-Benefit Fallacy: Why Cost-Benefit Analysis Is Broken"
+  authors: ["Flyvbjerg, Bent", "Bester, Dirk"]
+  year: 2021
+  venue: "Journal of Benefit-Cost Analysis, 12(3), 395-419"
+  type: paper
+  doi: "10.1017/bca.2021.9"
+  status: unverified
+  aliases: ["Flyvbjerg and Bester 2021", "Flyvbjerg & Bester 2021"]
+  summary: >
+    Argues for empirical reference-class calibration over judgment-based
+    forecasts in megaproject planning.  Cited from
+    solver/reference_classes.py.
+  methods: [reference_class_forecasting, calibration]
+  cites: []
+
+- key: flyvbjerg_gardner_2023
+  title: "How Big Things Get Done"
+  authors: ["Flyvbjerg, Bent", "Gardner, Dan"]
+  year: 2023
+  venue: "Currency / Random House"
+  type: textbook
+  status: unverified
+  aliases: ["Flyvbjerg and Gardner 2023", "Flyvbjerg & Gardner 2023"]
+  summary: >
+    Cross-sector classification of fat-tailed vs thin-tailed project types.
+    Drives the per-class tier-4 distribution choice (`birnbaum_saunders`
+    / `lognormal` / `skip`) in solver/reference_classes.py for sectors
+    like roads, solar, batteries (thin-tailed) vs nuclear, IT, Olympics
+    (fat-tailed).
+  methods: [reference_class_forecasting, sector_classification]
+  cites: [flyvbjerg_jmis_2022]
+
+- key: aaen_flyvbjerg_pmj_2025
+  title: >
+    Uniqueness of IT Cost Risk: A 23-Type Project Taxonomy
+  authors: ["Aaen, Jan", "Flyvbjerg, Bent", "et al."]
+  year: 2025
+  venue: "Project Management Journal"
+  type: paper
+  status: unverified
+  aliases: ["Aaen 2025", "Aaen et al. 2025", "Aaen, Flyvbjerg et al. PMJ 2025",
+            "Aaen / Flyvbjerg 2025", "Aaen, Flyvbjerg 2025"]
+  summary: >
+    Extends the per-class fat-tail taxonomy from Flyvbjerg & Gardner 2023
+    to 23 project types.  Cited as the basis for RW-§6.6.2 (extending
+    solver/reference_classes.py from 19 to 23 classes).
+  methods: [reference_class_forecasting, sector_classification]
+  cites: [flyvbjerg_gardner_2023, flyvbjerg_jmis_2022]
+
+- key: sovacool_gilbert_2014
+  title: >
+    Conceptualizing and Measuring Energy Security: A Synthesized Approach
+  authors: ["Sovacool, Benjamin K.", "Gilbert, Alex"]
+  year: 2014
+  venue: "Energy"
+  type: paper
+  status: unverified
+  aliases: ["Sovacool and Gilbert 2014", "Sovacool & Gilbert 2014"]
+  summary: >
+    n=401 electricity projects, mean overrun 117.3%.  Source for the
+    electricity / power-generation reference class calibration in
+    solver/reference_classes.py.
+  methods: [reference_class_forecasting, empirical_overrun_data]
+  cites: []
+
+# ===== Tail-risk and extreme-value theory =====
+- key: sornette_2009
+  title: "Dragon-Kings, Black Swans and the Prediction of Crises"
+  authors: ["Sornette, Didier"]
+  year: 2009
+  venue: "International Journal of Terraspace Science and Engineering, 2(1)"
+  type: paper
+  arxiv: "0907.4290"
+  status: unverified
+  aliases: ["Sornette 2009"]
+  summary: >
+    Introduces the dragon-king concept: outliers-among-outliers that
+    sit above the Pareto power-law tail.  Implemented in
+    solver/analysis.py as the dragon-king detector and 2D cost-schedule
+    extreme-event clustering.
+  methods: [dragon_king_detection, fat_tail_outliers]
+  cites: []
+
+- key: pickands_1975
+  title: "Statistical Inference Using Extreme Order Statistics"
+  authors: ["Pickands, James III"]
+  year: 1975
+  venue: "Annals of Statistics, 3(1), 119-131"
+  type: paper
+  doi: "10.1214/aos/1176343003"
+  status: unverified
+  aliases: ["Pickands 1975", "Pickands, 1975", "Pickands (1975)"]
+  summary: >
+    Foundational result: exceedances over a high threshold converge
+    asymptotically to the Generalized Pareto Distribution (GPD).
+    Cited in the roadmap as basis for R1 -- a possible upgrade of
+    the tier-5 Pareto-power-law to GPD.
+  methods: [GPD, extreme_value_theory, threshold_exceedance]
+  cites: []
+
+- key: coles_2001
+  title: "An Introduction to Statistical Modeling of Extreme Values"
+  authors: ["Coles, Stuart"]
+  year: 2001
+  venue: "Springer Series in Statistics"
+  type: textbook
+  doi: "10.1007/978-1-4471-3675-0"
+  status: unverified
+  aliases: ["Coles 2001"]
+  summary: >
+    Standard reference for extreme-value methodology, including
+    threshold-selection diagnostics (mean residual life, Hill plot)
+    needed to operationalise GPD per Pickands 1975.
+  methods: [extreme_value_theory, GPD, threshold_selection]
+  cites: [pickands_1975]
+
+# ===== Variance reduction and rare-event simulation =====
+- key: au_beck_2001
+  title: >
+    Estimation of Small Failure Probabilities in High Dimensions by Subset Simulation
+  authors: ["Au, Siu-Kui", "Beck, James L."]
+  year: 2001
+  venue: "Probabilistic Engineering Mechanics, 16(4), 263-277"
+  type: paper
+  doi: "10.1016/S0266-8920(01)00019-4"
+  status: unverified
+  aliases: ["Au and Beck 2001", "Au & Beck 2001"]
+  summary: >
+    Introduces subset simulation for rare-event probabilities.
+    Cited in roadmap as backbone of E5 (P95+ tail probabilities with
+    ~10x variance reduction over vanilla MC).
+  methods: [subset_simulation, rare_event_simulation, importance_sampling]
+  cites: []
+
+- key: giles_2008
+  title: "Multilevel Monte Carlo Path Simulation"
+  authors: ["Giles, Michael B."]
+  year: 2008
+  venue: "Operations Research, 56(3), 607-617"
+  type: paper
+  doi: "10.1287/opre.1070.0496"
+  status: unverified
+  aliases: ["Giles 2008"]
+  summary: >
+    Introduces Multilevel Monte Carlo (MLMC).  Cited in roadmap as a
+    deferred item: the proposed application to our 5-tier composite
+    distribution requires a real refinement coupling that the original
+    draft glossed over.
+  methods: [multilevel_monte_carlo, variance_reduction]
+  cites: []
+
+# ===== Community detection =====
+- key: lancichinetti_fortunato_2012
+  title: "Consensus Clustering in Complex Networks"
+  authors: ["Lancichinetti, Andrea", "Fortunato, Santo"]
+  year: 2012
+  venue: "Scientific Reports, 2, 336"
+  type: paper
+  doi: "10.1038/srep00336"
+  status: unverified
+  aliases: ["Lancichinetti and Fortunato 2012", "Lancichinetti & Fortunato 2012"]
+  summary: >
+    NMI-based stability metric for community detection across multiple
+    runs.  Cited in multi_resolution_pipeline.py for the multi-resolution
+    Louvain ladder stability analysis.
+  methods: [community_detection, NMI, multi_resolution_communities]
+  cites: []
+
+- key: traag_2019
+  title: >
+    From Louvain to Leiden: Guaranteeing Well-Connected Communities
+  authors: ["Traag, V. A.", "Waltman, L.", "van Eck, N. J."]
+  year: 2019
+  venue: "Scientific Reports, 9, 5233"
+  type: paper
+  doi: "10.1038/s41598-019-41695-z"
+  status: unverified
+  aliases: ["Traag 2019", "Traag et al. 2019", "Traag et al., 2019"]
+  summary: >
+    Introduces Leiden algorithm, eliminating the disconnected-community
+    defect of Louvain.  Cited in CLAUDE.md future improvements and
+    RW-§6.3.1 as a switchable alternative behind a COMMUNITY_ALGORITHM
+    flag.
+  methods: [leiden_algorithm, community_detection]
+  cites: []
+
+# ===== Density-based clustering =====
+- key: campello_2013
+  title: "Density-Based Clustering Based on Hierarchical Density Estimates"
+  authors: ["Campello, Ricardo J. G. B.", "Moulavi, Davoud", "Sander, Joerg"]
+  year: 2013
+  venue: "Pacific-Asia Conf on Knowledge Discovery and Data Mining (PAKDD)"
+  type: paper
+  doi: "10.1007/978-3-642-37456-2_14"
+  status: unverified
+  aliases: ["Campello 2013", "Campello et al. 2013"]
+  summary: >
+    Introduces HDBSCAN.  Used in app.py::pattern_detection for
+    activity clustering on (TaskType, Resources, Duration).
+  methods: [HDBSCAN, density_clustering]
+  cites: []
+
+# ===== Self-exciting point processes =====
+- key: hawkes_1971
+  title: "Spectra of Some Self-Exciting and Mutually Exciting Point Processes"
+  authors: ["Hawkes, Alan G."]
+  year: 1971
+  venue: "Biometrika, 58(1), 83-90"
+  type: paper
+  doi: "10.1093/biomet/58.1.83"
+  status: unverified
+  aliases: ["Hawkes 1971"]
+  summary: >
+    Foundational paper on self-exciting point processes.  Cited in the
+    roadmap research-gated section (R6) as the basis for delay-cascade
+    modelling once timestamped outcome data accumulates.
+  methods: [hawkes_process, self_exciting_point_process]
+  cites: []
+
+- key: daley_verejones_2003
+  title: "An Introduction to the Theory of Point Processes, Vol I"
+  authors: ["Daley, Daryl J.", "Vere-Jones, David"]
+  year: 2003
+  venue: "Springer Probability and Its Applications"
+  type: textbook
+  doi: "10.1007/b97277"
+  status: unverified
+  aliases: ["Daley and Vere-Jones 2003", "Daley & Vere-Jones 2003"]
+  summary: >
+    Standard textbook reference for Hawkes processes (§7) and the
+    thinning-based simulation algorithm.
+  methods: [hawkes_process, thinning_algorithm, point_processes]
+  cites: [hawkes_1971]
+
+# ===== Copulas and joint distributions =====
+- key: aas_2009
+  title: "Pair-Copula Constructions of Multiple Dependence"
+  authors: ["Aas, Kjersti", "Czado, Claudia", "Frigessi, Arnoldo", "Bakken, Henrik"]
+  year: 2009
+  venue: "Insurance: Mathematics and Economics, 44(2), 182-198"
+  type: paper
+  doi: "10.1016/j.insmatheco.2007.02.001"
+  status: unverified
+  aliases: ["Aas 2009", "Aas et al. 2009", "Aas, Czado, Frigessi & Bakken 2009"]
+  summary: >
+    Introduces vine copulas for multivariate dependence via pair-copula
+    decomposition.  Cited in roadmap R2 as the basis for >2-discipline
+    joint cost-schedule-quality dependence modelling.
+  methods: [vine_copulas, multivariate_dependence]
+  cites: []
+
+# ===== Skewed distributions =====
+- key: azzalini_capitanio_2003
+  title: >
+    Distributions Generated by Perturbation of Symmetry with Emphasis
+    on a Multivariate Skew t Distribution
+  authors: ["Azzalini, Adelchi", "Capitanio, Antonella"]
+  year: 2003
+  venue: "Journal of the Royal Statistical Society B, 65(2), 367-389"
+  type: paper
+  doi: "10.1111/1467-9868.00391"
+  status: unverified
+  aliases: ["Azzalini and Capitanio 2003", "Azzalini & Capitanio 2003"]
+  summary: >
+    Introduces the multivariate skew-t distribution.  Cited in roadmap
+    E6 as a candidate for an opt-in additional tier in the 5-tier risk
+    cascade.
+  methods: [skewed_t, asymmetric_distributions]
+  cites: []
+
+# ===== Variational inference and information criteria =====
+- key: liu_wang_2016
+  title: >
+    Stein Variational Gradient Descent: A General Purpose Bayesian
+    Inference Algorithm
+  authors: ["Liu, Qiang", "Wang, Dilin"]
+  year: 2016
+  venue: "Advances in Neural Information Processing Systems (NeurIPS) 29"
+  type: paper
+  arxiv: "1608.04471"
+  status: unverified
+  aliases: ["Liu and Wang 2016", "Liu & Wang 2016"]
+  summary: >
+    Introduces SVGD: particle-based variational inference using
+    Stein's method.  Cited in roadmap R4 as a candidate for D8.2
+    posterior approximation, faster than MCMC for low-dim smooth
+    posteriors.
+  methods: [SVGD, variational_inference, particle_methods]
+  cites: []
+
+- key: watanabe_2010
+  title: >
+    Asymptotic Equivalence of Bayes Cross Validation and Widely
+    Applicable Information Criterion in Singular Learning Theory
+  authors: ["Watanabe, Sumio"]
+  year: 2010
+  venue: "Journal of Machine Learning Research, 11, 3571-3594"
+  type: paper
+  url: "https://www.jmlr.org/papers/v11/watanabe10a.html"
+  status: unverified
+  aliases: ["Watanabe 2010"]
+  summary: >
+    Introduces WAIC (Widely Applicable Information Criterion).  Cited
+    in roadmap R3 as the model-selection tool for data-driven tier
+    selection in the 5-tier risk cascade -- gates on R4 / MCMC for
+    posterior samples.
+  methods: [WAIC, model_selection, information_criteria]
+  cites: []
+
+# ===== Proper scoring rules =====
+- key: gneiting_2008
+  title: "Assessing Probabilistic Forecasts of Multivariate Quantities"
+  authors: ["Gneiting, Tilmann", "Stanberry, Larissa I.", "Grimit, Eric P.",
+            "Held, Leonhard", "Johnson, Nicholas A."]
+  year: 2008
+  venue: "TEST, 17(2), 211-235"
+  type: paper
+  doi: "10.1007/s11749-008-0114-x"
+  status: unverified
+  aliases: ["Gneiting 2008", "Gneiting et al. 2008"]
+  summary: >
+    Introduces multivariate proper scoring rules including the Energy
+    Score.  Cited in roadmap R5 as the multivariate generalisation of
+    CRPS for joint cost-schedule calibration.
+  methods: [energy_score, proper_scoring_rules, multivariate_calibration]
+  cites: []
+
+- key: scheuerer_hamill_2015
+  title: >
+    Variogram-Based Proper Scoring Rules for Probabilistic Forecasts of
+    Multivariate Quantities
+  authors: ["Scheuerer, Michael", "Hamill, Thomas M."]
+  year: 2015
+  venue: "Monthly Weather Review, 143(4), 1321-1334"
+  type: paper
+  doi: "10.1175/MWR-D-14-00269.1"
+  status: unverified
+  aliases: ["Scheuerer and Hamill 2015", "Scheuerer & Hamill 2015"]
+  summary: >
+    Variogram score: multivariate proper scoring rule sensitive to
+    correlation structure.  Companion to Gneiting et al. 2008 for
+    R5 multivariate calibration.
+  methods: [variogram_score, proper_scoring_rules, multivariate_calibration]
+  cites: [gneiting_2008]
+
+# ===== Industry / government data sources =====
+- key: budzier_flyvbjerg_2024
+  title: "The Olympics: Cost, Time, and Stakeholder Reaction"
+  authors: ["Budzier, Alexander", "Flyvbjerg, Bent"]
+  year: 2024
+  venue: "arXiv 2406.01714"
+  type: preprint
+  arxiv: "2406.01714"
+  status: unverified
+  aliases: ["Budzier and Flyvbjerg 2024", "Budzier & Flyvbjerg 2024",
+            "Oxford Olympics Study 2024"]
+  summary: >
+    Updated Oxford Olympics dataset, mean overrun 172%.  Source for
+    the Olympics reference class calibration (alpha <= 1, infinite
+    mean) in solver/reference_classes.py.
+  methods: [reference_class_forecasting, empirical_overrun_data]
+  cites: [flyvbjerg_jmis_2022]
