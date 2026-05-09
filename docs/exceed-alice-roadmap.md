@@ -1,15 +1,80 @@
 # Exceed-Alice Roadmap (within scope of this repo)
 
-**Branch:** `claude/expand-alice-scope-7vbWP`
 **Lens:** strategic gap analysis vs Alice Technologies, mapped to concrete
 file-level milestones in this repo.
 **Scope boundary:** this is a Flask analytics service.  We do not compete on
 UI, 4D-BIM rendering, or asset management — those are out of scope.  We
-compete on **decision quality per cubic centimetre of math**.
+compete on **decision quality per cubic centimetre of math** (see
+"Adoption Story" near the bottom for why that boundary still leaves an
+open question).
 
 This document is the strategic complement to `REMAINING_WORK.md`.  Items
 referenced as `RW-§X.Y` map to section numbers there; we don't restate the
 library-pinning detail.
+
+---
+
+## How to Use This Doc
+
+**This is a menu, not a queue.**  The 10 dimensions and 12 backlog items
+below are *option-generation* — proposals for a contributor to pull
+from when slack appears or a customer ask matches.  Nothing here is
+committed work.
+
+Concrete rules:
+
+1. **Pick exactly one item** before opening an implementation PR.  The
+   PR's branch name must contain the item's identifier (e.g.,
+   `claude/d4-calendar-cpm`, `claude/e1-logsumexp-resource`).
+2. **Treat LOC and effort estimates as wishful.**  Real effort is
+   typically 1.5×–3× the planning-doc number.  Range columns in the
+   Dimension Index reflect this.
+3. **Two items max in flight at once across the team.**  More than
+   that and the dimensional dependencies (D4 → D7/D8/D9, D5 → D3/D6/D9)
+   create coordination overhead that wipes out the gains.
+4. **Update the Dimension Index when an item starts or ships.**  Owner
+   field gets a name; status flips from menu → in-progress → shipped.
+5. **Re-review this doc every 6 months** or when 3+ items have shipped,
+   whichever comes first.  Drift between doc and codebase is a real
+   risk; the review interval bounds it.
+6. **Customer-facing promises** are in the `customer_pitch` column.
+   Don't invent new ones in the per-dimension prose without updating
+   the Index.
+
+The two governance sections at the bottom of this doc — "Algorithms We
+Keep, and Why" and "Compute and Payload Budget" — have been lifted
+into `CLAUDE.md` so they govern every PR on the codebase, not only
+items pulled from this menu.
+
+## Dimension Index
+
+Every dimension below has owner / metric / pitch / effort metadata
+here.  Values marked `TBD` are filled in by the contributor who picks
+up the item.  Effort ranges are wide on purpose — point estimates from
+planning docs are unreliable.
+
+| Dim | Owner | Status | Success metric (concrete) | Customer pitch | Effort range |
+|---|---|---|---|---|---|
+| **D4** Calendar-aware CPM | TBD | menu | Per-activity ISO ES/EF/LS/LF datetimes within 1 working day of pandas `CustomBusinessHour` ground truth on the test fixtures, AND `schedule_adj_dur` analytic gradient within 1e-2 relative of FD with smoothing on a 5K-activity project | "Your TEAC band, Gantt dates, and recovery options reflect calendar-real working dates instead of abstract time units" | 4–10 weeks (adjoint kink may push higher) |
+| **D5A** Per-pool analytics | TBD | menu | `pools` block emitted on three endpoints; per-pool cruciality matches per-pool MC ground-truth within 10% on triangular fixtures; reuses `interface/analytics.py` (no new pool engine) | "We tell you which crew or equipment pool is dominating your tail risk, ranked by P80 contribution" | 2–5 weeks |
+| **D5B** Hard RCPSP/max | TBD | menu | `constraint_mode="hard"` available; CP-SAT vs L-BFGS-B agree on activity start order on no-conflict fixture; infeasibility returns 422 with witness | "Your schedule respects crew availability — guaranteed feasible under your hard caps" | 6–14 weeks (research bet on Pareto hybrid) |
+| **D7.1** Stochastic Earned Schedule | TBD | menu | Per-MC-sample Lipke ES band on `/completion/monte-carlo`; deterministic midpoint matches `/evm/analyze` to within 1 calendar day | "Your Earned Schedule isn't a single number — it's a confidence band aligned with the Monte Carlo finish-date distribution" | 2–4 weeks (D4 unblocks calendar dates) |
+| **D9.2** Salience-anchored recovery | TBD | menu | Both corridor-anchored and dragon-king-anchored recovery options surfaced via one engine call; existing JS-vs-Py harness still passes | "When your project is at risk, we tell you which corridor to parallelise OR which fat-tailed activity to mitigate, with explainability for each" | 2–4 weeks |
+| **D3.1** Multi-start L-BFGS-B | TBD | menu | K Sobol-seeded starts, top-K Pareto-non-dominated returned; matches single-start within 5% on convex fixtures, finds strictly better optima on a non-convex fixture | "Optimisation searches K starting points in parallel and returns the best — like Alice's optioneering, but with analytic gradients" | 2–4 weeks |
+| **D1.3** Copulas (cost-schedule joint) | TBD | menu | Joint MC samples drawn from chosen copula; tail-dependence λᵤ surfaced; default `independent` keeps existing behaviour | "We model joint cost-schedule extremes with peer-reviewed copula methods, not just marginal distributions" | 3–6 weeks |
+| **D2.3** Dragon-king p-value | TBD | menu | Permutation-test p-value attached to each dragon-king flag; existing threshold flag preserved | "Each fat-tail outlier comes with a confidence level, not just a binary flag" | 1–3 weeks |
+| D6.1 Leiden | TBD | menu | Behind `COMMUNITY_ALGORITHM=leiden` flag; NMI vs Louvain on fixtures within tolerance | "Better community detection (eliminates Louvain's disconnected-community defect) without breaking existing CommunityGroup field" | 1–2 weeks |
+| D7.2/D7.3 Calendar-aware percentile dates / per-activity TEAC | TBD | gated | (Unblocked by D4) | "Per-activity finish-date confidence bands honour your working calendar" | 2–4 weeks each |
+| D8 Calibration loop | TBD | gated | (Gated on `RW-§1.1` outcome data) | "Your priors get smarter with every project you close" | Multi-quarter |
+| D5B-CP-SAT image weight | TBD | menu | `EXTRAS=ortools` build path adds ≤80 MB; lean default unchanged | (Internal — feeds D5B) | 1 week |
+| D10.1 OpenAPI from `docs/api/*.md` | TBD | menu | CI fails when generated `openapi.json` drifts from markdown source | "Machine-readable API spec for SDK generation" | 2–4 weeks |
+| E1 Logsumexp resource smoothing | TBD | menu | `_FD_MAX_N=500` cliff removed; analytic gradient ≤ 1e-5 rel of FD on 50-bin profile | (Internal — eliminates a numerical limitation) | **3–7 days** (smallest item) |
+| E3 KKT residual checks | TBD | menu | KKT residual surfaced in `/solver/optimize` response; CI test asserts <1e-3 at converged optimum on fixtures | "Optimization comes with a stationarity certificate" | 2–4 days |
+| E4 Augmented Lagrangian | TBD | menu | `constraint_mode="hard_lag"` available; converges on infeasible fixture in ≤50 outer iterations | "Hard constraints without dropping gradient-based optimisation" | 3–6 weeks |
+| E5 Subset simulation | TBD | menu | P99.9 estimated with ~10⁴ samples within 5% of vanilla MC at 10⁶ samples | "Tail-risk estimates 10× more sample-efficient at P95 and beyond" | 4–8 weeks |
+| Methodological R1–R6 | — | research-gated | (Promote to engineering once data prerequisites land) | (Each item names its gate) | Multi-quarter |
+
+**Status legend:** `menu` (available, no owner), `in-progress` (owner assigned, PR open), `shipped` (merged to main, success metric verified), `gated` (waiting on prerequisite), `deferred` (in the "Won't Ship" table at the bottom).
 
 ---
 
@@ -138,7 +203,15 @@ calendar reality.
 | 4.7 | Unify `paths/calendar_slack.py` post-pass with `run_cpm` calendar mode | `paths/calendar_slack.py` | existing diff harness in `tests/test_paths_diff.py` still passes; the post-pass becomes a thin caller of the unified mode |
 | 4.8 | Update `docs/api/solver.md` with the `calendar.activity_dates` block | `docs/api/solver.md` | render check; consumer note added |
 
-### Adjoint Story (the load-bearing risk)
+### Adjoint Story (the load-bearing risk — research-grade, not engineering)
+
+> **Honest re-tag:** the eight-step milestone count above implies D4 is
+> sized like an engineering item.  This subsection isn't.  The adjoint
+> kink at non-working boundaries is a research-grade question that
+> could push effort to the high end of the 4–10 week range or surface
+> a deeper redesign.  A team picking up D4 should budget time for
+> exactly this risk, not assume it dissolves under FD smoothing.
+
 
 `schedule_adj_dur` is currently `1.0` on the critical path because
 `d(makespan)/d(d_i) = 1` when activity `i` is critical.  Under a calendar,
@@ -319,7 +392,15 @@ matching the existing Tchebycheff scalarisation.
 | 5B.7 | Infeasibility 422 + witness in route layer | `solver/routes.py`, `docs/api/solver.md` | infeasible fixture returns 422 with witness; soft mode returns 200 with violation |
 | 5B.8 | Performance guard: skip CP-SAT for n > 1000 with explanatory error | `solver/core.py` | guard test |
 
-#### Pareto Sweep Under Hard Mode (the trade-off the original plan glossed over)
+#### Pareto Sweep Under Hard Mode (research bet — not engineering)
+
+> **Honest re-tag:** this subsection describes a *hybrid* scheme
+> (L-BFGS-B Pareto frontier as starting hints for per-point CP-SAT
+> validation).  Plausible but unproven on real workloads.  Treat as a
+> research bet inside D5B, not as a sized engineering deliverable.
+> A team picking up D5B should validate the hybrid on representative
+> fixtures before committing to it as the production answer.
+
 
 `solver/pareto.py` runs Tchebycheff scalarisation across N weight vectors
 (default 30) and reuses L-BFGS-B's gradient-based convergence per
@@ -649,6 +730,70 @@ infrastructure or requiring methodological investigation).
 | Disjunctive programming / time-window decomposition for >10K-activity RCPSP | Premature; CP-SAT (D5B) handles target scale today |
 | Maximum Common Subgraph mining for cross-project patterns | Needs cross-project corpus; gates on multi-tenant data infra |
 | Branch-and-Cut with project-specific cuts | Premature optimisation atop CP-SAT |
+
+---
+
+## Adoption Story (the question this plan doesn't answer)
+
+The plan's framing — "decision quality per cubic centimetre of math" —
+defines what we *build*.  It doesn't define how a customer *adopts* it.
+
+A customer comparing us to Alice sees Alice's UI first.  Analytical
+superiority wrapped in someone else's interface is a real strategic
+loss, and this plan doesn't address it.  The honest options:
+
+1. **Accept the analytics-as-API role.**  Partner with a UI vendor (or
+   the customer's existing scheduling tool — P6, MS Project, Asta) and
+   compete on what we expose to *them*, not to end users.  Implies
+   investing in `RW-§6.5.1` (mpxj ingest) and `D10.1` (OpenAPI generation)
+   so integration is friction-free.
+2. **Build a thin reference UI.**  Out of this repo's scope, but a
+   companion repo could ship a minimal React/Vue frontend that exercises
+   every endpoint here — useful for sales demos, customer onboarding,
+   and forcing function on response-shape stability.  Not the same as
+   competing with Alice's UI, but closes the "I can't see it work" gap.
+3. **Stay analytics-only and let the customer's procurement loop sort
+   it out.**  Viable if the analytical advantage is large enough that
+   integrators come to us.  Riskier; bets on customer sophistication.
+
+Decision is out of scope for this engineering doc, but contributors
+working on items here should know: every customer-facing field
+(`pools`, `teac`, `pool_summary`, etc.) is more useful when there's
+a UI to render it.  Field design that anticipates rendering — stable
+key ordering, sensible defaults for empty cases, bounded list sizes —
+costs little and pays off when the adoption question gets answered.
+
+## Migration and Deprecation
+
+When a switchable addition (per "Algorithms We Keep" governance in
+`CLAUDE.md`) eventually becomes a production default — e.g., when
+CP-SAT hard mode displaces soft penalty for a customer segment — the
+PR that flips the default should:
+
+1. Update the response's `solver_used` (or equivalent) field's default
+   value documentation in `docs/api/`.
+2. Add a deprecation notice in the changelog with the old default's
+   end-of-support date (minimum 6 months).
+3. Run the JS-vs-Py diff harness and any other consumer-contract
+   tests on the new default.
+
+This plan deliberately leaves all switchable additions as opt-in
+forever unless the team makes an explicit deprecation decision via
+the above.
+
+## Review Cadence
+
+This doc should be re-reviewed:
+
+- Every 6 months from the merge date (next review by 2026-11),
+- OR when 3+ items have shipped from the menu, whichever is sooner.
+
+A review consists of: marking shipped items, refreshing the Dimension
+Index status column, removing items that have been deferred long
+enough that they're effectively dead, and updating the Adoption
+Story section if the strategic context has shifted.  If 6 months pass
+with zero items shipped, that's a signal the doc is being skimmed
+rather than used — escalate, don't refresh.
 
 ---
 
