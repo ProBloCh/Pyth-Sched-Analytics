@@ -486,6 +486,52 @@ taken ~164s, exceeding the Gunicorn timeout.
 Pushes to `main` trigger automatic deployment to Azure production. Treat
 `main` accordingly — no experimental changes, no untested algorithm rewrites.
 
+### Algorithm Selection: Augment with Switches, Not Replace
+
+Lifted from `docs/exceed-alice-roadmap.md` because it governs every PR
+on this codebase, not only the items in that roadmap.
+
+When a PR adds a new algorithm or method that overlaps with an existing
+one, the default should be **augment with a switch**, not replace.  The
+existing algorithm stays the default; the new one becomes opt-in via a
+config field, env var, or new tier.  A scientific computing service's
+value is partly in exposing the menu of methods so the analyst can pick
+the right tool — not in adopting whatever the latest paper said.
+
+Concrete examples already in this codebase:
+
+| Existing | Switchable addition | Default |
+|---|---|---|
+| K-means 2D extreme-event clustering (`solver/stochastic.py::_detect_2d_extremes`) | Copulas (when D1.3 lands) | K-means stays the descriptive lens; copulas augment for generative sampling |
+| Topological-averaging risk propagation (`solver/analysis.py`) | Bayesian network (when `RW-§6.5.3` lands) | Topo averaging is the default (O(V+E), unbiased on linear-Gaussian) |
+| Soft-penalty constraints (`solver/optimizer.py:CONSTRAINT_PENALTY_LAMBDA`) | CP-SAT hard mode (when D5B lands) / `trust-constr` | `constraint_mode="soft"` is the default forever — bounds may be aspirational, not hard |
+| Louvain community detection (`multi_resolution_pipeline.py`) | Leiden (when `RW-§6.3.1` lands) | Louvain stays default; Leiden behind `COMMUNITY_ALGORITHM` flag |
+| L-BFGS-B + Tchebycheff (`solver/optimizer.py`) | NSGA-II / MOEA/D (`RW-§6.3.3`), CP-SAT (D5B) | All three exposed; consumer picks per `solver_used` field |
+| Heuristic dragon-king threshold (`solver/analysis.py`) | Permutation-test p-value (when D2.3 lands) | Threshold gives the binary flag; p-value attaches confidence — both side by side |
+
+Defended against replacement: the triangular tier in the 5-tier risk
+model.  Triangular is the right estimator for low-information regimes
+(only min/mode/max known); it is not a placeholder for something
+better, it is the optimal choice for its information regime.
+
+### Compute and Payload Budget
+
+Lifted from `docs/exceed-alice-roadmap.md`.  Every additive field
+grows response payloads, fills Redis, and lengthens p99.  Without a
+budget, responses sprawl.
+
+| Concern | Budget | Mechanism |
+|---|---|---|
+| `/solver/optimize` p99 | ≤ 8 s for 5K-activity project (current ~6.5 s for 10K — see Performance Benchmarks above) | Pareto sweep parallelism, guard CP-SAT for n > 1000 |
+| `/completion/monte-carlo` response size | ≤ 250 KB pre-gzip on a 1K-activity project | Top-N truncation on `pools` (default 20, configurable), nested objects elided when empty |
+| `/solver/sensitivity` response size | ≤ 150 KB pre-gzip on a 1K-activity project | Same top-N rule; `pools` mirrors `interface/` shape so consumers reuse parsers |
+| Redis per-response | ≤ 1 MB | LRU eviction guards this; informational threshold |
+| Image size | ≤ 1.2 GB (currently ~900 MB) | `ortools` (D5B) and `pymoo` (D3.2) gated behind `EXTRAS=...`; lean default unchanged |
+
+When proposing a new response field, sanity-check against the relevant
+budget row.  When proposing a new dependency that adds >100 MB to the
+image, gate it behind `EXTRAS=`.
+
 ## Research Foundations
 
 | Component | Method | Source |
