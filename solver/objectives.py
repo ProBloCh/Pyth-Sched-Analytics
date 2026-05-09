@@ -8,6 +8,13 @@ ActivityParams so they can be evaluated cheaply inside optimisation loops.
 import numpy as np
 
 
+# Sharpness of the softplus smoothing in resource_objective.  At β=10
+# the deviation from np.maximum is < 1e-2 for |profile - cap| ≥ 1
+# and below double-precision zero for cap - profile ≥ 8.  See
+# docs/research/sketches/e1_logsumexp_resource.py for the derivation.
+RESOURCE_SMOOTHING_BETA = 10.0
+
+
 def schedule_objective(dag_state, params, project_ctx=None):
     """Project makespan (total duration)."""
     return dag_state.makespan
@@ -35,14 +42,8 @@ def risk_objective(dag_state, params, project_ctx=None):
     return float(np.sum(params.risk_scores * criticality * params.durations))
 
 
-def resource_objective(dag_state, params, project_ctx=None):
-    """
-    Resource overallocation penalty via smoothed trapezoidal profiles.
-    Discretises the timeline and penalises bins that exceed capacity.
-    """
-    if dag_state.n == 0 or dag_state.makespan <= 0:
-        return 0.0
-
+def _resolve_resource_capacity(project_ctx):
+    """Look up the active resource capacity, defaulting to 10."""
     capacity = 10.0
     if project_ctx and project_ctx.resource_capacities:
         try:
@@ -51,14 +52,34 @@ def resource_objective(dag_state, params, project_ctx=None):
                 capacity = cap
         except (TypeError, ValueError, StopIteration):
             pass
+    return capacity
+
+
+def _build_resource_profile(dag_state, params, project_ctx=None):
+    """Build the per-bin resource demand profile.
+
+    Returns ``(profile, capacity, bin_width, activity_bins)`` or
+    ``None`` when there's nothing to evaluate (n==0 or makespan<=0
+    or n_bins<=0).
+
+    ``activity_bins[i] = (start_bin, end_bin)`` is the half-open bin
+    range activity *i* contributes to, exposed so the analytic
+    adjoint (resource_adj_res) can map per-bin gradients back to
+    per-activity gradients without re-deriving the floor/ceil math.
+    """
+    if dag_state.n == 0 or dag_state.makespan <= 0:
+        return None
+
+    capacity = _resolve_resource_capacity(project_ctx)
 
     makespan = dag_state.makespan
     n_bins = min(int(np.ceil(makespan)), 500)
     if n_bins <= 0:
-        return 0.0
+        return None
 
     bin_width = makespan / n_bins
     profile = np.zeros(n_bins, dtype=np.float64)
+    activity_bins = [(0, 0)] * dag_state.n
 
     for i in range(dag_state.n):
         es, ef = dag_state.ES[i], dag_state.EF[i]
@@ -68,9 +89,39 @@ def resource_objective(dag_state, params, project_ctx=None):
         sb = max(0, min(int(np.floor(es / bin_width)), n_bins - 1))
         eb = max(sb + 1, min(int(np.ceil(ef / bin_width)), n_bins))
         profile[sb:eb] += rc
+        activity_bins[i] = (sb, eb)
 
-    overalloc = np.maximum(profile - capacity, 0.0)
-    return float(np.sum(overalloc ** 2) * bin_width)
+    return profile, capacity, bin_width, activity_bins
+
+
+def resource_objective(dag_state, params, project_ctx=None):
+    """Resource overallocation penalty.
+
+    Per roadmap item E1: the overallocation ``max(profile - cap, 0)``
+    is replaced with the everywhere-differentiable softplus
+
+        softplus(x, β) = log(1 + exp(β x)) / β
+                       = np.logaddexp(0, β x) / β   (numerically stable)
+
+    Pointwise softplus(x, β) ≥ max(x, 0) and converges pointwise to
+    max(x, 0) as β → ∞.  At β = ``RESOURCE_SMOOTHING_BETA`` = 10 the
+    deviation from max() is < 1e-2 for |x| ≥ 1 and below double-
+    precision zero for x ≤ -8 -- so a feasible profile (every bin
+    ≥ 1 unit below capacity) yields a numerically-zero penalty,
+    matching the previous formulation byte-for-byte on the existing
+    test fixture (resource_count=2, cap=10).
+
+    The smooth form is what makes ``resource_adj_res`` analytic
+    instead of FD -- see solver/adjoints.py.
+    """
+    built = _build_resource_profile(dag_state, params, project_ctx)
+    if built is None:
+        return 0.0
+    profile, capacity, bin_width, _ = built
+
+    delta = RESOURCE_SMOOTHING_BETA * (profile - capacity)
+    smooth_over = np.logaddexp(0.0, delta) / RESOURCE_SMOOTHING_BETA
+    return float(np.sum(smooth_over ** 2) * bin_width)
 
 
 def quality_objective(dag_state, params, project_ctx=None):
