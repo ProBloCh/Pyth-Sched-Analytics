@@ -1,0 +1,26 @@
+{
+  "comment": "Working-calendar parity fixtures, no holidays. MON_EPOCH = 2025-01-06T00:00:00Z (Monday). Covers midnight starts, intraday remainders, whole-day advances, weekend remainder bumps, and zero-hour passthrough.",
+  "calendar": {
+    "hours_per_day": 8,
+    "working_days": [1, 2, 3, 4, 5],
+    "holidays": []
+  },
+  "cases": [
+    { "name": "mon_midnight_plus_40h",         "start_iso": "2025-01-06T00:00:00Z", "work_hours": 40 },
+    { "name": "mon_midnight_plus_4h",          "start_iso": "2025-01-06T00:00:00Z", "work_hours": 4 },
+    { "name": "mon_midnight_plus_12h",         "start_iso": "2025-01-06T00:00:00Z", "work_hours": 12 },
+    { "name": "fri_midnight_plus_8h",          "start_iso": "2025-01-10T00:00:00Z", "work_hours": 8 },
+    { "name": "mon_4am_plus_4h",               "start_iso": "2025-01-06T04:00:00Z", "work_hours": 4 },
+    { "name": "mon_4am_plus_8h",               "start_iso": "2025-01-06T04:00:00Z", "work_hours": 8 },
+    { "name": "mon_1pm_plus_16h",              "start_iso": "2025-01-06T13:00:00Z", "work_hours": 16 },
+    { "name": "fri_10pm_plus_5h_weekend_bump", "start_iso": "2025-01-10T22:00:00Z", "work_hours": 5 },
+    { "name": "fri_10pm_plus_8h",              "start_iso": "2025-01-10T22:00:00Z", "work_hours": 8 },
+    { "name": "fri_10pm_plus_12h",             "start_iso": "2025-01-10T22:00:00Z", "work_hours": 12 },
+    { "name": "sat_midnight_plus_40h",         "start_iso": "2025-01-11T00:00:00Z", "work_hours": 40 },
+    { "name": "sat_1pm_plus_4h",               "start_iso": "2025-01-11T13:00:00Z", "work_hours": 4 },
+    { "name": "sat_1pm_plus_16h",              "start_iso": "2025-01-11T13:00:00Z", "work_hours": 16 },
+    { "name": "sat_zero_hours_passthrough",    "start_iso": "2025-01-11T00:00:00Z", "work_hours": 0 },
+    { "name": "mon_1pm_zero_hours_passthrough","start_iso": "2025-01-06T13:00:00Z", "work_hours": 0 },
+    { "name": "mon_midnight_plus_200h",        "start_iso": "2025-01-06T00:00:00Z", "work_hours": 200 }
+  ]
+}

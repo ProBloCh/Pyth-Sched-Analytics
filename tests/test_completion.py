@@ -422,6 +422,109 @@ class TestWorkingCalendar:
         assert _ms_to_iso(finishes[2]).startswith('2025-01-08')  # +2wd
         assert _ms_to_iso(finishes[3]).startswith('2025-01-13')  # +5wd
 
+    # -----------------------------------------------------------------
+    # Non-midnight start / JS-parity regressions.  Before the fix in
+    # PR ``claude/fix-working-day-calculation-sV0kz`` the cumulative
+    # work-hours formulation drifted by up to one working-day boundary
+    # when callers passed non-midnight starts.  These three cases lock
+    # the JS-parity behaviour (Reference/Completionprediction.js
+    # addWorkingHours lines 396-423).  Full JS-vs-Py parity is verified
+    # by tests/test_calendar_diff.py on shared fixtures.
+    # -----------------------------------------------------------------
+
+    def test_non_midnight_start_preserves_time_of_day(self):
+        """Mon 13:00 + 16h (2 working days, no remainder) must finish at
+        Wed 13:00, not Thu 00:00 (the pre-fix drift).  The 16h decomposes
+        into wholeDays=2, remHours=0 so the result must preserve the
+        13:00 wall-clock offset.
+        """
+        cal = WorkingCalendar.build(8.0, {1, 2, 3, 4, 5}, [],
+                                    MON_EPOCH, horizon_days=30)
+        mon_1pm = MON_EPOCH + 13 * 3_600_000.0
+        finish = advance_working_ms(mon_1pm, 16.0, cal)
+        expected = MON_EPOCH + 2 * 86_400_000.0 + 13 * 3_600_000.0
+        assert finish == expected, (
+            f"non-midnight drift: got {_ms_to_iso(finish)}, "
+            f"expected {_ms_to_iso(expected)}")
+
+    def test_non_midnight_remainder_lands_on_weekend(self):
+        """Fri 22:00 + 5h: wholeDays=0, remHours=5.  JS adds 5h
+        wall-clock -> Sat 03:00, then _normalizeWeekendForward bumps
+        to Mon 03:00.
+        """
+        cal = WorkingCalendar.build(8.0, {1, 2, 3, 4, 5}, [],
+                                    MON_EPOCH, horizon_days=30)
+        fri_10pm = MON_EPOCH + 4 * 86_400_000.0 + 22 * 3_600_000.0
+        finish = advance_working_ms(fri_10pm, 5.0, cal)
+        next_mon = MON_EPOCH + 7 * 86_400_000.0
+        expected = next_mon + 3 * 3_600_000.0  # Mon 03:00
+        assert finish == expected, (
+            f"weekend bump failed: got {_ms_to_iso(finish)}, "
+            f"expected {_ms_to_iso(expected)}")
+
+    def test_non_midnight_remainder_lands_on_holiday(self):
+        """Tue 22:00 + 5h with Wed-holiday: JS adds 5h wall-clock ->
+        Wed 03:00, then the holiday-loop bumps to Thu 03:00.
+        """
+        cal = WorkingCalendar.build(8.0, {1, 2, 3, 4, 5},
+                                    ['2025-01-08'], MON_EPOCH, 30)
+        tue_10pm = MON_EPOCH + 86_400_000.0 + 22 * 3_600_000.0
+        finish = advance_working_ms(tue_10pm, 5.0, cal)
+        thu = MON_EPOCH + 3 * 86_400_000.0
+        expected = thu + 3 * 3_600_000.0  # Thu 03:00
+        assert finish == expected, (
+            f"holiday bump failed: got {_ms_to_iso(finish)}, "
+            f"expected {_ms_to_iso(expected)}")
+
+    def test_max_working_hours_clamp_matches_js(self):
+        """JS ``CONFIG.maxWorkingHoursToAdd = 100_000`` clamps the input
+        before processing.  Without this clamp the Python port diverged
+        from JS by decades on runaway inputs.  This locks the clamp so
+        a future deletion of the np.minimum call would fail CI.
+        """
+        cal = WorkingCalendar.build(8.0, {1, 2, 3, 4, 5}, [],
+                                    MON_EPOCH, horizon_days=200_000)
+        finish_runaway = advance_working_ms(MON_EPOCH, 200_000.0, cal)
+        finish_at_cap = advance_working_ms(MON_EPOCH, 100_000.0, cal)
+        assert finish_runaway == finish_at_cap, (
+            f"clamp regressed: 200K hours produced "
+            f"{_ms_to_iso(finish_runaway)} but 100K (the cap) produced "
+            f"{_ms_to_iso(finish_at_cap)}")
+
+    def test_horizon_edge_does_not_shift_backward(self):
+        """Regression: when the horizon ends on a non-working day and an
+        advance lands there via the remainder add, the post-remainder
+        normalization must not shift the finish BACKWARD to a previous
+        working day.
+
+        Pre-guard, ``next_working_idx[K-1]`` for a non-working K-1
+        pointed at the last working day (``wp[-1]``); the post-norm step
+        then added ``day_epoch[wp[-1]] - day_epoch[K-1]`` -- a NEGATIVE
+        day delta -- and the finish moved ~1-2 days into the past.  The
+        right diagnostic at the horizon edge is the horizon-overflow
+        warning, not a silent backward shift.
+
+        Setup: horizon = 6 days starting Mon 2025-01-06 =
+        ``[Mon, Tue, Wed, Thu, Fri, Sat]``.  Sat at idx 5 is the horizon
+        edge and is non-working.  Fri 22:00 + 5h adds 5h wall-clock and
+        lands on Sat 03:00 (idx 5, which is K-1).  Pre-guard,
+        ``next_working_idx[5]`` was Fri (idx 4); the post-norm subtracted
+        one day and gave Fri 03:00.  With the guard, ``next_working_idx[5]
+        = K-1 = 5``; the post-norm is a no-op and the finish stays at
+        Sat 03:00 (clipped at the horizon edge as intended).
+        """
+        cal = WorkingCalendar.build(8.0, {1, 2, 3, 4, 5}, [],
+                                    MON_EPOCH, horizon_days=6)
+        fri_10pm = MON_EPOCH + 4 * 86_400_000.0 + 22 * 3_600_000.0
+        finish = advance_working_ms(fri_10pm, 5.0, cal)
+        sat_3am = MON_EPOCH + 5 * 86_400_000.0 + 3 * 3_600_000.0
+        assert finish >= fri_10pm, (
+            f"horizon-edge backward shift: finish {_ms_to_iso(finish)} "
+            f"is EARLIER than start {_ms_to_iso(fri_10pm)}")
+        assert finish == sat_3am, (
+            f"horizon-edge: got {_ms_to_iso(finish)}, "
+            f"expected {_ms_to_iso(sat_3am)} (Sat 03:00, clipped)")
+
 
 class TestCalendarPath:
     """End-to-end completion MC tests with calendar enabled."""
