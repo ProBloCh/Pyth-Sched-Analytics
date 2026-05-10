@@ -270,8 +270,12 @@ def advance_working_ms(start_ms, work_hours, cal):
 
     Semantics:
         - If work_hours == 0, finish_ms = start_ms (pass-through), even
-          if start is on a weekend.  Matches JS addWorkingHours line
-          399 short-circuit.
+          if start is on a weekend.  Matches JS addWorkingHours's early
+          ``if (h <= 0) return new Date(date);`` short-circuit.
+        - If work_hours > _MAX_WORKING_HOURS_TO_ADD (100K), the input
+          is clamped to that ceiling, matching JS CONFIG.
+          maxWorkingHoursToAdd.  Without this clamp, runaway values
+          diverge from JS by decades.
         - If the horizon is exhausted, the result is clipped to the
           last day of the calendar and a warning is logged (once per
           process per clip type, to avoid flooding during vectorised
@@ -367,15 +371,12 @@ def advance_working_ms(start_ms, work_hours, cal):
         cal.working_days_before, target_wd, side='right') - 1
     end_idx_search = np.clip(end_idx_search, 0, cal.K - 1)
     # When only_remainder (whole_days == 0), end_idx must equal
-    # start_norm_idx -- NOT the search result.  Reason: if
-    # start_norm_idx lands on a non-working weekday (holiday),
-    # working_days_before has a plateau there and side='right' jumps
-    # past the plateau to the next working day.  Adding intraday + rem
-    # on top of that day then double-counts the day advance.  JS
-    # _addWorkdaysO1(d, 0) only weekend-normalizes, leaving holidays
-    # for the post-remainder loop to handle.  We mirror that by
-    # keeping end_idx at start_norm_idx and letting the post-norm
-    # next_working_idx step do the holiday bump.
+    # start_norm_idx, NOT the searchsorted result -- if start_norm_idx
+    # is a holiday-weekday, working_days_before plateaus there and
+    # side='right' jumps past, double-counting the day advance once
+    # the intraday + rem crosses midnight.  Holidays at this stage are
+    # left for the post-remainder next_working_idx step to bump,
+    # matching JS _addWorkdaysO1(d, 0).
     end_idx = np.where(only_remainder, start_norm_idx, end_idx_search)
 
     finish_ms = (cal.day_epoch_ms[end_idx]
