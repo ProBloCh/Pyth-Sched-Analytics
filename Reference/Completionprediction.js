@@ -6471,6 +6471,15 @@
             normalizePercentComplete,
             convertToHours,
             _recordTelemetry,
+            // Working-calendar primitives exposed for the JS<->Python
+            // diff harness (tests/test_calendar_diff.py).  These are the
+            // canonical implementations of the day-arithmetic that
+            // completion/calendar.py advance_working_ms ports.
+            addWorkingHours,
+            subtractWorkingHours,
+            _addWorkdaysO1,
+            _normalizeWeekendForward,
+            _isWorkingDay,
         },
     };
 

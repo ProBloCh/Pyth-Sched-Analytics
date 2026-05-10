@@ -422,6 +422,60 @@ class TestWorkingCalendar:
         assert _ms_to_iso(finishes[2]).startswith('2025-01-08')  # +2wd
         assert _ms_to_iso(finishes[3]).startswith('2025-01-13')  # +5wd
 
+    # -----------------------------------------------------------------
+    # Non-midnight start / JS-parity regressions.  Before the fix in
+    # PR ``claude/fix-working-day-calculation-sV0kz`` the cumulative
+    # work-hours formulation drifted by up to one working-day boundary
+    # when callers passed non-midnight starts.  These three cases lock
+    # the JS-parity behaviour (Reference/Completionprediction.js
+    # addWorkingHours lines 396-423).  Full JS-vs-Py parity is verified
+    # by tests/test_calendar_diff.py on shared fixtures.
+    # -----------------------------------------------------------------
+
+    def test_non_midnight_start_preserves_time_of_day(self):
+        """Mon 13:00 + 16h (2 working days, no remainder) must finish at
+        Wed 13:00, not Thu 00:00 (the pre-fix drift).  The 16h decomposes
+        into wholeDays=2, remHours=0 so the result must preserve the
+        13:00 wall-clock offset.
+        """
+        cal = WorkingCalendar.build(8.0, {1, 2, 3, 4, 5}, [],
+                                    MON_EPOCH, horizon_days=30)
+        mon_1pm = MON_EPOCH + 13 * 3_600_000.0
+        finish = advance_working_ms(mon_1pm, 16.0, cal)
+        expected = MON_EPOCH + 2 * 86_400_000.0 + 13 * 3_600_000.0
+        assert finish == expected, (
+            f"non-midnight drift: got {_ms_to_iso(finish)}, "
+            f"expected {_ms_to_iso(expected)}")
+
+    def test_non_midnight_remainder_lands_on_weekend(self):
+        """Fri 22:00 + 5h: wholeDays=0, remHours=5.  JS adds 5h
+        wall-clock -> Sat 03:00, then _normalizeWeekendForward bumps
+        to Mon 03:00.
+        """
+        cal = WorkingCalendar.build(8.0, {1, 2, 3, 4, 5}, [],
+                                    MON_EPOCH, horizon_days=30)
+        fri_10pm = MON_EPOCH + 4 * 86_400_000.0 + 22 * 3_600_000.0
+        finish = advance_working_ms(fri_10pm, 5.0, cal)
+        next_mon = MON_EPOCH + 7 * 86_400_000.0
+        expected = next_mon + 3 * 3_600_000.0  # Mon 03:00
+        assert finish == expected, (
+            f"weekend bump failed: got {_ms_to_iso(finish)}, "
+            f"expected {_ms_to_iso(expected)}")
+
+    def test_non_midnight_remainder_lands_on_holiday(self):
+        """Tue 22:00 + 5h with Wed-holiday: JS adds 5h wall-clock ->
+        Wed 03:00, then the holiday-loop bumps to Thu 03:00.
+        """
+        cal = WorkingCalendar.build(8.0, {1, 2, 3, 4, 5},
+                                    ['2025-01-08'], MON_EPOCH, 30)
+        tue_10pm = MON_EPOCH + 86_400_000.0 + 22 * 3_600_000.0
+        finish = advance_working_ms(tue_10pm, 5.0, cal)
+        thu = MON_EPOCH + 3 * 86_400_000.0
+        expected = thu + 3 * 3_600_000.0  # Thu 03:00
+        assert finish == expected, (
+            f"holiday bump failed: got {_ms_to_iso(finish)}, "
+            f"expected {_ms_to_iso(expected)}")
+
 
 class TestCalendarPath:
     """End-to-end completion MC tests with calendar enabled."""
