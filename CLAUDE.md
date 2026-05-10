@@ -74,7 +74,7 @@ matrix, and top-N highest-risk activities per hotspot for downstream
 LLM grounding.  Engine is pure pandas/numpy with no Flask deps;
 re-callable via `compute_interface_analytics`.
 
-Tests: **837 across 10 test files**, including JS-vs-Python diff
+Tests: **838 across 10 test files**, including JS-vs-Python diff
 harnesses (`tests/test_evm_diff.py` + `tests/diff_harness/run_js_evm.js`;
 `tests/test_paths_diff.py` + `tests/diff_harness/run_js_paths.js`;
 `tests/test_calendar_diff.py` + `tests/diff_harness/run_js_calendar.js`)

@@ -279,7 +279,12 @@ def advance_working_ms(start_ms, work_hours, cal):
         - If the horizon is exhausted, the result is clipped to the
           last day of the calendar and a warning is logged (once per
           process per clip type, to avoid flooding during vectorised
-          Monte Carlo batches).
+          Monte Carlo batches).  When the horizon itself ends on a
+          non-working day, the post-remainder normalization is a no-op
+          at the edge (rather than a backward shift); the finish
+          preserves the unshifted landing.  Rely on horizon sizing
+          (``estimate_horizon_days``), not normalization, to avoid
+          this case.
 
     JS parity is verified by ``tests/test_calendar_diff.py``, which
     runs the JS implementation under Node.js on shared fixtures and

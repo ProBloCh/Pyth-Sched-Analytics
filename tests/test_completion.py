@@ -476,6 +476,21 @@ class TestWorkingCalendar:
             f"holiday bump failed: got {_ms_to_iso(finish)}, "
             f"expected {_ms_to_iso(expected)}")
 
+    def test_max_working_hours_clamp_matches_js(self):
+        """JS ``CONFIG.maxWorkingHoursToAdd = 100_000`` clamps the input
+        before processing.  Without this clamp the Python port diverged
+        from JS by decades on runaway inputs.  This locks the clamp so
+        a future deletion of the np.minimum call would fail CI.
+        """
+        cal = WorkingCalendar.build(8.0, {1, 2, 3, 4, 5}, [],
+                                    MON_EPOCH, horizon_days=200_000)
+        finish_runaway = advance_working_ms(MON_EPOCH, 200_000.0, cal)
+        finish_at_cap = advance_working_ms(MON_EPOCH, 100_000.0, cal)
+        assert finish_runaway == finish_at_cap, (
+            f"clamp regressed: 200K hours produced "
+            f"{_ms_to_iso(finish_runaway)} but 100K (the cap) produced "
+            f"{_ms_to_iso(finish_at_cap)}")
+
     def test_horizon_edge_does_not_shift_backward(self):
         """Regression: when the horizon ends on a non-working day and an
         advance lands there via the remainder add, the post-remainder
