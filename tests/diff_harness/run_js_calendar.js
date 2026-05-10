@@ -10,6 +10,14 @@
  * completion/calendar.py advance_working_ms against the canonical JS
  * implementation (Reference/Completionprediction.js lines 396-423).
  *
+ * Limitation: the JS reference's _normalizeWeekendForward hardcodes
+ * Sat=6 / Sun=0 via getDay() (Reference/Completionprediction.js
+ * _isWorkingDay), so a fixture with `working_days` != [1..5] would
+ * produce an apples-to-oranges comparison.  The Python side supports
+ * arbitrary working_day sets; the JS side does not.  Don't add
+ * non-Mon-Fri fixtures to this harness without first extending the JS
+ * reference to honour CONFIG.workingDays.
+ *
  * Fixture format:
  *   {
  *     "calendar": {

@@ -74,18 +74,22 @@ matrix, and top-N highest-risk activities per hotspot for downstream
 LLM grounding.  Engine is pure pandas/numpy with no Flask deps;
 re-callable via `compute_interface_analytics`.
 
-Tests: **830 across 10 test files**, including JS-vs-Python diff
+Tests: **837 across 10 test files**, including JS-vs-Python diff
 harnesses (`tests/test_evm_diff.py` + `tests/diff_harness/run_js_evm.js`;
 `tests/test_paths_diff.py` + `tests/diff_harness/run_js_paths.js`;
 `tests/test_calendar_diff.py` + `tests/diff_harness/run_js_calendar.js`)
 that run the JS reference implementations under Node.js on shared
-fixtures and assert numerical equivalence within `1e-6` relative
-tolerance.  EVM diff covers basic / complete / overrun / complex /
-with_holidays fixtures with predicted dates within 24 h including
-holiday-skipping via the full working-calendar path.  Calendar diff
-covers 24 cases × 3 fixtures (no_holidays / wed_holiday / mon_holiday)
-locking JS-parity for non-midnight starts, weekend / holiday remainder
-bumps, and whole-day advances of `advance_working_ms`.
+fixtures and assert numerical equivalence.  EVM and paths diffs use
+`1e-6` relative tolerance for scalars and 24 h tolerance for dates;
+calendar diff uses ≤ 1 ms absolute (the underlying primitive works
+in epoch-ms integers).  EVM diff covers basic / complete / overrun /
+complex / with_holidays fixtures with predicted dates within 24 h
+including holiday-skipping via the full working-calendar path.
+Calendar diff covers 30 cases × 3 fixtures (no_holidays / wed_holiday /
+mon_holiday) locking JS-parity for non-midnight starts, intraday
+cross-midnight remainder bumps, weekend / holiday post-remainder
+shifts, start-on-holiday cases, and whole-day advances of
+`advance_working_ms`.
 
 ## Four Principles
 

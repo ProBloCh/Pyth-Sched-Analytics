@@ -33,6 +33,12 @@ logger = logging.getLogger(__name__)
 _MS_PER_HOUR = 3_600_000.0
 _MS_PER_DAY = 86_400_000.0
 
+# Mirror CONFIG.maxWorkingHoursToAdd from Reference/Completionprediction.js
+# line 131.  JS clamps work_hours to this before doing arithmetic to
+# bound finish dates and avoid Chart.js overflow; matching it keeps
+# JS-Py parity at the extreme end of the input range.
+_MAX_WORKING_HOURS_TO_ADD = 100_000.0
+
 # Rate-limit the horizon-clip warnings so a single MC run with thousands
 # of out-of-horizon advances doesn't spam the log.  One warning per
 # process is plenty; the caller is usually the same bug each time.
@@ -181,11 +187,10 @@ class WorkingCalendar:
                                         K - 1, wp[pos]).astype(np.int64)
 
         # Vectorised next-weekday lookup (skips weekends only -- ignores
-        # holidays).  Mirrors JS _normalizeWeekendForward in
-        # _addWorkdaysO1's wholeDays<=0 branch (Reference/
-        # Completionprediction.js:324), which normalizes weekends only.
-        # Same no-forward-match guard as next_working_idx -- see comment
-        # above.
+        # holidays).  Mirrors JS _normalizeWeekendForward as called in
+        # _addWorkdaysO1's wholeDays<=0 branch, which normalizes
+        # weekends only.  Same no-forward-match guard as
+        # next_working_idx -- see comment above.
         is_weekday = np.isin(iso, np.fromiter(working_days, dtype=np.int64))
         wd = np.flatnonzero(is_weekday)
         if wd.size == 0:
@@ -234,26 +239,34 @@ def advance_working_ms(start_ms, work_hours, cal):
     Returns:
         finish_ms: same shape as inputs, epoch ms.
 
-    Algorithm (JS-parity with Reference/Completionprediction.js
-    addWorkingHours lines 396-423):
+    Algorithm (JS-parity with
+    Reference/Completionprediction.js::addWorkingHours):
 
         1. Decompose work_hours into wholeDays + remainder via
-           ``floor(h / hpd)`` (matches JS line 404).
+           ``floor(h / hpd)``.
         2. Advance the day index by ``wholeDays`` *working days*, while
            preserving the input's wall-clock time-of-day (the JS code
            does this naturally because ``Date.setDate`` only changes the
            date component).
               - When wholeDays > 0, start is normalized to the next
                 day that is BOTH a weekday AND not a holiday (matches
-                JS _addWorkdaysO1 line 332).
+                JS ``_addWorkdaysO1``'s holiday-aware loop).
               - When wholeDays == 0, start is normalized to the next
                 weekday only -- holidays are not skipped at this stage
-                (matches JS _addWorkdaysO1 line 324
+                (matches JS ``_addWorkdaysO1(d, 0)`` calling
                 ``_normalizeWeekendForward``).
-        3. Add the remainder as raw wall-clock hours (JS line 409).
+        3. Add the remainder as raw wall-clock hours.
         4. If the result lands on a weekend or holiday, shift forward
-           to the next working day, preserving time-of-day (JS lines
-           410-420).
+           to the next working day, preserving time-of-day (mirrors the
+           JS post-remainder ``_normalizeWeekendForward`` + holiday
+           bump loop).
+
+    Currently the JS reference's ``_normalizeWeekendForward`` hardcodes
+    Sat/Sun via ``getDay()``; if the calendar uses a non-Mon-Fri
+    working-week (e.g. Sun-Thu), the Python side will produce its own
+    self-consistent result but there is no JS counterpart to diff
+    against.  The JS↔Py harness in ``tests/test_calendar_diff.py``
+    therefore only exercises Mon-Fri fixtures.
 
     Semantics:
         - If work_hours == 0, finish_ms = start_ms (pass-through), even
@@ -280,6 +293,11 @@ def advance_working_ms(start_ms, work_hours, cal):
 
     # Zero-work passthrough: match JS short-circuit exactly.
     zero_work = work_arr <= 0.0
+
+    # Upper-clamp to match JS line 400 (h > maxWorkingHoursToAdd).
+    # Without this, a runaway work_hours value diverges from JS by
+    # decades for inputs above 100K hours.
+    work_arr = np.minimum(work_arr, _MAX_WORKING_HOURS_TO_ADD)
 
     # Clip start into calendar range; rate-limited warning when any
     # start falls outside the horizon (indicates stale calendar or
@@ -317,13 +335,10 @@ def advance_working_ms(start_ms, work_hours, cal):
     whole_days = np.floor(work_arr / hpd).astype(np.int64)
     rem_hours = work_arr - whole_days.astype(np.float64) * hpd
 
-    # Start normalization differs by branch:
-    #   wholeDays == 0: JS _addWorkdaysO1 calls _normalizeWeekendForward
-    #     (line 324) -- weekend-only.
-    #   wholeDays  > 0 with holidays: JS loops until _isWorkingDay
-    #     (line 332) -- weekend + holiday.
-    #   wholeDays  > 0 no holidays: JS calls _normalizeWeekendForward
-    #     (line 342) -- weekend only.
+    # Start normalization differs by branch (mirrors JS _addWorkdaysO1):
+    #   wholeDays == 0: JS calls _normalizeWeekendForward only.
+    #   wholeDays  > 0 with holidays: JS loops until _isWorkingDay.
+    #   wholeDays  > 0 no holidays: JS calls _normalizeWeekendForward.
     # Our `next_working_idx` includes holidays in `is_working`, so when
     # there are NO holidays it equals `next_weekday_idx` and the fast-
     # path / slow-path JS split collapses cleanly.
@@ -348,9 +363,20 @@ def advance_working_ms(start_ms, work_hours, cal):
     # side='right' - 1 gives the smallest index k where
     # working_days_before[k] == target_wd, landing at the START of the
     # (N+1)-th working day from start_norm_idx.
-    end_idx = np.searchsorted(
+    end_idx_search = np.searchsorted(
         cal.working_days_before, target_wd, side='right') - 1
-    end_idx = np.clip(end_idx, 0, cal.K - 1)
+    end_idx_search = np.clip(end_idx_search, 0, cal.K - 1)
+    # When only_remainder (whole_days == 0), end_idx must equal
+    # start_norm_idx -- NOT the search result.  Reason: if
+    # start_norm_idx lands on a non-working weekday (holiday),
+    # working_days_before has a plateau there and side='right' jumps
+    # past the plateau to the next working day.  Adding intraday + rem
+    # on top of that day then double-counts the day advance.  JS
+    # _addWorkdaysO1(d, 0) only weekend-normalizes, leaving holidays
+    # for the post-remainder loop to handle.  We mirror that by
+    # keeping end_idx at start_norm_idx and letting the post-norm
+    # next_working_idx step do the holiday bump.
+    end_idx = np.where(only_remainder, start_norm_idx, end_idx_search)
 
     finish_ms = (cal.day_epoch_ms[end_idx]
                  + intraday_ms
