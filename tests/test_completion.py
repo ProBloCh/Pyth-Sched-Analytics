@@ -476,6 +476,40 @@ class TestWorkingCalendar:
             f"holiday bump failed: got {_ms_to_iso(finish)}, "
             f"expected {_ms_to_iso(expected)}")
 
+    def test_horizon_edge_does_not_shift_backward(self):
+        """Regression: when the horizon ends on a non-working day and an
+        advance lands there via the remainder add, the post-remainder
+        normalization must not shift the finish BACKWARD to a previous
+        working day.
+
+        Pre-guard, ``next_working_idx[K-1]`` for a non-working K-1
+        pointed at the last working day (``wp[-1]``); the post-norm step
+        then added ``day_epoch[wp[-1]] - day_epoch[K-1]`` -- a NEGATIVE
+        day delta -- and the finish moved ~1-2 days into the past.  The
+        right diagnostic at the horizon edge is the horizon-overflow
+        warning, not a silent backward shift.
+
+        Setup: horizon = 6 days starting Mon 2025-01-06 =
+        ``[Mon, Tue, Wed, Thu, Fri, Sat]``.  Sat at idx 5 is the horizon
+        edge and is non-working.  Fri 22:00 + 5h adds 5h wall-clock and
+        lands on Sat 03:00 (idx 5, which is K-1).  Pre-guard,
+        ``next_working_idx[5]`` was Fri (idx 4); the post-norm subtracted
+        one day and gave Fri 03:00.  With the guard, ``next_working_idx[5]
+        = K-1 = 5``; the post-norm is a no-op and the finish stays at
+        Sat 03:00 (clipped at the horizon edge as intended).
+        """
+        cal = WorkingCalendar.build(8.0, {1, 2, 3, 4, 5}, [],
+                                    MON_EPOCH, horizon_days=6)
+        fri_10pm = MON_EPOCH + 4 * 86_400_000.0 + 22 * 3_600_000.0
+        finish = advance_working_ms(fri_10pm, 5.0, cal)
+        sat_3am = MON_EPOCH + 5 * 86_400_000.0 + 3 * 3_600_000.0
+        assert finish >= fri_10pm, (
+            f"horizon-edge backward shift: finish {_ms_to_iso(finish)} "
+            f"is EARLIER than start {_ms_to_iso(fri_10pm)}")
+        assert finish == sat_3am, (
+            f"horizon-edge: got {_ms_to_iso(finish)}, "
+            f"expected {_ms_to_iso(sat_3am)} (Sat 03:00, clipped)")
+
 
 class TestCalendarPath:
     """End-to-end completion MC tests with calendar enabled."""

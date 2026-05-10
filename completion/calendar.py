@@ -160,29 +160,42 @@ class WorkingCalendar:
 
         # Vectorised next-working-day lookup (skips weekends + holidays).
         # For each day k, next_working_idx[k] is the smallest j >= k with
-        # is_working[j] == True; if none exists, clamps to K-1.
+        # is_working[j] == True.  Where no forward match exists (k past
+        # the last working day in the horizon) we point at K-1 -- the
+        # horizon edge -- NOT at the last working day.  This matters
+        # because the post-remainder normalization in advance_working_ms
+        # adds (day_epoch[next_working_idx] - day_epoch[final_day_idx]);
+        # if we pointed to a previous working day, that shift would be
+        # NEGATIVE and the finish time would move backward.  Routing
+        # through K-1 makes the shift a no-op at the horizon edge -- the
+        # finish stays where it landed and the horizon-overflow warning
+        # carries the rest of the diagnostic.
         wp = np.flatnonzero(is_working)
         if wp.size == 0:
             next_working_idx = np.full(K, K - 1, dtype=np.int64)
         else:
-            pos = np.clip(
-                np.searchsorted(wp, np.arange(K), side='left'),
-                0, wp.size - 1)
-            next_working_idx = wp[pos]
+            raw_pos = np.searchsorted(wp, np.arange(K), side='left')
+            no_forward_match = raw_pos >= wp.size
+            pos = np.clip(raw_pos, 0, wp.size - 1)
+            next_working_idx = np.where(no_forward_match,
+                                        K - 1, wp[pos]).astype(np.int64)
 
         # Vectorised next-weekday lookup (skips weekends only -- ignores
         # holidays).  Mirrors JS _normalizeWeekendForward in
         # _addWorkdaysO1's wholeDays<=0 branch (Reference/
         # Completionprediction.js:324), which normalizes weekends only.
+        # Same no-forward-match guard as next_working_idx -- see comment
+        # above.
         is_weekday = np.isin(iso, np.fromiter(working_days, dtype=np.int64))
         wd = np.flatnonzero(is_weekday)
         if wd.size == 0:
             next_weekday_idx = np.full(K, K - 1, dtype=np.int64)
         else:
-            pos = np.clip(
-                np.searchsorted(wd, np.arange(K), side='left'),
-                0, wd.size - 1)
-            next_weekday_idx = wd[pos]
+            raw_pos = np.searchsorted(wd, np.arange(K), side='left')
+            no_forward_match = raw_pos >= wd.size
+            pos = np.clip(raw_pos, 0, wd.size - 1)
+            next_weekday_idx = np.where(no_forward_match,
+                                        K - 1, wd[pos]).astype(np.int64)
 
         return cls(
             hours_per_day=float(hours_per_day),
