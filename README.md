@@ -66,3 +66,4 @@ Dockerfile          # Container build
 ## Guidance
 - [Cybereum multi-resolution community detection guidance (review)](docs/cybereum-multiresolution-guidance.md)
 - [CADJ-P solver architecture and API](solver/Readme.md)
+- [World-class readiness scorecard](docs/world-class-scorecard.md)
