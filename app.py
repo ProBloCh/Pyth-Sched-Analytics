@@ -947,8 +947,13 @@ def _propagate_with_residual_cycles(G: nx.DiGraph, risk_map: dict) -> dict:
     Condenses G into its SCC DAG, topologically sorts the SCCs, and
     propagates intrinsic + averaged-predecessor risk through them.
     Singleton SCCs (the common case) compute exactly as the acyclic
-    path.  Non-trivial SCCs run a damped Jacobi iteration so the result
-    is well-defined even for self-loops or pure k-cycles.
+    path.  Non-trivial SCCs run a damped Jacobi iteration: when the SCC
+    has external predecessors the iteration is contractive and converges
+    to a fixed point; for SCCs whose preds are entirely internal (pure
+    k-cycle of isolated nodes) the underlying linear system has no
+    fixed point, so the iteration is bounded-deterministic rather than
+    convergent.  The 50-iter cap + 1e-9 tolerance bound the bounded
+    case; the determinism guarantee is what matters either way.
     """
     C = nx.condensation(G)
     prop: dict = {}
@@ -966,8 +971,9 @@ def _propagate_with_residual_cycles(G: nx.DiGraph, risk_map: dict) -> dict:
             prop[n] = float(risk_map.get(str(n), 0.0)) + inherited
             continue
 
-        # Non-trivial SCC: Jacobi with damping (α=0.5 keeps the iteration
-        # contractive even when within-SCC inflow would otherwise diverge).
+        # Non-trivial SCC: damped Jacobi (α=0.5).  Bounded + deterministic
+        # for the no-external-input case; converges otherwise.  See the
+        # function docstring for the fixed-point-existence discussion.
         alpha = 0.5
         current = {n: float(risk_map.get(str(n), 0.0)) for n in members}
         for _ in range(50):
