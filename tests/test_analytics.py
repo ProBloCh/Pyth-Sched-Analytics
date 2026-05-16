@@ -224,6 +224,45 @@ class TestEnsureDag:
         assert G.graph['cycles_removed'] == []
         assert G.graph['cycles_remaining'] is False
 
+    def test_multi_disjoint_cycles_deterministic_within_fixed_ordering(self):
+        """Two disjoint cycles in the same input must produce identical
+        cycles_removed lists across repeated runs of that exact input.
+        Cross-input-permutation invariance is P-3 scope (cache
+        canonicalisation) and is NOT promised here."""
+        nodes = [{'ID': c, 'Duration': 1} for c in 'ABCDEF']
+        links = [
+            {'source': 'A', 'target': 'B'},
+            {'source': 'B', 'target': 'C'},
+            {'source': 'C', 'target': 'A'},  # cycle 1
+            {'source': 'D', 'target': 'E'},
+            {'source': 'E', 'target': 'F'},
+            {'source': 'F', 'target': 'D'},  # cycle 2
+        ]
+
+        run1 = ensure_dag(build_nx_graph(nodes, links))
+        run2 = ensure_dag(build_nx_graph(nodes, links))
+        assert run1.graph['cycles_removed'] == run2.graph['cycles_removed']
+        # Both cycles must have been broken.
+        assert len(run1.graph['cycles_removed']) == 2
+
+    def test_cap_hit_sets_cycles_remaining(self):
+        """When the cycle-removal cap is exhausted before all cycles are
+        broken, cycles_remaining must be True so the response can flag
+        the partial sanitisation."""
+        # max_cycle_removals = max(|E|//2, 1).  With 3 edges and two
+        # disjoint cycles (self-loop on A, plus B<->C), cap=1 but two
+        # removals are needed.  Whatever cycle find_cycle returns first,
+        # the other remains after the single allowed removal.
+        nodes = [{'ID': c, 'Duration': 1} for c in 'ABC']
+        links = [
+            {'source': 'A', 'target': 'A'},   # cycle 1: self-loop
+            {'source': 'B', 'target': 'C'},
+            {'source': 'C', 'target': 'B'},   # cycle 2: 2-cycle
+        ]
+        G = ensure_dag(build_nx_graph(nodes, links))
+        assert G.graph['cycles_remaining'] is True
+        assert len(G.graph['cycles_removed']) == 1
+
 
 # ---------------------------------------------------------------------------
 # Critical path
@@ -555,6 +594,76 @@ class TestAnalyse:
         for v in vals1.values():
             assert v == v  # not NaN
             assert v != 0.0
+
+    def test_self_loop_endpoint_path_is_bounded(self):
+        """In the normal path ensure_dag removes the self-loop, so
+        propagated_risk is computed acyclically with no self-edge
+        contribution.  The self-loop must appear in cycles_removed."""
+        nodes = [
+            {'ID': 'A', 'Duration': 1, 'riskScore': 2.0},
+            {'ID': 'B', 'Duration': 1, 'riskScore': 3.0},
+        ]
+        links = [
+            {'source': 'A', 'target': 'A'},  # self-loop on A
+            {'source': 'A', 'target': 'B'},
+        ]
+        result = analyse(nodes, links)
+        a_row = next(n for n in result['nodes'] if n['ID'] == 'A')
+        # Without the self-loop fix, this was ~52 at 50 Jacobi iters.
+        # After ensure_dag drops the self-edge, propagated_risk_A is
+        # just the intrinsic (no external preds).
+        assert a_row['propagated_risk'] < 10.0
+        # The self-loop edge should appear in the removed-cycles list.
+        removed = {(e['source'], e['target']) for e in result['cycles_removed']}
+        assert ('A', 'A') in removed
+
+    def test_residual_self_loop_dropped_from_inflow(self):
+        """When ensure_dag's cap leaves a self-loop in G,
+        _propagate_with_residual_cycles must drop the self-edge from the
+        inflow average -- otherwise propagated_risk scales with the
+        Jacobi iter cap (pre-fix: 2.0 intrinsic → ~52 after 50 iters)."""
+        import networkx as nx
+        from app import _risk_propagation
+
+        df = pd.DataFrame([
+            {'ID': 'A', 'riskScore': 2.0, 'CommunityGroup': 0},
+        ])
+        G = nx.DiGraph()
+        G.add_node('A')
+        G.add_edge('A', 'A')  # self-loop survives because we skip ensure_dag
+
+        result = _risk_propagation(G, df.copy())
+        val = float(result['propagated_risk'].iloc[0])
+        # Self-edge dropped → no inflow → propagated_risk == intrinsic.
+        assert val == pytest.approx(2.0, rel=1e-6)
+        # The function records the drop so analyse() can emit a warning.
+        assert G.graph.get('self_loops_dropped', 0) >= 1
+
+    def test_pure_cycle_emits_scc_non_convergent_warning(self):
+        """Pure k-cycle SCC with no external pred reaches the Jacobi cap
+        without converging.  Output must still be deterministic and the
+        warning channel must flag the non-converged state so consumers
+        know not to read the numbers at face value."""
+        import networkx as nx
+        from app import _risk_propagation
+
+        df = pd.DataFrame([
+            {'ID': 'A', 'riskScore': 5.0, 'CommunityGroup': 0},
+            {'ID': 'B', 'riskScore': 7.0, 'CommunityGroup': 0},
+            {'ID': 'C', 'riskScore': 3.0, 'CommunityGroup': 0},
+        ])
+        G = nx.DiGraph()
+        for n in df['ID']:
+            G.add_node(n)
+        # Pure 3-cycle, no external input.
+        G.add_edge('A', 'B')
+        G.add_edge('B', 'C')
+        G.add_edge('C', 'A')
+
+        _risk_propagation(G, df.copy())
+        # The function records non-convergence on G.graph for the caller
+        # (analyse) to translate into a warning entry.
+        assert G.graph.get('scc_non_convergent_count', 0) >= 1
 
 
 # ---------------------------------------------------------------------------

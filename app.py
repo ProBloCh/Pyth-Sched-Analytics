@@ -507,10 +507,15 @@ def ensure_dag(G: nx.DiGraph):
     
     # Remove cycles using NetworkX (cap iterations to avoid runaway loops).
     # When find_cycle returns a cycle, pick the edge to remove by the
-    # canonical (source, target, type, lag) tuple so the chosen edge is
-    # invariant to NetworkX adjacency-iteration order.  Without this, the
-    # same cyclic input could produce different removed edges across runs
-    # or networkx versions, silently shifting downstream CPM / risk results.
+    # canonical (source, target, type, lag) tuple — the lexicographically
+    # smallest tuple from the cycle wins.  This freezes *which edge gets
+    # cut* within each discovered cycle, so the same input produces the
+    # same removed edge regardless of NetworkX-internal traversal order.
+    # Note the scope: this guarantees determinism for a fixed input link
+    # ordering.  Two semantically-equivalent inputs whose links are
+    # permuted may still find a different first cycle via DFS-order, so
+    # full canonicalisation across input permutations is P-3 scope (cache
+    # canonicalisation), not addressed here.
     def _cycle_edge_key(edge):
         u, v = edge[0], edge[1]
         attrs = G.edges[u, v]
@@ -947,16 +952,23 @@ def _propagate_with_residual_cycles(G: nx.DiGraph, risk_map: dict) -> dict:
     Condenses G into its SCC DAG, topologically sorts the SCCs, and
     propagates intrinsic + averaged-predecessor risk through them.
     Singleton SCCs (the common case) compute exactly as the acyclic
-    path.  Non-trivial SCCs run a damped Jacobi iteration: when the SCC
-    has external predecessors the iteration is contractive and converges
-    to a fixed point; for SCCs whose preds are entirely internal (pure
-    k-cycle of isolated nodes) the underlying linear system has no
-    fixed point, so the iteration is bounded-deterministic rather than
-    convergent.  The 50-iter cap + 1e-9 tolerance bound the bounded
-    case; the determinism guarantee is what matters either way.
+    path.  Self-loops are treated as non-contributing (the self-edge
+    is dropped from the inflow average) so a node A→A doesn't iterate
+    onto itself.  Non-trivial SCCs run a damped Jacobi iteration:
+    convergence requires every member of the SCC to have at least one
+    predecessor outside the SCC (so every row of the averaging matrix
+    has a sub-unit sum and Banach contraction applies).  When that
+    fails -- a deep-internal member with only in-SCC preds, or a pure
+    k-cycle with no external input -- the iteration is
+    bounded-deterministic rather than convergent.  SCCs that exit the
+    iteration via the iter cap (vs. the 1e-9 convergence break) are
+    recorded on ``G.graph['scc_non_convergent_count']`` so the caller
+    can emit a structured warning to the response.
     """
     C = nx.condensation(G)
     prop: dict = {}
+    non_convergent_sccs = 0
+    self_loops_dropped = 0
     for scc_idx in nx.topological_sort(C):
         members = sorted(C.nodes[scc_idx]['members'], key=str)
         member_set = set(members)
@@ -971,16 +983,34 @@ def _propagate_with_residual_cycles(G: nx.DiGraph, risk_map: dict) -> dict:
             prop[n] = float(risk_map.get(str(n), 0.0)) + inherited
             continue
 
+        if len(members) == 1 and is_self_loop:
+            # Singleton SCC with a self-edge: dropping the self-edge from
+            # the inflow average means the node behaves like the acyclic
+            # singleton above and propagated_risk stays bounded by the
+            # external risk reaching it.  The alternative (iterating onto
+            # itself) produced cap-dependent magnitudes -- A→A with
+            # intrinsic 2.0 reached ~52 at 50 iters, double that at 100.
+            n = members[0]
+            external_preds = [p for p in G.predecessors(n) if p != n]
+            inherited = (sum(prop.get(p, 0.0) for p in external_preds)
+                         / len(external_preds)) if external_preds else 0.0
+            prop[n] = float(risk_map.get(str(n), 0.0)) + inherited
+            self_loops_dropped += 1
+            continue
+
         # Non-trivial SCC: damped Jacobi (α=0.5).  Bounded + deterministic
         # for the no-external-input case; converges otherwise.  See the
         # function docstring for the fixed-point-existence discussion.
         alpha = 0.5
         current = {n: float(risk_map.get(str(n), 0.0)) for n in members}
+        converged = False
         for _ in range(50):
             next_vals = {}
             for n in members:
                 intrinsic = float(risk_map.get(str(n), 0.0))
-                preds = list(G.predecessors(n))
+                # Drop any self-edge from the inflow set -- same rationale
+                # as the singleton self-loop branch above.
+                preds = [p for p in G.predecessors(n) if p != n]
                 if preds:
                     inflow = sum(
                         current[p] if p in member_set else prop.get(p, 0.0)
@@ -993,9 +1023,15 @@ def _propagate_with_residual_cycles(G: nx.DiGraph, risk_map: dict) -> dict:
             delta = max(abs(next_vals[n] - current[n]) for n in members)
             current = next_vals
             if delta < 1e-9:
+                converged = True
                 break
+        if not converged:
+            non_convergent_sccs += 1
         for n in members:
             prop[n] = current[n]
+
+    G.graph['scc_non_convergent_count'] = non_convergent_sccs
+    G.graph['self_loops_dropped'] = self_loops_dropped
     return prop
 
 
@@ -1364,6 +1400,9 @@ def analyse(nodes, links):
         # so downstream consumers can react without scraping log files.
         cycles_removed = G.graph.get('cycles_removed', [])
         cycles_remaining = bool(G.graph.get('cycles_remaining', False))
+        scc_non_convergent_count = int(
+            G.graph.get('scc_non_convergent_count', 0))
+        self_loops_dropped = int(G.graph.get('self_loops_dropped', 0))
         warnings_list = []
         if cycles_removed:
             warnings_list.append({
@@ -1378,6 +1417,24 @@ def analyse(nodes, links):
                 'severity': 'warning',
                 'message': ("Cycle-removal cap was reached; the analysis "
                             "ran with residual cycles still present."),
+            })
+        if self_loops_dropped:
+            warnings_list.append({
+                'code': 'self_loop_dropped',
+                'severity': 'info',
+                'message': (f"Dropped {self_loops_dropped} self-loop edge(s) "
+                            f"when computing propagated_risk; self-edges do "
+                            f"not contribute to network risk inheritance."),
+            })
+        if scc_non_convergent_count:
+            warnings_list.append({
+                'code': 'scc_non_convergent',
+                'severity': 'warning',
+                'message': (f"{scc_non_convergent_count} cyclic component(s) "
+                            f"did not reach the propagation fixed-point "
+                            f"within the iteration cap; propagated_risk "
+                            f"values for those nodes are bounded and "
+                            f"deterministic but not converged."),
             })
 
         # Build response

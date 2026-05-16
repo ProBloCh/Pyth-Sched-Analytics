@@ -280,11 +280,14 @@ well-defined output.  Each entry:
 
 When the input is already a DAG, the array is empty.
 
-Edge selection is canonical: at each cycle-break step the
-lexicographically smallest `(source, target, type, lag)` tuple in the
-found cycle is removed.  This guarantees the same input produces the
-same `cycles_removed` list across runs, NetworkX versions, and
-dict-iteration orderings.
+Edge selection is canonical *within each discovered cycle*: at each
+cycle-break step the lexicographically smallest `(source, target, type,
+lag)` tuple in the found cycle is removed.  This guarantees the same
+input link ordering produces the same `cycles_removed` list across runs
+and NetworkX versions.  Two semantically-equivalent inputs whose links
+are permuted may still produce different removed-edge orderings — full
+canonicalisation across input permutations is part of P-3 (cache
+canonicalisation) and is intentionally out of scope here.
 
 A guard caps the number of removal iterations at `max(|edges| / 2, 1)`.
 If the cap is reached and cycles still remain, a `cycles_remaining`
@@ -303,13 +306,15 @@ to.  Each entry:
 | Key | Type | Description |
 |---|---|---|
 | `code` | `string` | Stable, machine-readable identifier. |
-| `severity` | `string` | One of `info` / `warning` / `error`. |
+| `severity` | `string` | Either `info` or `warning`. |
 | `message` | `string` | Human-readable detail. |
 
 | Code | Severity | Meaning |
 |---|---|---|
 | `cycles_removed` | `info` | One or more edges were removed to break input cycles.  Inspect `cycles_removed` for specifics. |
 | `cycles_remaining` | `warning` | The cycle-removal cap was reached and the graph still contained cycles when analytics began. |
+| `self_loop_dropped` | `info` | One or more self-edges (`A → A`) were excluded from the `propagated_risk` inflow.  Self-edges don't represent network risk inheritance. |
+| `scc_non_convergent` | `warning` | One or more residual cyclic components did not reach the propagation fixed-point within the iteration cap.  Their `propagated_risk` values are bounded and deterministic but not converged; treat as advisory rather than absolute. |
 
 The array is empty when nothing is worth flagging.  New codes may be
 added in future revisions; consumers should treat unknown codes as
