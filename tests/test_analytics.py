@@ -180,6 +180,89 @@ class TestEnsureDag:
         # Should have removed exactly 1 edge to break the cycle
         assert len(G.edges) == 2
 
+    def test_records_removed_edges(self, cyclic_graph):
+        """ensure_dag publishes removed edges on G.graph for the caller."""
+        nodes, links = cyclic_graph
+        G = build_nx_graph(nodes, links)
+        G = ensure_dag(G)
+        removed = G.graph['cycles_removed']
+        assert isinstance(removed, list)
+        assert len(removed) == 1
+        entry = removed[0]
+        assert set(entry.keys()) == {'source', 'target', 'type', 'lag'}
+        # The removed edge must have come from the input cycle.
+        assert (entry['source'], entry['target']) in {
+            ('A', 'B'), ('B', 'C'), ('C', 'A')
+        }
+        assert G.graph['cycles_remaining'] is False
+
+    def test_cycle_edge_choice_is_deterministic(self, cyclic_graph):
+        """The cycle-edge tie-break is canonical: it picks the
+        lexicographically smallest (source, target, type, lag) tuple,
+        regardless of input link ordering."""
+        nodes, links = cyclic_graph
+
+        # Same cycle, two distinct insertion orders.
+        G1 = build_nx_graph(nodes, links)
+        G2 = build_nx_graph(nodes, list(reversed(links)))
+
+        G1 = ensure_dag(G1)
+        G2 = ensure_dag(G2)
+
+        edge1 = (G1.graph['cycles_removed'][0]['source'],
+                 G1.graph['cycles_removed'][0]['target'])
+        edge2 = (G2.graph['cycles_removed'][0]['source'],
+                 G2.graph['cycles_removed'][0]['target'])
+        assert edge1 == edge2
+        # Lexicographically smallest of {(A,B), (B,C), (C,A)} is (A,B).
+        assert edge1 == ('A', 'B')
+
+    def test_no_cycle_keeps_lists_empty(self, simple_chain):
+        nodes, links = simple_chain
+        G = build_nx_graph(nodes, links)
+        G = ensure_dag(G)
+        assert G.graph['cycles_removed'] == []
+        assert G.graph['cycles_remaining'] is False
+
+    def test_multi_disjoint_cycles_deterministic_within_fixed_ordering(self):
+        """Two disjoint cycles in the same input must produce identical
+        cycles_removed lists across repeated runs of that exact input.
+        Cross-input-permutation invariance is P-3 scope (cache
+        canonicalisation) and is NOT promised here."""
+        nodes = [{'ID': c, 'Duration': 1} for c in 'ABCDEF']
+        links = [
+            {'source': 'A', 'target': 'B'},
+            {'source': 'B', 'target': 'C'},
+            {'source': 'C', 'target': 'A'},  # cycle 1
+            {'source': 'D', 'target': 'E'},
+            {'source': 'E', 'target': 'F'},
+            {'source': 'F', 'target': 'D'},  # cycle 2
+        ]
+
+        run1 = ensure_dag(build_nx_graph(nodes, links))
+        run2 = ensure_dag(build_nx_graph(nodes, links))
+        assert run1.graph['cycles_removed'] == run2.graph['cycles_removed']
+        # Both cycles must have been broken.
+        assert len(run1.graph['cycles_removed']) == 2
+
+    def test_cap_hit_sets_cycles_remaining(self):
+        """When the cycle-removal cap is exhausted before all cycles are
+        broken, cycles_remaining must be True so the response can flag
+        the partial sanitisation."""
+        # max_cycle_removals = max(|E|//2, 1).  With 3 edges and two
+        # disjoint cycles (self-loop on A, plus B<->C), cap=1 but two
+        # removals are needed.  Whatever cycle find_cycle returns first,
+        # the other remains after the single allowed removal.
+        nodes = [{'ID': c, 'Duration': 1} for c in 'ABC']
+        links = [
+            {'source': 'A', 'target': 'A'},   # cycle 1: self-loop
+            {'source': 'B', 'target': 'C'},
+            {'source': 'C', 'target': 'B'},   # cycle 2: 2-cycle
+        ]
+        G = ensure_dag(build_nx_graph(nodes, links))
+        assert G.graph['cycles_remaining'] is True
+        assert len(G.graph['cycles_removed']) == 1
+
 
 # ---------------------------------------------------------------------------
 # Critical path
@@ -448,6 +531,152 @@ class TestAnalyse:
         assert 'nodes' in result
         assert 'error' not in result
 
+    def test_cyclic_input_surfaces_cycles_removed(self, cyclic_graph):
+        """Response must publish cycles_removed + a structured warning."""
+        nodes, links = cyclic_graph
+        result = analyse(nodes, links)
+        assert isinstance(result.get('cycles_removed'), list)
+        assert len(result['cycles_removed']) == 1
+        assert set(result['cycles_removed'][0].keys()) == {
+            'source', 'target', 'type', 'lag'
+        }
+        codes = {w['code'] for w in result.get('warnings', [])}
+        # Warning code is `cycles_removed_summary` -- the top-level
+        # `cycles_removed` field carries the list itself, and the two
+        # share no name so consumers can branch on the code without
+        # disambiguation.
+        assert 'cycles_removed_summary' in codes
+        assert 'cycles_remaining' not in codes  # cap not hit on this fixture
+
+    def test_dag_input_has_empty_cycle_fields(self, simple_chain):
+        """No cycles -> empty cycles_removed and empty warnings."""
+        nodes, links = simple_chain
+        result = analyse(nodes, links)
+        assert result.get('cycles_removed') == []
+        # warnings list is present (always) but holds no cycle entries.
+        codes = {w['code'] for w in result.get('warnings', [])}
+        assert 'cycles_removed_summary' not in codes
+        assert 'cycles_remaining' not in codes
+
+    def test_propagated_risk_deterministic_on_residual_cycles(self):
+        """When ensure_dag leaves residual cycles, _risk_propagation must
+        produce identical output across repeated calls (was nondeterministic
+        before: the fallback walked nodes in insertion order and treated
+        unvisited predecessors as 0.0)."""
+        import networkx as nx
+        from app import _risk_propagation
+
+        # Build a graph with a self-sustaining cycle that ensure_dag would
+        # break.  We construct G directly and skip ensure_dag so the
+        # residual-cycle branch of _risk_propagation is exercised.
+        risk_scores = {'A': 5.0, 'B': 7.0, 'C': 3.0, 'D': 4.0}
+        df = pd.DataFrame([
+            {'ID': k, 'riskScore': v, 'CommunityGroup': 0}
+            for k, v in risk_scores.items()
+        ])
+
+        def _build():
+            G = nx.DiGraph()
+            for n in df['ID']:
+                G.add_node(n)
+            # A -> B -> C -> A is a cycle; D feeds in from outside.
+            G.add_edge('A', 'B')
+            G.add_edge('B', 'C')
+            G.add_edge('C', 'A')
+            G.add_edge('D', 'A')
+            return G
+
+        out1 = _risk_propagation(_build(), df.copy())
+        out2 = _risk_propagation(_build(), df.copy())
+        vals1 = dict(zip(out1['ID'].astype(str),
+                         out1['propagated_risk'].astype(float)))
+        vals2 = dict(zip(out2['ID'].astype(str),
+                         out2['propagated_risk'].astype(float)))
+        assert vals1 == vals2
+        # Every node should have a finite, non-zero propagated risk
+        # (intrinsic is non-zero and propagation is well-defined).
+        for v in vals1.values():
+            assert v == v  # not NaN
+            assert v != 0.0
+
+    def test_self_loop_endpoint_path_is_bounded(self):
+        """In the normal path ensure_dag removes the self-loop, so
+        propagated_risk is computed acyclically with no self-edge
+        contribution.  The self-loop must appear in cycles_removed."""
+        nodes = [
+            {'ID': 'A', 'Duration': 1, 'riskScore': 2.0},
+            {'ID': 'B', 'Duration': 1, 'riskScore': 3.0},
+        ]
+        links = [
+            {'source': 'A', 'target': 'A'},  # self-loop on A
+            {'source': 'A', 'target': 'B'},
+        ]
+        result = analyse(nodes, links)
+        a_row = next(n for n in result['nodes'] if n['ID'] == 'A')
+        # Without the self-loop fix, this was ~52 at 50 Jacobi iters.
+        # After ensure_dag drops the self-edge, propagated_risk_A is
+        # just the intrinsic (no external preds).
+        assert a_row['propagated_risk'] < 10.0
+        # The self-loop edge should appear in the removed-cycles list.
+        removed = {(e['source'], e['target']) for e in result['cycles_removed']}
+        assert ('A', 'A') in removed
+
+    def test_residual_self_loop_dropped_from_inflow(self):
+        """When ensure_dag's cap leaves a self-loop in G,
+        _propagate_with_residual_cycles must drop the self-edge from the
+        inflow average -- otherwise propagated_risk scales with the
+        Jacobi iter cap (pre-fix: 2.0 intrinsic → ~52 after 50 iters)."""
+        import networkx as nx
+        from app import _risk_propagation
+
+        df = pd.DataFrame([
+            {'ID': 'A', 'riskScore': 2.0, 'CommunityGroup': 0},
+        ])
+        G = nx.DiGraph()
+        G.add_node('A')
+        G.add_edge('A', 'A')  # self-loop survives because we skip ensure_dag
+
+        result = _risk_propagation(G, df.copy())
+        val = float(result['propagated_risk'].iloc[0])
+        # Self-edge dropped → no inflow → propagated_risk == intrinsic.
+        assert val == pytest.approx(2.0, rel=1e-6)
+        # The function records the drop so analyse() can emit a warning.
+        assert G.graph.get('self_loops_dropped', 0) >= 1
+
+    def test_pure_cycle_falls_back_to_intrinsic_with_warning(self):
+        """Pure k-cycle SCC with no external pred has no fixed point under
+        the averaging propagation.  The implementation must (1) record
+        scc_non_convergent for the warning channel, and (2) write the
+        intrinsic riskScore -- not the cap-linear Jacobi residue, which
+        empirically grew ~130 at 50 iters, ~255 at 100, ~1254 at 500
+        before this fix -- to propagated_risk for the SCC members."""
+        import networkx as nx
+        from app import _risk_propagation
+
+        risk_scores = {'A': 5.0, 'B': 7.0, 'C': 3.0}
+        df = pd.DataFrame([
+            {'ID': k, 'riskScore': v, 'CommunityGroup': 0}
+            for k, v in risk_scores.items()
+        ])
+        G = nx.DiGraph()
+        for n in df['ID']:
+            G.add_node(n)
+        # Pure 3-cycle, no external input.
+        G.add_edge('A', 'B')
+        G.add_edge('B', 'C')
+        G.add_edge('C', 'A')
+
+        out = _risk_propagation(G, df.copy())
+        # Non-convergence recorded so analyse() can emit the warning.
+        assert G.graph.get('scc_non_convergent_count', 0) >= 1
+        # propagated_risk falls back to intrinsic riskScore -- bounded,
+        # iteration-cap-independent, and pairs with the warning.
+        vals = dict(zip(out['ID'].astype(str),
+                        out['propagated_risk'].astype(float)))
+        assert vals['A'] == pytest.approx(risk_scores['A'], rel=1e-9)
+        assert vals['B'] == pytest.approx(risk_scores['B'], rel=1e-9)
+        assert vals['C'] == pytest.approx(risk_scores['C'], rel=1e-9)
+
 
 # ---------------------------------------------------------------------------
 # /graph-metrics endpoint contract
@@ -467,6 +696,22 @@ class TestGraphMetricsEndpoint:
         assert 'work_packages' in data
         assert 'templates' in data
         assert 'cache_key' in data
+        # Cycle-handling fields are always-present (empty for DAG inputs).
+        assert data['cycles_removed'] == []
+        assert isinstance(data.get('warnings'), list)
+
+    def test_cyclic_input_endpoint_surface(self, client, cyclic_graph):
+        """/graph-metrics must surface cycles_removed + warnings to HTTP."""
+        nodes, links = cyclic_graph
+        resp = client.post('/graph-metrics',
+                           json={'nodes': nodes, 'links': links})
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert len(data['cycles_removed']) == 1
+        entry = data['cycles_removed'][0]
+        assert set(entry.keys()) == {'source', 'target', 'type', 'lag'}
+        codes = {w['code'] for w in data['warnings']}
+        assert 'cycles_removed_summary' in codes
 
     def test_lru_cache_not_mutated_across_requests(self, client):
         """Regression test for H2: the route handler adds cache_key/cache_hit/

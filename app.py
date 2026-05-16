@@ -505,31 +505,66 @@ def ensure_dag(G: nx.DiGraph):
             if DEBUG:
                 logging.warning(f"NetworkKit DAG check failed: {e}")
     
-    # Remove cycles using NetworkX (cap iterations to avoid runaway loops)
+    # Remove cycles using NetworkX (cap iterations to avoid runaway loops).
+    # When find_cycle returns a cycle, pick the edge to remove by the
+    # canonical (source, target, type, lag) tuple — the lexicographically
+    # smallest tuple from the cycle wins.  This freezes *which edge gets
+    # cut* within each discovered cycle, so the same input produces the
+    # same removed edge regardless of NetworkX-internal traversal order.
+    # Note the scope: this guarantees determinism for a fixed input link
+    # ordering.  Two semantically-equivalent inputs whose links are
+    # permuted may still find a different first cycle via DFS-order, so
+    # full canonicalisation across input permutations is P-3 scope (cache
+    # canonicalisation), not addressed here.
+    def _cycle_edge_key(edge):
+        u, v = edge[0], edge[1]
+        attrs = G.edges[u, v]
+        try:
+            lag = float(attrs.get('lag', 0))
+        except (TypeError, ValueError):
+            lag = 0.0
+        return (str(u), str(v), str(attrs.get('type', 'FS')), lag)
+
     max_cycle_removals = max(len(G.edges) // 2, 1)
-    cycles_removed = 0
-    while cycles_removed < max_cycle_removals:
+    removed_edges = []
+    while len(removed_edges) < max_cycle_removals:
         try:
             cycle = nx.find_cycle(G, orientation='original')
-            u, v = cycle[0][0], cycle[0][1]
+            edge = min(cycle, key=_cycle_edge_key)
+            u, v = edge[0], edge[1]
+            attrs = G.edges[u, v]
+            try:
+                lag = float(attrs.get('lag', 0))
+            except (TypeError, ValueError):
+                lag = 0.0
+            removed_edges.append({
+                'source': str(u),
+                'target': str(v),
+                'type': attrs.get('type', 'FS'),
+                'lag': lag,
+            })
             G.remove_edge(u, v)
-            cycles_removed += 1
             if DEBUG:
                 logging.info(f"Removed edge to break cycle: {u} -> {v}")
         except nx.NetworkXNoCycle:
             break
 
-    if cycles_removed >= max_cycle_removals:
+    cycles_remaining = False
+    if len(removed_edges) >= max_cycle_removals:
         # Verify the graph actually still has cycles before warning
         try:
             nx.find_cycle(G, orientation='original')
+            cycles_remaining = True
             logging.warning(f"Cycle removal capped at {max_cycle_removals}. "
                             f"Graph may still contain cycles.")
         except nx.NetworkXNoCycle:
             pass  # all cycles resolved despite hitting the cap
-    
-    if DEBUG and cycles_removed > 0:
-        logging.info(f"Removed {cycles_removed} edges to break cycles")
+
+    if DEBUG and removed_edges:
+        logging.info(f"Removed {len(removed_edges)} edges to break cycles")
+
+    G.graph['cycles_removed'] = removed_edges
+    G.graph['cycles_remaining'] = cycles_remaining
     
     # Connect orphan nodes to start/end milestones (from v1)
     start_milestones = [n for n in G.nodes if G.nodes[n].get('Milestone') and G.in_degree(n) == 0]
@@ -911,6 +946,104 @@ def _centralities_nx(G: nx.DiGraph, df: pd.DataFrame):
     df['degree_centrality'] = df['ID'].astype(str).map(deg).fillna(0)
     df['Clustering_Coefficient'] = df['ID'].astype(str).map(clust).fillna(0)
 
+def _propagate_with_residual_cycles(G: nx.DiGraph, risk_map: dict) -> dict:
+    """Deterministic risk propagation when G still contains cycles.
+
+    Condenses G into its SCC DAG, topologically sorts the SCCs, and
+    propagates intrinsic + averaged-predecessor risk through them.
+    Singleton SCCs (the common case) compute exactly as the acyclic
+    path.  Self-loops are treated as non-contributing (the self-edge
+    is dropped from the inflow average) so a node A→A doesn't iterate
+    onto itself.  Non-trivial SCCs run a damped Jacobi iteration:
+    convergence requires every member of the SCC to have at least one
+    predecessor outside the SCC (so every row of the averaging matrix
+    has a sub-unit sum and Banach contraction applies).  When that
+    fails -- a deep-internal member with only in-SCC preds, or a pure
+    k-cycle with no external input -- the iteration is
+    bounded-deterministic rather than convergent.  SCCs that exit the
+    iteration via the iter cap (vs. the 1e-9 convergence break) are
+    recorded on ``G.graph['scc_non_convergent_count']`` so the caller
+    can emit a structured warning to the response.
+    """
+    C = nx.condensation(G)
+    prop: dict = {}
+    non_convergent_sccs = 0
+    self_loops_dropped = 0
+    for scc_idx in nx.topological_sort(C):
+        members = sorted(C.nodes[scc_idx]['members'], key=str)
+        member_set = set(members)
+
+        is_self_loop = (len(members) == 1
+                        and members[0] in set(G.predecessors(members[0])))
+        if len(members) == 1 and not is_self_loop:
+            n = members[0]
+            preds = list(G.predecessors(n))
+            inherited = (sum(prop.get(p, 0.0) for p in preds) / len(preds)
+                         if preds else 0.0)
+            prop[n] = float(risk_map.get(str(n), 0.0)) + inherited
+            continue
+
+        if len(members) == 1 and is_self_loop:
+            # Singleton SCC with a self-edge: dropping the self-edge from
+            # the inflow average means the node behaves like the acyclic
+            # singleton above and propagated_risk stays bounded by the
+            # external risk reaching it.  The alternative (iterating onto
+            # itself) produced cap-dependent magnitudes -- A→A with
+            # intrinsic 2.0 reached ~52 at 50 iters, double that at 100.
+            n = members[0]
+            external_preds = [p for p in G.predecessors(n) if p != n]
+            inherited = (sum(prop.get(p, 0.0) for p in external_preds)
+                         / len(external_preds)) if external_preds else 0.0
+            prop[n] = float(risk_map.get(str(n), 0.0)) + inherited
+            self_loops_dropped += 1
+            continue
+
+        # Non-trivial SCC: damped Jacobi (α=0.5).  Bounded + deterministic
+        # for the no-external-input case; converges otherwise.  See the
+        # function docstring for the fixed-point-existence discussion.
+        alpha = 0.5
+        current = {n: float(risk_map.get(str(n), 0.0)) for n in members}
+        converged = False
+        for _ in range(50):
+            next_vals = {}
+            for n in members:
+                intrinsic = float(risk_map.get(str(n), 0.0))
+                # Drop any self-edge from the inflow set -- same rationale
+                # as the singleton self-loop branch above.
+                preds = [p for p in G.predecessors(n) if p != n]
+                if preds:
+                    inflow = sum(
+                        current[p] if p in member_set else prop.get(p, 0.0)
+                        for p in preds
+                    ) / len(preds)
+                else:
+                    inflow = 0.0
+                target = intrinsic + inflow
+                next_vals[n] = alpha * target + (1.0 - alpha) * current[n]
+            delta = max(abs(next_vals[n] - current[n]) for n in members)
+            current = next_vals
+            if delta < 1e-9:
+                converged = True
+                break
+        if converged:
+            for n in members:
+                prop[n] = current[n]
+        else:
+            # Non-converged SCC: the Jacobi residue at the iter cap is
+            # linear in `max_iter` (pure 3-cycle empirically: ~130 at 50
+            # iters, ~255 at 100, ~1254 at 500), which would surface
+            # cap-dependent magnitudes in `propagated_risk`.  Fall back
+            # to intrinsic-only — bounded, contract-stable, and pairs
+            # with the scc_non_convergent warning that flags the SCC.
+            non_convergent_sccs += 1
+            for n in members:
+                prop[n] = float(risk_map.get(str(n), 0.0))
+
+    G.graph['scc_non_convergent_count'] = non_convergent_sccs
+    G.graph['self_loops_dropped'] = self_loops_dropped
+    return prop
+
+
 def _risk_propagation(G: nx.DiGraph, df: pd.DataFrame):
     """Propagate risk through the dependency network.
 
@@ -941,18 +1074,22 @@ def _risk_propagation(G: nx.DiGraph, df: pd.DataFrame):
     # This gives activities deeper in the dependency chain higher propagated risk.
     try:
         topo = list(nx.topological_sort(G))
+        prop = {}
+        for node in topo:
+            intrinsic = float(risk_map.get(str(node), 0.0))
+            preds = list(G.predecessors(node))
+            if preds:
+                inherited = sum(prop.get(p, 0.0) for p in preds) / len(preds)
+            else:
+                inherited = 0.0
+            prop[node] = intrinsic + inherited
     except nx.NetworkXUnfeasible:
-        topo = list(G.nodes())
-
-    prop = {}
-    for node in topo:
-        intrinsic = float(risk_map.get(str(node), 0.0))
-        preds = list(G.predecessors(node))
-        if preds:
-            inherited = sum(prop.get(p, 0.0) for p in preds) / len(preds)
-        else:
-            inherited = 0.0
-        prop[node] = intrinsic + inherited
+        # Residual cycles (ensure_dag hit its removal cap).  The old
+        # fallback used G.nodes() insertion order, so predecessors not yet
+        # visited read as 0.0 and the result varied with iteration order.
+        # Condense to the SCC DAG instead — that order is deterministic —
+        # and Jacobi-iterate within each non-trivial SCC.
+        prop = _propagate_with_residual_cycles(G, risk_map)
 
     # Risk transmission: how much risk a node sends forward
     # = propagated_risk × out_degree (more successors = more risk spread)
@@ -1266,6 +1403,55 @@ def analyse(nodes, links):
         health = _schedule_health(G, df_nodes, critical_path,
                                   critical_path_length)
 
+        # Surface cycle handling so callers can detect that the analysis
+        # ran on a sanitized graph and (when the cap was hit) that some
+        # cycles remain.  Both are tied to a structured `warnings` array
+        # so downstream consumers can react without scraping log files.
+        cycles_removed = G.graph.get('cycles_removed', [])
+        cycles_remaining = bool(G.graph.get('cycles_remaining', False))
+        scc_non_convergent_count = int(
+            G.graph.get('scc_non_convergent_count', 0))
+        self_loops_dropped = int(G.graph.get('self_loops_dropped', 0))
+        warnings_list = []
+        if cycles_removed:
+            if cycles_remaining:
+                _msg = (f"Removed {len(cycles_removed)} edge(s) attempting "
+                        f"to convert the input into a DAG; cycles remain — "
+                        f"see cycles_remaining warning.")
+            else:
+                _msg = (f"Removed {len(cycles_removed)} edge(s) to "
+                        f"convert the input into a DAG.")
+            warnings_list.append({
+                'code': 'cycles_removed_summary',
+                'severity': 'info',
+                'message': _msg,
+            })
+        if cycles_remaining:
+            warnings_list.append({
+                'code': 'cycles_remaining',
+                'severity': 'warning',
+                'message': ("Cycle-removal cap was reached; the analysis "
+                            "ran with residual cycles still present."),
+            })
+        if self_loops_dropped:
+            warnings_list.append({
+                'code': 'self_loop_dropped',
+                'severity': 'info',
+                'message': (f"Dropped {self_loops_dropped} self-loop edge(s) "
+                            f"when computing propagated_risk; self-edges do "
+                            f"not contribute to network risk inheritance."),
+            })
+        if scc_non_convergent_count:
+            warnings_list.append({
+                'code': 'scc_non_convergent',
+                'severity': 'warning',
+                'message': (f"{scc_non_convergent_count} cyclic component(s) "
+                            f"did not reach the propagation fixed-point "
+                            f"within the iteration cap; propagated_risk "
+                            f"values for those nodes are bounded and "
+                            f"deterministic but not converged."),
+            })
+
         # Build response
         response = {
             'nodes': df_nodes.replace({np.nan: None}).to_dict('records'),
@@ -1275,6 +1461,8 @@ def analyse(nodes, links):
             'critical_path_length': float(critical_path_length),
             'templates': templates,
             'schedule_health': health,
+            'cycles_removed': cycles_removed,
+            'warnings': warnings_list,
         }
         if multi_res:
             response['multi_resolution_communities'] = multi_res
@@ -1310,10 +1498,12 @@ def graph_metrics():
     if not nodes:
         return jsonify({'error': 'No nodes provided'}), 400
     
-    # Generate cache key (v2 prefix avoids reading stale pickle-serialized
-    # entries left by the pre-JSON caching code during a rolling deploy)
+    # Generate cache key.  The v3 prefix prevents v2-cached responses
+    # (which lack the cycles_removed / warnings top-level fields added
+    # alongside the deterministic cycle-handling rewrite) from being
+    # served during a rolling deploy.
     key = _sha([nodes, links])
-    redis_key = f"graph:v2:{key}"
+    redis_key = f"graph:v3:{key}"
     
     # Try Redis cache first
     cached_result = get_cached_result(redis_key)
