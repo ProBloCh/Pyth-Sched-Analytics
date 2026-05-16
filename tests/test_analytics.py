@@ -541,7 +541,11 @@ class TestAnalyse:
             'source', 'target', 'type', 'lag'
         }
         codes = {w['code'] for w in result.get('warnings', [])}
-        assert 'cycles_removed' in codes
+        # Warning code is `cycles_removed_summary` -- the top-level
+        # `cycles_removed` field carries the list itself, and the two
+        # share no name so consumers can branch on the code without
+        # disambiguation.
+        assert 'cycles_removed_summary' in codes
         assert 'cycles_remaining' not in codes  # cap not hit on this fixture
 
     def test_dag_input_has_empty_cycle_fields(self, simple_chain):
@@ -551,7 +555,7 @@ class TestAnalyse:
         assert result.get('cycles_removed') == []
         # warnings list is present (always) but holds no cycle entries.
         codes = {w['code'] for w in result.get('warnings', [])}
-        assert 'cycles_removed' not in codes
+        assert 'cycles_removed_summary' not in codes
         assert 'cycles_remaining' not in codes
 
     def test_propagated_risk_deterministic_on_residual_cycles(self):
@@ -639,18 +643,20 @@ class TestAnalyse:
         # The function records the drop so analyse() can emit a warning.
         assert G.graph.get('self_loops_dropped', 0) >= 1
 
-    def test_pure_cycle_emits_scc_non_convergent_warning(self):
-        """Pure k-cycle SCC with no external pred reaches the Jacobi cap
-        without converging.  Output must still be deterministic and the
-        warning channel must flag the non-converged state so consumers
-        know not to read the numbers at face value."""
+    def test_pure_cycle_falls_back_to_intrinsic_with_warning(self):
+        """Pure k-cycle SCC with no external pred has no fixed point under
+        the averaging propagation.  The implementation must (1) record
+        scc_non_convergent for the warning channel, and (2) write the
+        intrinsic riskScore -- not the cap-linear Jacobi residue, which
+        empirically grew ~130 at 50 iters, ~255 at 100, ~1254 at 500
+        before this fix -- to propagated_risk for the SCC members."""
         import networkx as nx
         from app import _risk_propagation
 
+        risk_scores = {'A': 5.0, 'B': 7.0, 'C': 3.0}
         df = pd.DataFrame([
-            {'ID': 'A', 'riskScore': 5.0, 'CommunityGroup': 0},
-            {'ID': 'B', 'riskScore': 7.0, 'CommunityGroup': 0},
-            {'ID': 'C', 'riskScore': 3.0, 'CommunityGroup': 0},
+            {'ID': k, 'riskScore': v, 'CommunityGroup': 0}
+            for k, v in risk_scores.items()
         ])
         G = nx.DiGraph()
         for n in df['ID']:
@@ -660,10 +666,16 @@ class TestAnalyse:
         G.add_edge('B', 'C')
         G.add_edge('C', 'A')
 
-        _risk_propagation(G, df.copy())
-        # The function records non-convergence on G.graph for the caller
-        # (analyse) to translate into a warning entry.
+        out = _risk_propagation(G, df.copy())
+        # Non-convergence recorded so analyse() can emit the warning.
         assert G.graph.get('scc_non_convergent_count', 0) >= 1
+        # propagated_risk falls back to intrinsic riskScore -- bounded,
+        # iteration-cap-independent, and pairs with the warning.
+        vals = dict(zip(out['ID'].astype(str),
+                        out['propagated_risk'].astype(float)))
+        assert vals['A'] == pytest.approx(risk_scores['A'], rel=1e-9)
+        assert vals['B'] == pytest.approx(risk_scores['B'], rel=1e-9)
+        assert vals['C'] == pytest.approx(risk_scores['C'], rel=1e-9)
 
 
 # ---------------------------------------------------------------------------
@@ -699,7 +711,7 @@ class TestGraphMetricsEndpoint:
         entry = data['cycles_removed'][0]
         assert set(entry.keys()) == {'source', 'target', 'type', 'lag'}
         codes = {w['code'] for w in data['warnings']}
-        assert 'cycles_removed' in codes
+        assert 'cycles_removed_summary' in codes
 
     def test_lru_cache_not_mutated_across_requests(self, client):
         """Regression test for H2: the route handler adds cache_key/cache_hit/

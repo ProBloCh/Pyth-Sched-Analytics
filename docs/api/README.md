@@ -63,6 +63,33 @@ from any consumer (MCP, agent, third-party).
    can make cached entries incompatible.  After breaking changes, flush
    the cache or use a new cache-key prefix (see `redis_key` in `app.py`).
 
+## Warnings Convention
+
+Endpoints that perform analytics emit structured advisories through a
+top-level `warnings` array.  When the analysis succeeded but a caller
+should react (input was sanitized, a numerical fallback fired, a
+calibration input looked judgment-derived, etc.), the warning gives the
+consumer enough signal to render or branch without scraping log files.
+
+Each entry is `{code, severity, message}`:
+
+| Field | Type | Description |
+|---|---|---|
+| `code` | `string` | Stable, machine-readable identifier.  Treat unknown codes as opaque -- do not fail on them. |
+| `severity` | `string` | Currently emitted: `info` or `warning`. |
+| `message` | `string` | Human-readable detail.  Not guaranteed stable across releases; do not parse. |
+
+The shape matches `completion/monte_carlo._build_calibration_warnings`
+and the per-endpoint warning tables in [graph-metrics.md](graph-metrics.md#warnings),
+[solver.md](solver.md), [completion.md](completion.md), and others.
+
+Stability rule: warning **codes** are stable; warning **messages** are
+not.  Consumers should branch on `code`, not on substring matching.
+
+When a new endpoint adds an analytics output, prefer this shape over
+inventing a new convention.  Three endpoints already use it as of
+the cycle-handling rewrite on `/graph-metrics`.
+
 ## Consuming Applications
 
 | Consumer | Language | Entry Point | Keys Used |

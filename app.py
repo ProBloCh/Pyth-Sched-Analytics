@@ -523,7 +523,7 @@ def ensure_dag(G: nx.DiGraph):
             lag = float(attrs.get('lag', 0))
         except (TypeError, ValueError):
             lag = 0.0
-        return (str(u), str(v), str(attrs.get('type', '')), lag)
+        return (str(u), str(v), str(attrs.get('type', 'FS')), lag)
 
     max_cycle_removals = max(len(G.edges) // 2, 1)
     removed_edges = []
@@ -1025,10 +1025,19 @@ def _propagate_with_residual_cycles(G: nx.DiGraph, risk_map: dict) -> dict:
             if delta < 1e-9:
                 converged = True
                 break
-        if not converged:
+        if converged:
+            for n in members:
+                prop[n] = current[n]
+        else:
+            # Non-converged SCC: the Jacobi residue at the iter cap is
+            # linear in `max_iter` (pure 3-cycle empirically: ~130 at 50
+            # iters, ~255 at 100, ~1254 at 500), which would surface
+            # cap-dependent magnitudes in `propagated_risk`.  Fall back
+            # to intrinsic-only — bounded, contract-stable, and pairs
+            # with the scc_non_convergent warning that flags the SCC.
             non_convergent_sccs += 1
-        for n in members:
-            prop[n] = current[n]
+            for n in members:
+                prop[n] = float(risk_map.get(str(n), 0.0))
 
     G.graph['scc_non_convergent_count'] = non_convergent_sccs
     G.graph['self_loops_dropped'] = self_loops_dropped
@@ -1405,11 +1414,17 @@ def analyse(nodes, links):
         self_loops_dropped = int(G.graph.get('self_loops_dropped', 0))
         warnings_list = []
         if cycles_removed:
+            if cycles_remaining:
+                _msg = (f"Removed {len(cycles_removed)} edge(s) attempting "
+                        f"to convert the input into a DAG; cycles remain — "
+                        f"see cycles_remaining warning.")
+            else:
+                _msg = (f"Removed {len(cycles_removed)} edge(s) to "
+                        f"convert the input into a DAG.")
             warnings_list.append({
-                'code': 'cycles_removed',
+                'code': 'cycles_removed_summary',
                 'severity': 'info',
-                'message': (f"Removed {len(cycles_removed)} edge(s) to "
-                            f"convert the input into a DAG."),
+                'message': _msg,
             })
         if cycles_remaining:
             warnings_list.append({

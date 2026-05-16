@@ -311,10 +311,10 @@ to.  Each entry:
 
 | Code | Severity | Meaning |
 |---|---|---|
-| `cycles_removed` | `info` | One or more edges were removed to break input cycles.  Inspect `cycles_removed` for specifics. |
+| `cycles_removed_summary` | `info` | One or more edges were removed to break input cycles.  Inspect the top-level `cycles_removed` field for the specific edges.  When `cycles_remaining` fires alongside, the message acknowledges that the cap was hit and the graph is not yet a DAG. |
 | `cycles_remaining` | `warning` | The cycle-removal cap was reached and the graph still contained cycles when analytics began. |
 | `self_loop_dropped` | `info` | One or more self-edges (`A → A`) were excluded from the `propagated_risk` inflow.  Self-edges don't represent network risk inheritance. |
-| `scc_non_convergent` | `warning` | One or more residual cyclic components did not reach the propagation fixed-point within the iteration cap.  Their `propagated_risk` values are bounded and deterministic but not converged; treat as advisory rather than absolute. |
+| `scc_non_convergent` | `warning` | One or more residual cyclic components did not reach the propagation fixed-point within the iteration cap.  Members of such components fall back to their intrinsic `riskScore` for `propagated_risk` (instead of the cap-dependent Jacobi residue), pairing with this warning so consumers know cascade propagation didn't run for those nodes. |
 
 The array is empty when nothing is worth flagging.  New codes may be
 added in future revisions; consumers should treat unknown codes as
