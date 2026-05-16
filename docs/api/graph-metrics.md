@@ -53,10 +53,15 @@ Content-Type: application/json
 ### Caching
 
 Responses are cached by a SHA-256 hash of `[nodes, links]`.  Cache layers:
-1. **Redis** (shared across instances) — key prefix `graph:v2:<hash>`
+1. **Redis** (shared across instances) — key prefix `graph:v3:<hash>`
 2. **LRU in-memory** (per-instance) — keyed on JSON-serialized input
 
 Identical requests return cached results with `cache_hit: true`.
+
+The Redis key prefix was bumped from `v2` to `v3` alongside the
+deterministic cycle-handling rewrite, which added the top-level
+`cycles_removed` and `warnings` fields.  Older `v2:` entries are
+ignored on read and let to expire naturally.
 
 ---
 
@@ -79,6 +84,8 @@ Content-Type: application/json
 | `templates` | `object` | Always | Repeating activity patterns detected (see [Templates](#templates)). |
 | `schedule_health` | `object` | Always | DCMA 14-point schedule health assessment (see [Schedule Health](#schedule-health)). |
 | `multi_resolution_communities` | `object` | Conditional | Multi-resolution community hierarchy. **Present only when** `n_nodes >= 50` and `edges > 0`. See [Multi-Resolution Communities](#multi-resolution-communities). |
+| `cycles_removed` | `array<object>` | Always | Edges removed by `ensure_dag` to sanitize the input into a DAG. Empty array when the input was already acyclic. See [Cycles Removed](#cycles-removed). |
+| `warnings` | `array<object>` | Always | Structured advisories about how the analysis ran (e.g. cycle removal, residual cycles).  Empty array when nothing is worth flagging.  See [Warnings](#warnings). |
 | `cache_key` | `string` | Always | SHA-256 hash of the input. |
 | `cache_hit` | `boolean` | Always | `true` if result was served from cache. |
 | `processing_time` | `float` | Always | Wall-clock seconds for the request. |
@@ -255,3 +262,55 @@ containment edges between adjacent resolution tiers:
 |---|---|---|
 | `400` | `{"error": "No nodes provided"}` | Missing or empty `nodes` array. |
 | `500` | `{"error": "<message>"}` | Unhandled analysis error. |
+
+---
+
+### Cycles Removed
+
+`cycles_removed` lists the edges that `ensure_dag` deleted to turn the
+input into a DAG so CPM, risk propagation, and community detection have
+well-defined output.  Each entry:
+
+| Key | Type | Description |
+|---|---|---|
+| `source` | `string` | Source activity ID of the removed edge. |
+| `target` | `string` | Target activity ID of the removed edge. |
+| `type` | `string` | Original link type (`FS` / `SS` / `FF` / `SF`). |
+| `lag` | `float` | Original lag in input time units (`0` when absent). |
+
+When the input is already a DAG, the array is empty.
+
+Edge selection is canonical: at each cycle-break step the
+lexicographically smallest `(source, target, type, lag)` tuple in the
+found cycle is removed.  This guarantees the same input produces the
+same `cycles_removed` list across runs, NetworkX versions, and
+dict-iteration orderings.
+
+A guard caps the number of removal iterations at `max(|edges| / 2, 1)`.
+If the cap is reached and cycles still remain, a `cycles_remaining`
+entry is appended to `warnings` and analytics proceed on the partially-
+sanitized graph (`_risk_propagation` then routes through SCC
+condensation to keep its output deterministic).
+
+---
+
+### Warnings
+
+`warnings` is a structured advisory channel for issues that didn't
+prevent the response from being computed but that callers should react
+to.  Each entry:
+
+| Key | Type | Description |
+|---|---|---|
+| `code` | `string` | Stable, machine-readable identifier. |
+| `severity` | `string` | One of `info` / `warning` / `error`. |
+| `message` | `string` | Human-readable detail. |
+
+| Code | Severity | Meaning |
+|---|---|---|
+| `cycles_removed` | `info` | One or more edges were removed to break input cycles.  Inspect `cycles_removed` for specifics. |
+| `cycles_remaining` | `warning` | The cycle-removal cap was reached and the graph still contained cycles when analytics began. |
+
+The array is empty when nothing is worth flagging.  New codes may be
+added in future revisions; consumers should treat unknown codes as
+opaque rather than failing.

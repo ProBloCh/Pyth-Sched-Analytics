@@ -180,6 +180,50 @@ class TestEnsureDag:
         # Should have removed exactly 1 edge to break the cycle
         assert len(G.edges) == 2
 
+    def test_records_removed_edges(self, cyclic_graph):
+        """ensure_dag publishes removed edges on G.graph for the caller."""
+        nodes, links = cyclic_graph
+        G = build_nx_graph(nodes, links)
+        G = ensure_dag(G)
+        removed = G.graph['cycles_removed']
+        assert isinstance(removed, list)
+        assert len(removed) == 1
+        entry = removed[0]
+        assert set(entry.keys()) == {'source', 'target', 'type', 'lag'}
+        # The removed edge must have come from the input cycle.
+        assert (entry['source'], entry['target']) in {
+            ('A', 'B'), ('B', 'C'), ('C', 'A')
+        }
+        assert G.graph['cycles_remaining'] is False
+
+    def test_cycle_edge_choice_is_deterministic(self, cyclic_graph):
+        """The cycle-edge tie-break is canonical: it picks the
+        lexicographically smallest (source, target, type, lag) tuple,
+        regardless of input link ordering."""
+        nodes, links = cyclic_graph
+
+        # Same cycle, two distinct insertion orders.
+        G1 = build_nx_graph(nodes, links)
+        G2 = build_nx_graph(nodes, list(reversed(links)))
+
+        G1 = ensure_dag(G1)
+        G2 = ensure_dag(G2)
+
+        edge1 = (G1.graph['cycles_removed'][0]['source'],
+                 G1.graph['cycles_removed'][0]['target'])
+        edge2 = (G2.graph['cycles_removed'][0]['source'],
+                 G2.graph['cycles_removed'][0]['target'])
+        assert edge1 == edge2
+        # Lexicographically smallest of {(A,B), (B,C), (C,A)} is (A,B).
+        assert edge1 == ('A', 'B')
+
+    def test_no_cycle_keeps_lists_empty(self, simple_chain):
+        nodes, links = simple_chain
+        G = build_nx_graph(nodes, links)
+        G = ensure_dag(G)
+        assert G.graph['cycles_removed'] == []
+        assert G.graph['cycles_remaining'] is False
+
 
 # ---------------------------------------------------------------------------
 # Critical path
@@ -448,6 +492,70 @@ class TestAnalyse:
         assert 'nodes' in result
         assert 'error' not in result
 
+    def test_cyclic_input_surfaces_cycles_removed(self, cyclic_graph):
+        """Response must publish cycles_removed + a structured warning."""
+        nodes, links = cyclic_graph
+        result = analyse(nodes, links)
+        assert isinstance(result.get('cycles_removed'), list)
+        assert len(result['cycles_removed']) == 1
+        assert set(result['cycles_removed'][0].keys()) == {
+            'source', 'target', 'type', 'lag'
+        }
+        codes = {w['code'] for w in result.get('warnings', [])}
+        assert 'cycles_removed' in codes
+        assert 'cycles_remaining' not in codes  # cap not hit on this fixture
+
+    def test_dag_input_has_empty_cycle_fields(self, simple_chain):
+        """No cycles -> empty cycles_removed and empty warnings."""
+        nodes, links = simple_chain
+        result = analyse(nodes, links)
+        assert result.get('cycles_removed') == []
+        # warnings list is present (always) but holds no cycle entries.
+        codes = {w['code'] for w in result.get('warnings', [])}
+        assert 'cycles_removed' not in codes
+        assert 'cycles_remaining' not in codes
+
+    def test_propagated_risk_deterministic_on_residual_cycles(self):
+        """When ensure_dag leaves residual cycles, _risk_propagation must
+        produce identical output across repeated calls (was nondeterministic
+        before: the fallback walked nodes in insertion order and treated
+        unvisited predecessors as 0.0)."""
+        import networkx as nx
+        from app import _risk_propagation
+
+        # Build a graph with a self-sustaining cycle that ensure_dag would
+        # break.  We construct G directly and skip ensure_dag so the
+        # residual-cycle branch of _risk_propagation is exercised.
+        risk_scores = {'A': 5.0, 'B': 7.0, 'C': 3.0, 'D': 4.0}
+        df = pd.DataFrame([
+            {'ID': k, 'riskScore': v, 'CommunityGroup': 0}
+            for k, v in risk_scores.items()
+        ])
+
+        def _build():
+            G = nx.DiGraph()
+            for n in df['ID']:
+                G.add_node(n)
+            # A -> B -> C -> A is a cycle; D feeds in from outside.
+            G.add_edge('A', 'B')
+            G.add_edge('B', 'C')
+            G.add_edge('C', 'A')
+            G.add_edge('D', 'A')
+            return G
+
+        out1 = _risk_propagation(_build(), df.copy())
+        out2 = _risk_propagation(_build(), df.copy())
+        vals1 = dict(zip(out1['ID'].astype(str),
+                         out1['propagated_risk'].astype(float)))
+        vals2 = dict(zip(out2['ID'].astype(str),
+                         out2['propagated_risk'].astype(float)))
+        assert vals1 == vals2
+        # Every node should have a finite, non-zero propagated risk
+        # (intrinsic is non-zero and propagation is well-defined).
+        for v in vals1.values():
+            assert v == v  # not NaN
+            assert v != 0.0
+
 
 # ---------------------------------------------------------------------------
 # /graph-metrics endpoint contract
@@ -467,6 +575,22 @@ class TestGraphMetricsEndpoint:
         assert 'work_packages' in data
         assert 'templates' in data
         assert 'cache_key' in data
+        # Cycle-handling fields are always-present (empty for DAG inputs).
+        assert data['cycles_removed'] == []
+        assert isinstance(data.get('warnings'), list)
+
+    def test_cyclic_input_endpoint_surface(self, client, cyclic_graph):
+        """/graph-metrics must surface cycles_removed + warnings to HTTP."""
+        nodes, links = cyclic_graph
+        resp = client.post('/graph-metrics',
+                           json={'nodes': nodes, 'links': links})
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert len(data['cycles_removed']) == 1
+        entry = data['cycles_removed'][0]
+        assert set(entry.keys()) == {'source', 'target', 'type', 'lag'}
+        codes = {w['code'] for w in data['warnings']}
+        assert 'cycles_removed' in codes
 
     def test_lru_cache_not_mutated_across_requests(self, client):
         """Regression test for H2: the route handler adds cache_key/cache_hit/
