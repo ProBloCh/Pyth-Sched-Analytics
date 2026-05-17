@@ -135,6 +135,18 @@ omit = [
 
 [tool.coverage.report]
 fail_under = 83
+
+# -----------------------------------------------------------------------------
+# pytest
+# -----------------------------------------------------------------------------
+# Custom markers must be registered or pytest emits PytestUnknownMarkWarning
+# (and treats them as typos in strict mode).  Add new markers here.
+# -----------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+markers = [
+    "determinism: locks numerical reproducibility on stochastic and deterministic endpoints (PR-12).  Filter with `pytest -m determinism` to run only this pack.",
+]
 show_missing = false
 skip_covered = true
 exclude_lines = [
