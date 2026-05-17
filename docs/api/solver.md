@@ -336,12 +336,28 @@ Content-Type: application/json
 | `iterations` | `int` | Always | Actual iterations completed (`<= max_iterations`). |
 | `converged` | `boolean` | Always | `true` if stopped before hitting `max_iterations`. |
 | `history` | `array<object>` | Always | Per-iteration objective snapshot (see [History Entry](#history-entry)). |
+| `optimizer_diagnostics` | `object` | Always | Structured termination summary (PR-11). See below. |
 | `config` | `object` | Always | Echo of active config: `{disciplines, weights, max_iterations}`. |
 | `computation_ms` | `float` | Always | Wall-clock milliseconds. |
 | `cache_hit` | `boolean` | Always | `true` if served from cache. |
 | `stochastic` | `object` | Conditional | Monte Carlo results on optimized state. **Present only when** `stochastic: true`. See [Stochastic](#stochastic). |
 | `constraints` | `object \| null` | Always | Per-constraint feasibility report at the **post-optimisation** state.  `null` when no `max_makespan` / `max_budget` was supplied or the bound couldn't be resolved; otherwise see [Constraints Report](#constraints-report). |
 | `calendar` | `object` | Conditional | Calendar mapping from final `makespan` to a real end date.  Same shape as the sensitivity-endpoint `calendar`.  See [Calendar Mapping](#calendar-mapping). |
+
+##### `optimizer_diagnostics`
+
+| Key | Type | Description |
+|---|---|---|
+| `iterations` | `int` | Same value as the top-level `iterations` field. |
+| `max_iterations` | `int` | The budget that was active for this run. |
+| `converged` | `boolean` | Same value as the top-level `converged` field. |
+| `terminated_reason` | `string` | One of `converged` / `max_iter_hit` / `unknown`.  Useful for log queries: filter on `terminated_reason = "max_iter_hit"` to find runs that exhausted their budget. |
+| `max_iter_hit` | `boolean` | `true` iff `terminated_reason == "max_iter_hit"`.  Strong signal that the solver returned a sub-optimal answer; consumers should retry with a higher `max_iterations` budget. |
+
+The same diagnostic is emitted to Prometheus as
+`pyth_solver_iterations` (histogram) and
+`pyth_solver_terminations_total{reason}` (counter).  See
+[docs/observability.md](../observability.md).
 | `warnings` | `array<object>` | Conditional | Non-fatal advisory messages.  See [Hard Constraints](#hard-constraints) for the full list of warning codes. |
 
 #### Activity Change

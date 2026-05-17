@@ -81,6 +81,57 @@ _CACHE_EVENTS = Counter(
     registry=_REGISTRY,
 )
 
+# Solver internal metrics (PR-11).  Recorded by solver/core.py via
+# record_solver_run() / record_mc_run() below so the metrics module
+# stays the single owner of the prometheus-client surface.
+_SOLVER_ITERATIONS = Histogram(
+    'pyth_solver_iterations',
+    'L-BFGS-B iteration count per /solver/optimize call.',
+    labelnames=('endpoint',),
+    buckets=(1, 5, 10, 25, 50, 100, 250, 500),
+    registry=_REGISTRY,
+)
+
+_SOLVER_TERMINATIONS = Counter(
+    'pyth_solver_terminations_total',
+    'Optimiser termination reason per call -- converged, max_iter_hit, '
+    'or unknown.  An over-budgeted run that hits max_iterations '
+    'without converging surfaces as max_iter_hit, the signal that the '
+    'solver returned a suboptimal answer.',
+    labelnames=('endpoint', 'reason'),
+    registry=_REGISTRY,
+)
+
+_MC_SAMPLES = Histogram(
+    'pyth_mc_samples',
+    'Monte Carlo sample count per stochastic solver / completion run.',
+    labelnames=('endpoint',),
+    buckets=(1, 10, 32, 100, 256, 1000),
+    registry=_REGISTRY,
+)
+
+
+def record_solver_run(endpoint: str, iterations: int,
+                      terminated_reason: str) -> None:
+    """Emit solver metrics for a single /solver/optimize call.
+
+    ``endpoint`` is the solver entry point name (typically
+    ``'optimize'``).  ``terminated_reason`` must be one of
+    ``{'converged', 'max_iter_hit', 'unknown'}``; unknown values are
+    silently coerced to ``'unknown'`` so a typo doesn't leak into
+    label cardinality.
+    """
+    _SOLVER_ITERATIONS.labels(endpoint=endpoint).observe(max(0, int(iterations)))
+    reason = terminated_reason if terminated_reason in (
+        'converged', 'max_iter_hit', 'unknown',
+    ) else 'unknown'
+    _SOLVER_TERMINATIONS.labels(endpoint=endpoint, reason=reason).inc()
+
+
+def record_mc_run(endpoint: str, n_samples: int) -> None:
+    """Emit MC sample-count histogram for a stochastic run."""
+    _MC_SAMPLES.labels(endpoint=endpoint).observe(max(0, int(n_samples)))
+
 # Fields stamped onto every record from the request context.  Any
 # additional fields passed via logger.info(..., extra={...}) or via
 # flask.g.log_extras are merged in by the formatter below.

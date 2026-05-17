@@ -111,6 +111,9 @@ exposition format.
 |---|---|---|---|
 | `pyth_request_duration_seconds` | Histogram | `endpoint`, `method`, `status` | Wall-clock request latency.  Buckets cover ~25 ms through 120 s (matches the documented `analyse()` envelope for graphs up to 15K nodes).  The `/metrics` scrape itself is excluded so the histogram doesn't get skewed. |
 | `pyth_cache_events_total` | Counter | `outcome` | Cache lookup outcomes.  Routes opt in by setting `flask.g.cache_event = 'hit' \| 'miss' \| 'store' \| 'error'`.  Unknown values are silently ignored (label closed). |
+| `pyth_solver_iterations` | Histogram | `endpoint` | L-BFGS-B iteration count per `/solver/optimize` call.  Buckets 1..500. |
+| `pyth_solver_terminations_total` | Counter | `endpoint`, `reason` | Optimiser termination reason.  `reason` is one of `converged`, `max_iter_hit`, `unknown`; unknown values are coerced to `unknown` so label cardinality stays closed. |
+| `pyth_mc_samples` | Histogram | `endpoint` | MC sample count per stochastic run.  Emitted from `/solver/optimize` when `solver_config.stochastic = true`.  Buckets 1..1000. |
 
 ### Authentication
 
@@ -145,10 +148,13 @@ scrape_configs:
 
 ### What `/metrics` does NOT do
 
-* Does not surface solver iteration counts or MC sample counts --
-  that's PR-11 (`pyth_solver_iterations`, `pyth_solver_converged`,
-  `pyth_mc_samples`, etc.).
 * Does not emit per-route cache size / TTL metrics.
+* Does not emit individual solver convergence trajectories
+  (per-iteration objective values are in the response body's
+  `history` field; emit them to a time-series DB if you need them).
+* Does not emit Pareto-frontier metrics (per-point iterations / MC
+  samples) -- only the aggregate `/solver/optimize` path is
+  instrumented today.
 
 ## What's NOT in PR-9 / PR-10
 
