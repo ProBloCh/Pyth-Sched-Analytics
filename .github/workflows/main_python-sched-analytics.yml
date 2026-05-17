@@ -114,6 +114,15 @@ jobs:
           source venv/bin/activate
           pip install -r requirements.txt -r requirements-dev.txt
 
+      - name: CLAUDE.md test-counter drift check
+        # PR-18.  Asserts the canonical test count + file count in
+        # CLAUDE.md match the live `pytest --collect-only` output and
+        # the test_*.py file count.  Fails the build on drift so the
+        # author can bump the counter in the same commit.
+        run: |
+          source venv/bin/activate
+          python scripts/check_claude_md.py
+
       - name: Run tests with coverage
         # --cov-fail-under is read from pyproject.toml [tool.coverage.report].
         # See docs/roadmap-to-10.md PR-7 for the threshold-bump protocol.

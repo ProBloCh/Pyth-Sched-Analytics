@@ -23,7 +23,7 @@ Deployed to Azure via GitHub Actions.
 **Tech stack:** Python 3.12, Flask, NetworkX + NetworkKit (C++ acceleration),
 NumPy, Pandas, scikit-learn, SciPy, Redis (optional caching).
 
-**Architecture:** `app.py` (~1,400 LOC) handles descriptive analytics.
+**Architecture:** `app.py` (~1,680 LOC) handles descriptive analytics.
 `multi_resolution_pipeline.py` (~335 LOC) handles hierarchical community
 detection.  `solver/` (10 modules, ~2,400 LOC) is a Flask Blueprint
 registered in `app.py` that provides three prescriptive endpoints plus a
@@ -74,7 +74,7 @@ matrix, and top-N highest-risk activities per hotspot for downstream
 LLM grounding.  Engine is pure pandas/numpy with no Flask deps;
 re-callable via `compute_interface_analytics`.
 
-Tests: **838 across 10 test files**, including JS-vs-Python diff
+Tests: **934 across 19 test files**, including JS-vs-Python diff
 harnesses (`tests/test_evm_diff.py` + `tests/diff_harness/run_js_evm.js`;
 `tests/test_paths_diff.py` + `tests/diff_harness/run_js_paths.js`;
 `tests/test_calendar_diff.py` + `tests/diff_harness/run_js_calendar.js`)
@@ -120,7 +120,7 @@ Maintain the existing simplicity. Don't add speculative complexity.
 
 ### 3. Surgical Changes
 
-Touch only what you must.  The test suite (157 tests) catches regressions,
+Touch only what you must.  The test suite (count above) catches regressions,
 but collateral damage in untested paths is still possible.
 
 - Don't "improve" adjacent code, comments, or formatting.
@@ -144,7 +144,7 @@ Define success criteria. Verify before declaring done.
   1. [Step] -> verify: [check]
   2. [Step] -> verify: [check]
 
-**Note:** The project has 157 automated tests (pytest).  Run with
+**Note:** The project has 934 automated tests (pytest).  Run with
 `python -m pytest tests/ -v`.  Verification means running the tests,
 checking endpoint responses, and reviewing outputs for correctness.
 When adding new features, add corresponding tests.
