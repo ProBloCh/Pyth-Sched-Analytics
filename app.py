@@ -98,6 +98,14 @@ CORS(app,
      allow_headers=["Content-Type", "Authorization", "X-API-Key"],
      methods=["GET", "POST", "OPTIONS"])
 
+# Request IDs + structured JSON logging.  Registered BEFORE auth so
+# the request_id is stamped on g BEFORE the auth gate runs -- that way
+# a 401/503 response from the auth hook still carries X-Request-ID
+# and gets logged with the correlation field.  See observability.py.
+from observability import init_observability  # noqa: E402
+
+init_observability(app)
+
 # API-key gate.  Health endpoints stay public; everything else requires
 # X-API-Key when PYTH_API_KEYS is set.  See auth.py for the policy.
 init_auth(app)
