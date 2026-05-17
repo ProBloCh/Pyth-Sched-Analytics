@@ -30,11 +30,15 @@ from flask import Flask, jsonify, request
 # Web Apps probes.  /metrics has its own optional X-Metrics-Token
 # gate in observability.py; bypassing X-API-Key here lets the
 # scraper hit the endpoint without a customer-facing key.
+#
+# /test-cors is intentionally NOT whitelisted: it echoes the
+# attacker-controlled Origin header in its response body, which
+# (while benign in plain JSON) is a reflective unauth surface we
+# don't need in production.  Devs verifying CORS pass their dev key.
 WHITELIST_PATHS = frozenset({
     '/',
     '/health',
     '/metrics',
-    '/test-cors',
     '/solver/health',
     '/completion/health',
     '/evm/health',
@@ -61,6 +65,14 @@ def _auth_disabled() -> bool:
 
 
 def _compare_any(presented: str, valid: list[str]) -> bool:
+    # Per-key compare_digest is constant-time, but iterating over
+    # ``valid`` makes the total wall-clock leak the configured key
+    # count (early miss = shorter total time when ``presented`` is
+    # all-different lengths).  The leak is negligible: PYTH_API_KEYS
+    # is operator-supplied at deploy time (not an attacker-derivable
+    # secret), and the count rarely exceeds 2-3 distinct keys.  If
+    # the key count ever becomes sensitive, switch to comparing
+    # against a fixed-length digest set instead.
     if not presented:
         return False
     presented_b = presented.encode('utf-8')

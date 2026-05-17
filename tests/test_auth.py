@@ -245,11 +245,30 @@ def test_whitespace_only_keys_trigger_503_at_request_time(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Diagnostic endpoints (/test-cors, /) join the public list.
-# Enumerated separately because they're not health probes per se.
+# Diagnostic endpoints.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize('path', ['/test-cors', '/'])
-def test_diagnostic_endpoints_are_public(auth_client, path):
-    resp = auth_client.get(path)
-    assert resp.status_code == 200, f'{path} returned {resp.status_code}'
+def test_root_endpoint_is_public(auth_client):
+    """The root path is a service-discovery endpoint, intentionally public."""
+    resp = auth_client.get('/')
+    assert resp.status_code == 200
+
+
+def test_test_cors_requires_auth(auth_client):
+    """/test-cors echoes the Origin header in its response body.  We
+    removed it from WHITELIST_PATHS so the reflective surface stays
+    auth-gated in production (devs verifying CORS pass their dev key
+    via X-API-Key)."""
+    resp = auth_client.get('/test-cors')
+    assert resp.status_code == 401, (
+        f'/test-cors is in WHITELIST_PATHS again?  Got {resp.status_code}')
+
+
+def test_test_cors_accessible_with_key(auth_client):
+    """With a valid X-API-Key, /test-cors is reachable -- the
+    capability isn't removed, just gated."""
+    resp = auth_client.get(
+        '/test-cors',
+        headers={'X-API-Key': 'test-key-abc'},
+    )
+    assert resp.status_code == 200

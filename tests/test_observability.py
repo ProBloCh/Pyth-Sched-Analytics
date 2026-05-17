@@ -52,6 +52,35 @@ def test_request_id_echoes_when_supplied(client):
     assert resp.headers.get('X-Request-ID') == custom
 
 
+@pytest.mark.parametrize('malicious', [
+    'a' * 200,                      # too long
+    'has spaces',                   # whitespace
+    'has\nnewline',                 # log injection via CRLF -- werkzeug
+                                    #   actually rejects this at the http
+                                    #   layer too, but we double-belt-and-
+                                    #   suspenders at the sanitizer.
+    '<script>alert(1)</script>',    # angle brackets
+    '\x00null-byte',                # control byte
+    '',                             # explicitly empty (after strip)
+    '   ',                          # whitespace-only
+])
+def test_request_id_malicious_value_replaced_with_uuid(client, malicious):
+    """Off-pattern X-Request-ID values are silently replaced with a
+    fresh UUID4.  Defends against log injection, control bytes, and
+    oversized values that would inflate every JSON log line."""
+    try:
+        resp = client.get('/health', headers={'X-Request-ID': malicious})
+    except ValueError:
+        # Werkzeug rejects CRLF at the HTTP layer before our sanitizer
+        # ever runs -- that's an acceptable secondary defense.
+        return
+    rid = resp.headers.get('X-Request-ID', '')
+    assert rid != malicious, (
+        f'Malicious request-ID {malicious!r} was echoed unchanged')
+    # The replacement is always a UUID4.
+    assert UUID4_RE.match(rid), f'Replacement not a UUID4: {rid!r}'
+
+
 def test_request_id_present_on_auth_failure(monkeypatch):
     """Auth-gate 401/503 responses still carry X-Request-ID -- the
     observability before_request runs before the auth before_request
@@ -199,6 +228,24 @@ def test_metrics_excludes_self_scrape(client):
                      if 'pyth_request_duration_seconds' in line
                      and 'prometheus_metrics' in line]
     assert not metrics_lines, metrics_lines
+
+
+def test_unmatched_route_bucketed_as_unmatched(client):
+    """A 404 on an attacker-controlled path bucketizes as endpoint
+    label 'unmatched' instead of leaking the path into label
+    cardinality (scrape-DoS / memory-growth defense)."""
+    # Hit a route that doesn't exist.
+    resp = client.get('/this-path-does-not-exist-' + 'a' * 50)
+    assert resp.status_code == 404
+    body = client.get('/metrics').get_data(as_text=True)
+    # The 50-char path must NOT appear in any metric label.
+    assert 'this-path-does-not-exist' not in body, (
+        'Attacker-controlled path leaked into Prometheus labels')
+    # The unmatched bucket should exist after our 404.
+    unmatched_lines = [line for line in body.splitlines()
+                       if 'pyth_request_duration_seconds_count' in line
+                       and 'endpoint="unmatched"' in line]
+    assert unmatched_lines, body
 
 
 def test_metrics_token_required_when_set(monkeypatch):

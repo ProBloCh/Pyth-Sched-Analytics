@@ -57,7 +57,11 @@ def _optimizer_diagnostics(iterations, converged, max_iterations):
 def _emit_solver_metrics(endpoint, iterations, converged, max_iterations,
                          n_mc_samples=None):
     """Best-effort Prometheus emission.  Never raises -- a metrics
-    failure mid-request must not break the solver response."""
+    failure mid-request must not break the solver response.  The
+    debug log line ensures genuine bugs (not just prometheus
+    unavailability) are diagnosable in test or DEBUG environments
+    without breaking the request -- silent except: pass would hide
+    real issues like a typo in _optimizer_diagnostics."""
     try:
         from observability import record_mc_run, record_solver_run
         diag = _optimizer_diagnostics(iterations, converged, max_iterations)
@@ -66,7 +70,7 @@ def _emit_solver_metrics(endpoint, iterations, converged, max_iterations,
         if n_mc_samples is not None:
             record_mc_run(endpoint, int(n_mc_samples))
     except Exception:  # nosec B110 -- metrics best-effort; never break the solver
-        pass
+        logger.debug("solver metrics emission failed", exc_info=True)
 
 logger = logging.getLogger(__name__)
 

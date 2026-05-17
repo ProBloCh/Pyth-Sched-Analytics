@@ -64,7 +64,7 @@ optimizer, is reachable from any browser.
 - [ ] `docs/api/README.md` and each endpoint doc: state required header.
 - [ ] Add `PYTH_API_KEYS` and `PYTH_CORS_ORIGINS` to deployment notes.
 
-**Done when.** All existing 803 tests pass with `PYTH_API_KEYS` set in
+**Done when.** All existing tests pass with `PYTH_API_KEYS` set in
 the test fixture; new auth tests pass; manual curl without header
 returns 401.
 
@@ -236,7 +236,7 @@ entry leaves `.github/workflows/main_python-sched-analytics.yml`.
 
 ### PR-7 · Coverage threshold gate (S, test confidence)
 
-**Why.** 803 tests is high; coverage % is unknown.  A threshold gate
+**Why.** The suite is broad; coverage % is unknown.  A threshold gate
 freezes that quality forward.
 
 **Files.**
@@ -473,7 +473,7 @@ Current size: 1436 LOC.
 - [ ] No behaviour change; diff harness must remain green.
 - [ ] Update `CLAUDE.md` architecture section to list the submodules.
 
-**Done when.** All 803 tests pass unchanged; `completion/monte_carlo.py`
+**Done when.** All tests pass unchanged; `completion/monte_carlo.py`
 ≤ 600 LOC.
 
 **Depends on.** Tiers 0–2 fully landed.
@@ -529,7 +529,7 @@ Current size: 1446 LOC.
 - [ ] `app.py` ≤ 250 LOC.
 - [ ] Update `CLAUDE.md` *Architecture* section.
 
-**Done when.** All 803 tests pass; CI matrix green; no consumer-visible
+**Done when.** All tests pass; CI matrix green; no consumer-visible
 import path broken (verified by smoke test).
 
 **Depends on.** PR-15, PR-16.

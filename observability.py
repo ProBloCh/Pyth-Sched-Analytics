@@ -33,6 +33,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -46,12 +47,27 @@ from prometheus_client import (
     generate_latest,
 )
 
+# X-Request-ID accepted from clients only if it matches this pattern.
+# 1-128 chars, ASCII letters / digits / hyphen / underscore / dot / colon.
+# Rejects: log-injection via CRLF, oversized values that inflate every
+# JSON log line, attacker-controlled control bytes that confuse the
+# JSON formatter.  Off-pattern values trigger a fresh UUID4.
+_VALID_REQUEST_ID = re.compile(r'^[A-Za-z0-9._:-]{1,128}$')
+
 _REQUEST_LOGGER_NAME = 'pyth.request'
 _METRICS_PATH = '/metrics'
 
 # Dedicated registry so the /metrics output is deterministic in tests
 # (the default process_collector / platform_collector add hostname /
 # pid labels that change between runs).
+#
+# RELOAD-SAFETY CONTRACT: the Histogram / Counter declarations below
+# register at module-import time.  ``importlib.reload(observability)``
+# WILL RAISE ``ValueError: Duplicated timeseries in CollectorRegistry``.
+# Tests that need a fresh registry must monkey-patch ``_REGISTRY`` or
+# call ``CollectorRegistry().unregister(...)`` -- never reload the
+# module.  Production code never reloads modules; this only matters
+# for test infrastructure.
 _REGISTRY = CollectorRegistry()
 
 # Latency histogram.  Bucket boundaries cover the documented
@@ -238,7 +254,13 @@ def _install_root_logger(level: int) -> None:
 
 def _before_request() -> None:
     incoming = request.headers.get('X-Request-ID', '').strip()
-    g.request_id = incoming if incoming else str(uuid.uuid4())
+    # Reject anything outside the whitelist so the value can be safely
+    # echoed in headers and embedded in JSON log lines without
+    # log-injection / control-byte / oversized-string concerns.
+    if _VALID_REQUEST_ID.match(incoming):
+        g.request_id = incoming
+    else:
+        g.request_id = str(uuid.uuid4())
     g.request_start_ts = time.time()
 
 
@@ -262,7 +284,12 @@ def _after_request(response: Response) -> Response:
     # for the /metrics scrape itself (recursive cardinality + skews
     # histogram buckets toward fast scrape responses).
     if latency_seconds is not None and request.path != _METRICS_PATH:
-        endpoint = request.endpoint or request.path
+        # Use request.endpoint (Flask handler name) for bounded
+        # cardinality.  Unmatched routes (404s) have endpoint=None;
+        # bucketing them as 'unmatched' prevents attacker-controlled
+        # path values from inflating the histogram's label set (which
+        # would otherwise enable a scrape-DoS / memory-growth vector).
+        endpoint = request.endpoint or 'unmatched'
         _REQUEST_DURATION.labels(
             endpoint=endpoint,
             method=request.method,
