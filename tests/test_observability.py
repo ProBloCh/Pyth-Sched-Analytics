@@ -154,3 +154,135 @@ def test_access_log_request_id_matches_response_header(client, caplog):
     assert len(request_records) == 1
     assert request_records[0].request_id == 'corr-xyz'
     assert resp.headers['X-Request-ID'] == 'corr-xyz'
+
+
+# ---------------------------------------------------------------------------
+# Prometheus /metrics endpoint
+# ---------------------------------------------------------------------------
+
+def test_metrics_endpoint_returns_prometheus_text(client):
+    """`/metrics` returns text/plain Prometheus exposition format."""
+    # Hit at least one endpoint so the histogram has a sample.
+    client.get('/health')
+    resp = client.get('/metrics')
+    assert resp.status_code == 200
+    assert resp.mimetype.startswith('text/plain')
+    body = resp.get_data(as_text=True)
+    assert 'pyth_request_duration_seconds' in body
+    assert '# HELP' in body  # Prometheus exposition format marker
+
+
+def test_metrics_records_request_latency(client):
+    """A request to /health increments the latency histogram."""
+    client.get('/health')
+    client.get('/health')
+    body = client.get('/metrics').get_data(as_text=True)
+    # The _count for the health endpoint should be >= 2.
+    health_lines = [line for line in body.splitlines()
+                    if line.startswith('pyth_request_duration_seconds_count')
+                    and 'health' in line]
+    assert health_lines, body
+    # Sum the counts across any matching label sets.
+    total = 0
+    for line in health_lines:
+        # e.g. pyth_request_duration_seconds_count{endpoint="health",...} 2.0
+        total += float(line.rsplit(' ', 1)[-1])
+    assert total >= 2
+
+
+def test_metrics_excludes_self_scrape(client):
+    """/metrics scrapes don't appear as labels in the histogram --
+    avoids recursive cardinality + skewed buckets."""
+    # Do a clean scrape, then look at the body.
+    body = client.get('/metrics').get_data(as_text=True)
+    metrics_lines = [line for line in body.splitlines()
+                     if 'pyth_request_duration_seconds' in line
+                     and 'prometheus_metrics' in line]
+    assert not metrics_lines, metrics_lines
+
+
+def test_metrics_token_required_when_set(monkeypatch):
+    """When PYTH_METRICS_TOKEN is set, /metrics requires the matching
+    X-Metrics-Token header."""
+    monkeypatch.setenv('PYTH_METRICS_TOKEN', 'scrape-token')
+    app.config['TESTING'] = True
+    c = app.test_client()
+
+    # No token -> 401
+    resp = c.get('/metrics')
+    assert resp.status_code == 401
+
+    # Wrong token -> 401
+    resp = c.get('/metrics', headers={'X-Metrics-Token': 'wrong'})
+    assert resp.status_code == 401
+
+    # Correct token -> 200
+    resp = c.get('/metrics', headers={'X-Metrics-Token': 'scrape-token'})
+    assert resp.status_code == 200
+
+
+def test_metrics_token_unset_means_open(monkeypatch):
+    """When PYTH_METRICS_TOKEN is unset, /metrics is open (private-
+    network scrape pattern).  Locks in the default."""
+    monkeypatch.delenv('PYTH_METRICS_TOKEN', raising=False)
+    app.config['TESTING'] = True
+    c = app.test_client()
+    resp = c.get('/metrics')
+    assert resp.status_code == 200
+
+
+def test_metrics_endpoint_is_auth_exempt(monkeypatch):
+    """Even with PYTH_API_KEYS set, /metrics doesn't require X-API-Key."""
+    monkeypatch.setenv('PYTH_AUTH_DISABLED', 'false')
+    monkeypatch.setenv('PYTH_API_KEYS', 'real-key')
+    app.config['TESTING'] = True
+    c = app.test_client()
+    resp = c.get('/metrics')
+    assert resp.status_code == 200
+
+
+def test_cache_event_counter_increments_on_opt_in():
+    """A route that sets ``g.cache_event = 'hit'`` bumps the counter.
+
+    Drives ``_after_request`` directly inside a test request context
+    rather than registering a runtime route -- Flask 3 forbids
+    add_url_rule after the first request.
+    """
+    import time
+
+    from flask import Response, g
+
+    from observability import _CACHE_EVENTS, _after_request
+
+    before = _CACHE_EVENTS.labels(outcome='hit')._value.get()
+
+    with app.test_request_context('/whatever', method='GET'):
+        g.request_id = 'test-cache-rid'
+        g.request_start_ts = time.time() - 0.001  # 1 ms ago
+        g.cache_event = 'hit'
+        _after_request(Response('ok', status=200))
+
+    after = _CACHE_EVENTS.labels(outcome='hit')._value.get()
+    assert after == before + 1
+
+
+def test_cache_event_counter_ignores_unknown_outcome():
+    """A route that sets a typo'd ``g.cache_event`` does NOT silently
+    create a new label dimension -- the outcome label is closed."""
+    import time
+
+    from flask import Response, g
+
+    from observability import _CACHE_EVENTS, _after_request
+
+    with app.test_request_context('/whatever', method='GET'):
+        g.request_id = 'test-cache-bad-rid'
+        g.request_start_ts = time.time() - 0.001
+        g.cache_event = 'cached'  # not in the allowed set
+        _after_request(Response('ok', status=200))
+
+    # The counter for 'cached' was never created.  Confirm by checking
+    # the registry's known label values.
+    for sample in _CACHE_EVENTS.collect():
+        for s in sample.samples:
+            assert s.labels.get('outcome') != 'cached', sample.samples

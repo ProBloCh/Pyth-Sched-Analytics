@@ -29,6 +29,7 @@ format) for local dev.
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
@@ -36,9 +37,49 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from flask import Flask, Response, g, request
+from flask import Flask, Response, g, jsonify, request
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Counter,
+    Histogram,
+    generate_latest,
+)
 
 _REQUEST_LOGGER_NAME = 'pyth.request'
+_METRICS_PATH = '/metrics'
+
+# Dedicated registry so the /metrics output is deterministic in tests
+# (the default process_collector / platform_collector add hostname /
+# pid labels that change between runs).
+_REGISTRY = CollectorRegistry()
+
+# Latency histogram.  Bucket boundaries cover the documented
+# performance envelope in CLAUDE.md: ~100 ms for small graphs through
+# ~12 s for 15K-node analyse().  The +Inf bucket Prometheus adds
+# captures runaway requests.
+_REQUEST_DURATION = Histogram(
+    'pyth_request_duration_seconds',
+    'Wall-clock request duration in seconds, labelled by endpoint, '
+    'method, and status code.',
+    labelnames=('endpoint', 'method', 'status'),
+    buckets=(0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+             60.0, 120.0),
+    registry=_REGISTRY,
+)
+
+# Cache outcome counter.  Routes opt in by setting one of
+# ``flask.g.cache_event = 'hit' | 'miss' | 'store' | 'error'`` during
+# request handling; absent = no increment.  Keeps the counter
+# meaningful (routes that don't use the cache aren't pulled into the
+# zero-bucket).
+_CACHE_EVENTS = Counter(
+    'pyth_cache_events_total',
+    'Cache lookup outcomes per request.  Routes opt in by setting '
+    'flask.g.cache_event.',
+    labelnames=('outcome',),
+    registry=_REGISTRY,
+)
 
 # Fields stamped onto every record from the request context.  Any
 # additional fields passed via logger.info(..., extra={...}) or via
@@ -160,9 +201,26 @@ def _after_request(response: Response) -> Response:
         response.headers.setdefault('X-Request-ID', rid)
 
     start = getattr(g, 'request_start_ts', None)
-    latency_ms = round((time.time() - start) * 1000, 2) if start else None
+    latency_seconds = (time.time() - start) if start else None
+    latency_ms = round(latency_seconds * 1000, 2) if latency_seconds is not None else None
 
     cache_hit = getattr(g, 'cache_hit', None)
+    cache_event = getattr(g, 'cache_event', None)
+
+    # Metrics: record latency + cache outcome.  Don't record metrics
+    # for the /metrics scrape itself (recursive cardinality + skews
+    # histogram buckets toward fast scrape responses).
+    if latency_seconds is not None and request.path != _METRICS_PATH:
+        endpoint = request.endpoint or request.path
+        _REQUEST_DURATION.labels(
+            endpoint=endpoint,
+            method=request.method,
+            status=str(response.status_code),
+        ).observe(latency_seconds)
+        if isinstance(cache_event, str) and cache_event in (
+            'hit', 'miss', 'store', 'error',
+        ):
+            _CACHE_EVENTS.labels(outcome=cache_event).inc()
 
     record = {
         'request_id': rid,
@@ -174,24 +232,73 @@ def _after_request(response: Response) -> Response:
     }
     if cache_hit is not None:
         record['cache_hit'] = cache_hit
+    if cache_event is not None:
+        record['cache_event'] = cache_event
 
-    logging.getLogger(_REQUEST_LOGGER_NAME).info(
-        f'{request.method} {request.path} -> {response.status_code}',
-        extra=record,
-    )
+    # Don't log the /metrics scrape -- it'd spam the access log with
+    # one line per scrape interval (typically every 15s).  Operators
+    # who want scrape audit can read the Prometheus side.
+    if request.path != _METRICS_PATH:
+        logging.getLogger(_REQUEST_LOGGER_NAME).info(
+            f'{request.method} {request.path} -> {response.status_code}',
+            extra=record,
+        )
     return response
 
 
+def _check_metrics_token() -> Response | None:
+    """Optional X-Metrics-Token gate.
+
+    When ``PYTH_METRICS_TOKEN`` is set, every ``/metrics`` request
+    must present a matching ``X-Metrics-Token`` header.  When unset,
+    ``/metrics`` is open -- suitable for private-network Prometheus
+    scrapes; production deployments exposed to the internet should
+    set the token.
+    """
+    expected = os.environ.get('PYTH_METRICS_TOKEN', '').strip()
+    if not expected:
+        return None
+    presented = request.headers.get('X-Metrics-Token', '')
+    if presented and hmac.compare_digest(
+        presented.encode('utf-8'), expected.encode('utf-8'),
+    ):
+        return None
+    return (
+        jsonify({'error': 'unauthorized'}),
+        401,
+        {'WWW-Authenticate': 'MetricsToken'},
+    )
+
+
+def _metrics_endpoint():
+    """Return the Prometheus text-format scrape body."""
+    blocked = _check_metrics_token()
+    if blocked is not None:
+        return blocked
+    body = generate_latest(_REGISTRY)
+    return Response(body, mimetype=CONTENT_TYPE_LATEST)
+
+
 def init_observability(app: Flask) -> None:
-    """Register the JSON formatter + request-ID hooks on the Flask app."""
+    """Register the JSON formatter, request-ID hooks, and /metrics route."""
     level = logging.DEBUG if app.debug else logging.INFO
     _install_root_logger(level)
     app.before_request(_before_request)
     app.after_request(_after_request)
+    app.add_url_rule(
+        _METRICS_PATH,
+        endpoint='prometheus_metrics',
+        view_func=_metrics_endpoint,
+        methods=['GET'],
+    )
     logging.info(
         'observability initialised',
         extra={
             'json_logs': _json_logs_enabled(),
             'request_logger': _REQUEST_LOGGER_NAME,
+            'metrics_path': _METRICS_PATH,
+            'metrics_token_required': bool(
+                os.environ.get('PYTH_METRICS_TOKEN', '').strip()
+            ),
         },
     )

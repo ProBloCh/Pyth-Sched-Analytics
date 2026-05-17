@@ -99,12 +99,63 @@ traces
 | order by timestamp asc
 ```
 
-## What's NOT in PR-9
+## Prometheus `/metrics`
 
-* No Prometheus `/metrics` endpoint (PR-10 in the roadmap).
-* No solver / Monte-Carlo internal metrics (PR-11).
+Scrape-format endpoint shipped in PR-10.  Available at
+`GET /metrics`, returns the standard `text/plain; version=0.0.4`
+exposition format.
+
+### Available series
+
+| Name | Type | Labels | Notes |
+|---|---|---|---|
+| `pyth_request_duration_seconds` | Histogram | `endpoint`, `method`, `status` | Wall-clock request latency.  Buckets cover ~25 ms through 120 s (matches the documented `analyse()` envelope for graphs up to 15K nodes).  The `/metrics` scrape itself is excluded so the histogram doesn't get skewed. |
+| `pyth_cache_events_total` | Counter | `outcome` | Cache lookup outcomes.  Routes opt in by setting `flask.g.cache_event = 'hit' \| 'miss' \| 'store' \| 'error'`.  Unknown values are silently ignored (label closed). |
+
+### Authentication
+
+`/metrics` is **exempt from `X-API-Key`** -- Prometheus scrapers
+should be able to reach it without a customer-facing credential.
+
+Optionally protected by a separate token:
+
+| Env var | Default | Effect |
+|---|---|---|
+| `PYTH_METRICS_TOKEN` | unset | When set, `/metrics` requires `X-Metrics-Token: <value>` (returns 401 otherwise).  When unset, `/metrics` is open -- suitable for private-network scrapes (Azure VNet, k8s Service). |
+
+### Scrape config example
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: pyth-sched-analytics
+    metrics_path: /metrics
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['python-sched-analytics.azurewebsites.net:443']
+    scheme: https
+    # Only needed when PYTH_METRICS_TOKEN is set:
+    authorization:
+      type: ApiKey
+      credentials: <PYTH_METRICS_TOKEN-value>
+    # Custom header name to match our gate:
+    headers:
+      X-Metrics-Token: <PYTH_METRICS_TOKEN-value>
+```
+
+### What `/metrics` does NOT do
+
+* Does not surface solver iteration counts or MC sample counts --
+  that's PR-11 (`pyth_solver_iterations`, `pyth_solver_converged`,
+  `pyth_mc_samples`, etc.).
+* Does not emit per-route cache size / TTL metrics.
+
+## What's NOT in PR-9 / PR-10
+
+* No solver / Monte-Carlo internal metrics (PR-11 in the roadmap).
 * No structured error logging on exceptions -- the existing
   `logger.exception()` calls work but their tracebacks land in the
   `exc_info` JSON field, not as structured stack frames.
-* `cache_hit` is opt-in per route.  Routes that set `g.cache_hit`
-  today: none.  Wire as needed.
+* `cache_hit` (the log field) and `cache_event` (the counter) are
+  opt-in per route.  Routes that set them today: none.  Wire as
+  needed.

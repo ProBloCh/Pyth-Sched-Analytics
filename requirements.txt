@@ -21,6 +21,10 @@ redis==5.0.1
 # Production server
 gunicorn==22.0.0
 
+# Metrics (Prometheus text-format scrape endpoint at /metrics).
+# Pure-Python client, no transitive deps beyond stdlib.  See PR-10.
+prometheus-client==0.25.0
+
 # Testing
 pytest==9.0.3
 

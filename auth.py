@@ -26,10 +26,14 @@ import os
 from flask import Flask, jsonify, request
 
 # Health + diagnostic endpoints that do NOT require auth -- consumed by
-# load balancers, uptime monitors, and the Azure Web Apps probes.
+# load balancers, uptime monitors, Prometheus scrapers, and the Azure
+# Web Apps probes.  /metrics has its own optional X-Metrics-Token
+# gate in observability.py; bypassing X-API-Key here lets the
+# scraper hit the endpoint without a customer-facing key.
 WHITELIST_PATHS = frozenset({
     '/',
     '/health',
+    '/metrics',
     '/test-cors',
     '/solver/health',
     '/completion/health',
