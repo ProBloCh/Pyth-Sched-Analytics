@@ -564,6 +564,7 @@ class TestAnalyse:
         before: the fallback walked nodes in insertion order and treated
         unvisited predecessors as 0.0)."""
         import networkx as nx
+
         from app import _risk_propagation
 
         # Build a graph with a self-sustaining cycle that ensure_dag would
@@ -627,6 +628,7 @@ class TestAnalyse:
         inflow average -- otherwise propagated_risk scales with the
         Jacobi iter cap (pre-fix: 2.0 intrinsic → ~52 after 50 iters)."""
         import networkx as nx
+
         from app import _risk_propagation
 
         df = pd.DataFrame([
@@ -651,6 +653,7 @@ class TestAnalyse:
         empirically grew ~130 at 50 iters, ~255 at 100, ~1254 at 500
         before this fix -- to propagated_risk for the SCC members."""
         import networkx as nx
+
         from app import _risk_propagation
 
         risk_scores = {'A': 5.0, 'B': 7.0, 'C': 3.0}

@@ -30,9 +30,7 @@ from pathlib import Path
 
 import pytest
 
-from completion.calendar import (
-    WorkingCalendar, advance_working_ms, _parse_holiday)
-
+from completion.calendar import WorkingCalendar, advance_working_ms
 
 HARNESS_DIR = Path(__file__).parent / 'diff_harness'
 JS_HARNESS = HARNESS_DIR / 'run_js_calendar.js'
@@ -70,7 +68,7 @@ def _run_js(fixture_path):
 
 def _parse_iso_to_ms(iso):
     """Parse 'YYYY-MM-DDTHH:MM:SSZ' (or +00:00) to UTC epoch ms."""
-    from datetime import datetime, timezone
+    from datetime import datetime
     s = iso.replace('Z', '+00:00')
     return datetime.fromisoformat(s).timestamp() * 1000.0
 

@@ -46,8 +46,9 @@ exclude = ["tests*", "Reference*", "docs*"]
 line-length = 100
 target-version = "py312"
 extend-exclude = [
-    "Reference",          # vendored JS reference, not Python
-    "tests/diff_harness", # JS subprocess harness, not Python
+    "Reference",                  # vendored JS reference, not Python
+    "tests/diff_harness",         # JS subprocess harness, not Python
+    "docs/research/sketches",     # research scratch code (lambdas / casual imports OK)
     ".venv",
     "venv",
 ]
