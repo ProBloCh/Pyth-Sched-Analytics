@@ -5,8 +5,6 @@ Uses Flask's test client — no actual HTTP server needed.
 Tests request validation, error handling, and response contracts.
 """
 
-import json
-import pytest
 
 
 # =====================================================================

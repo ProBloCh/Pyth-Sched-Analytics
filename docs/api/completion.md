@@ -523,6 +523,55 @@ the LinkedIn-discussion signature -- and the customer can tighten
 the corresponding `percentile_factors` via a custom class or
 override.
 
+#### Per-percentile hit rates (PR-22)
+
+The `predicted` block accepts the full percentile band:
+`p10_finish`, `p20_finish`, `p50_finish`, `p80_finish`, `p95_finish`
+(plus `baseline_finish`).  All percentile fields are **optional**;
+older records that only carry `p80_finish` continue to validate.
+`p80_finish` remains the only required percentile.
+
+`/completion/calibration-report` returns a `by_class.<class>.hit_rates`
+sub-object with one entry per percentile that has at least one
+recorded outcome:
+
+```json
+"hit_rates": {
+  "p10": { "n": 17, "hits": 2,  "rate": 0.118, "expected": 0.10, "calibration_score": 1.18 },
+  "p50": { "n": 30, "hits": 16, "rate": 0.533, "expected": 0.50, "calibration_score": 1.07 },
+  "p80": { "n": 30, "hits": 24, "rate": 0.800, "expected": 0.80, "calibration_score": 1.00 },
+  "p95": { "n": 30, "hits": 30, "rate": 1.000, "expected": 0.95, "calibration_score": 1.05 }
+}
+```
+
+* `n` -- outcomes that had this percentile recorded.
+* `hits` -- outcomes whose `actual.finish` was on or before
+  `predicted.pX_finish`.
+* `rate` -- `hits / n`.
+* `expected` -- the percentile itself (`0.10`, `0.20`, ...).
+* `calibration_score` -- `rate / expected`; **1.0 is perfect**.
+  Greater than 1.0 means the percentile is **conservative** (more
+  hits than the band's nominal probability); less than 1.0 means it
+  is **overconfident** (the band misses more often than the
+  percentile suggests).
+
+#### P80 hit-rate advisory
+
+At 30 or more recorded outcomes for a given reference class, the
+empirical P80 hit-rate is checked against the band `[70 %, 90 %]`:
+
+* `rate < 0.70` -> *"published P80 is overconfident for this
+  reference class"* note.
+* `rate > 0.90` -> *"published P80 is over-conservative for this
+  reference class"* note.
+
+The 30-outcome floor is the same threshold the existing
+`mean_ratio` advisory uses; below it, hit-rates are too noisy to
+act on.  The advisory is purely informational -- it does not change
+the percentile factors.  Closing the loop (auto-recalibrating the
+`percentile_factors` table) is future work tracked in
+`docs/roadmap-to-10.md` (PR-22 follow-up: empirical-CDF transform).
+
 ### Model vs reality
 
 Even with reference-class calibration in place, the published P80 is a

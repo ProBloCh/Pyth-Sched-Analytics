@@ -31,9 +31,9 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
-from solver.dag import build_dag, DAGState
-from .enumerate import path_duration, build_succ_edge_index
+from solver.dag import DAGState, build_dag
 
+from .enumerate import build_succ_edge_index, path_duration
 
 # ---------------------------------------------------------------------------
 # Config

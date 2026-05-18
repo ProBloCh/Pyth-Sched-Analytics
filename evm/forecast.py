@@ -18,12 +18,15 @@ import math
 from collections import deque
 
 from .helpers import (
-    Bounds, clamp, safe_date, convert_to_hours,
-    normalize_percent_complete, difference_in_calendar_days,
+    Bounds,
+    clamp,
+    convert_to_hours,
+    difference_in_calendar_days,
     get_sector_schedule_overrun,
+    normalize_percent_complete,
+    safe_date,
 )
 from .metrics import compute_duration_weighted
-
 
 # ---------------------------------------------------------------------------
 # Time-phased cumulative EV at a given day

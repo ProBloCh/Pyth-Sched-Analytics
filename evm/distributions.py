@@ -31,15 +31,17 @@ Output schema (preserved from the scalar version):
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import math
+from datetime import timedelta
+
 import numpy as np
 
 from .helpers import (
-    safe_date, date_to_iso_date, convert_to_hours,
-    normalize_percent_complete, difference_in_calendar_days,
+    convert_to_hours,
+    date_to_iso_date,
+    normalize_percent_complete,
+    safe_date,
 )
-
 
 _SEC_PER_DAY = 86400.0
 

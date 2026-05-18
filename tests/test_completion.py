@@ -14,11 +14,14 @@ Covers:
 import pytest
 
 from completion.monte_carlo import (
-    run_completion_mc, CompletionMCConfig,
-    _parse_iso_to_ms, _ms_to_iso, _duration_to_ms,
-    _MS_PER_DAY, _MS_PER_HOUR,
+    _MS_PER_DAY,
+    _MS_PER_HOUR,
+    CompletionMCConfig,
+    _duration_to_ms,
+    _ms_to_iso,
+    _parse_iso_to_ms,
+    run_completion_mc,
 )
-
 
 # =====================================================================
 # Date / duration helpers
@@ -1192,6 +1195,336 @@ class TestOutcomesEndpoint:
         assert dc['mean_ratio'] > 1.0
 
 
+class TestCalibrationHitRates:
+    """PR-22: per-percentile hit-rate aggregation in calibration_report.
+
+    The hit_rate block lives at by_class.<class>.hit_rates.<pXX> and
+    counts outcomes where actual.finish <= predicted.pXX_finish.  At
+    n >= 30 the P80 hit-rate triggers an advisory if it falls outside
+    [70 %, 90 %].
+    """
+
+    _CLASS = 'pr22_test_class'
+
+    def _payload(self, idx, actual_iso, percentiles):
+        """Build a register-outcome payload.  ``percentiles`` is a dict
+        like {'p80_finish': '2026-12-01', 'p50_finish': '2026-09-01'};
+        keys not present are omitted (mirrors real-world records that
+        only carry whichever percentiles the producer published)."""
+        return {
+            'project_id': f'PR22-{self._CLASS}-{idx:04d}',
+            'reference_class': self._CLASS,
+            'predicted': {
+                'baseline_finish': '2026-06-01T00:00:00Z',
+                **{k: f'{v}T00:00:00Z' for k, v in percentiles.items()},
+            },
+            'actual': {'finish': actual_iso + 'T00:00:00Z'},
+        }
+
+    def test_hit_rate_block_populated(self, client):
+        # 5 records: actual lands BEFORE p80 in 4/5, AFTER p80 in 1/5.
+        scenarios = [
+            ('2026-10-01', True),
+            ('2026-11-01', True),
+            ('2026-11-15', True),
+            ('2026-11-20', True),
+            ('2027-02-01', False),
+        ]
+        cls = f'{self._CLASS}_block_populated'
+        for i, (actual, _) in enumerate(scenarios):
+            payload = self._payload(i, actual, {
+                'p50_finish': '2026-09-01',
+                'p80_finish': '2026-12-01',
+                'p95_finish': '2027-03-01',
+            })
+            payload['reference_class'] = cls
+            payload['project_id'] = f'PR22-{cls}-{i}'
+            r = client.post('/completion/register-outcome', json=payload)
+            assert r.status_code == 200
+
+        report = client.get(
+            f'/completion/calibration-report?reference_class={cls}'
+        ).get_json()
+        rates = report['by_class'][cls]['hit_rates']
+        assert rates['p80']['n'] == 5
+        assert rates['p80']['hits'] == 4
+        assert rates['p80']['rate'] == pytest.approx(0.8)
+        assert rates['p80']['expected'] == 0.80
+        assert rates['p80']['calibration_score'] == pytest.approx(1.0)
+        # P95 should be 5/5 (all actuals before p95)
+        assert rates['p95']['hits'] == 5
+        assert rates['p95']['rate'] == pytest.approx(1.0)
+
+    def test_p10_p20_accepted_when_present(self, client):
+        cls = f'{self._CLASS}_p10p20'
+        payload = self._payload(0, '2026-08-15', {
+            'p10_finish': '2026-07-01',
+            'p20_finish': '2026-07-15',
+            'p50_finish': '2026-09-01',
+            'p80_finish': '2026-12-01',
+            'p95_finish': '2027-03-01',
+        })
+        payload['reference_class'] = cls
+        payload['project_id'] = f'PR22-{cls}-0'
+        r = client.post('/completion/register-outcome', json=payload)
+        assert r.status_code == 200
+        report = client.get(
+            f'/completion/calibration-report?reference_class={cls}'
+        ).get_json()
+        rates = report['by_class'][cls]['hit_rates']
+        # actual=2026-08-15 lands AFTER p10 (07-01) and p20 (07-15) but
+        # BEFORE p50 (09-01).
+        assert rates['p10']['hits'] == 0
+        assert rates['p20']['hits'] == 0
+        assert rates['p50']['hits'] == 1
+
+    def test_invalid_p10_iso_rejected(self, client):
+        cls = f'{self._CLASS}_bad_p10'
+        payload = self._payload(0, '2026-08-15', {
+            'p80_finish': '2026-12-01',
+        })
+        payload['predicted']['p10_finish'] = 'not-a-date'
+        payload['reference_class'] = cls
+        r = client.post('/completion/register-outcome', json=payload)
+        assert r.status_code == 400
+        assert 'p10_finish' in r.get_json()['error']
+
+    def test_p80_warning_below_lower_bound_at_n30(self, client):
+        # 30 records, only 50 % of actuals hit before P80 -> rate=0.5,
+        # below the 0.70 lower bound -> warning expected.
+        cls = f'{self._CLASS}_overconfident'
+        for i in range(30):
+            actual = '2026-11-01' if i < 15 else '2027-02-01'
+            payload = self._payload(i, actual, {'p80_finish': '2026-12-01'})
+            payload['reference_class'] = cls
+            payload['project_id'] = f'PR22-{cls}-{i}'
+            r = client.post('/completion/register-outcome', json=payload)
+            assert r.status_code == 200
+
+        report = client.get(
+            f'/completion/calibration-report?reference_class={cls}'
+        ).get_json()
+        rates = report['by_class'][cls]['hit_rates']
+        assert rates['p80']['rate'] == pytest.approx(0.5)
+        assert any('overconfident' in n for n in report['notes']), report['notes']
+
+    def test_p80_warning_above_upper_bound_at_n30(self, client):
+        # 30 records, all actuals hit before P80 -> rate=1.0, above
+        # 0.90 upper bound -> warning expected.
+        cls = f'{self._CLASS}_pessimistic'
+        for i in range(30):
+            payload = self._payload(i, '2026-08-01',
+                                    {'p80_finish': '2026-12-01'})
+            payload['reference_class'] = cls
+            payload['project_id'] = f'PR22-{cls}-{i}'
+            r = client.post('/completion/register-outcome', json=payload)
+            assert r.status_code == 200
+
+        report = client.get(
+            f'/completion/calibration-report?reference_class={cls}'
+        ).get_json()
+        rates = report['by_class'][cls]['hit_rates']
+        assert rates['p80']['rate'] == pytest.approx(1.0)
+        assert any('over-conservative' in n for n in report['notes']), report['notes']
+
+    def test_p80_warning_silent_below_n30(self, client):
+        # 10 records with terrible calibration -- rate = 0.0 -- but n
+        # below the 30-floor, so no warning.
+        cls = f'{self._CLASS}_low_n'
+        for i in range(10):
+            payload = self._payload(i, '2027-02-01',
+                                    {'p80_finish': '2026-12-01'})
+            payload['reference_class'] = cls
+            payload['project_id'] = f'PR22-{cls}-{i}'
+            client.post('/completion/register-outcome', json=payload)
+
+        report = client.get(
+            f'/completion/calibration-report?reference_class={cls}'
+        ).get_json()
+        rates = report['by_class'][cls]['hit_rates']
+        assert rates['p80']['n'] == 10
+        # The "<30 outcomes registered" note still fires; the
+        # P80-overconfident note must NOT.
+        assert not any('overconfident' in n for n in report['notes']), \
+            report['notes']
+
+    def test_actual_exactly_on_p80_counts_as_hit(self, client):
+        """Project that finishes exactly on its predicted P80 day must
+        count as a hit (the percentile band is closed-upper, ``<=``)."""
+        cls = f'{self._CLASS}_eq'
+        payload = self._payload(0, '2026-12-01', {'p80_finish': '2026-12-01'})
+        payload['reference_class'] = cls
+        payload['project_id'] = f'PR22-{cls}-0'
+        client.post('/completion/register-outcome', json=payload)
+        report = client.get(
+            f'/completion/calibration-report?reference_class={cls}'
+        ).get_json()
+        rates = report['by_class'][cls]['hit_rates']
+        assert rates['p80']['hits'] == 1
+        assert rates['p80']['n'] == 1
+
+    def test_p80_advisory_uses_strict_inequality_at_lower_bound(self, client):
+        """rate == 0.70 must NOT fire the overconfident advisory.  The
+        check is strict ``<`` so a customer just inside the band stays
+        silent; tests one side of the boundary so a future relaxation
+        to ``<=`` is caught here."""
+        cls = f'{self._CLASS}_strict_low'
+        # 30 records, 21 hits -> rate exactly 0.70
+        for i in range(30):
+            actual = '2026-11-01' if i < 21 else '2027-02-01'
+            payload = self._payload(i, actual, {'p80_finish': '2026-12-01'})
+            payload['reference_class'] = cls
+            payload['project_id'] = f'PR22-{cls}-{i}'
+            client.post('/completion/register-outcome', json=payload)
+
+        report = client.get(
+            f'/completion/calibration-report?reference_class={cls}'
+        ).get_json()
+        rates = report['by_class'][cls]['hit_rates']
+        assert rates['p80']['rate'] == pytest.approx(0.7)
+        assert not any('overconfident' in n for n in report['notes']), \
+            report['notes']
+
+    def test_p80_advisory_uses_strict_inequality_at_upper_bound(self, client):
+        """rate == 0.90 must NOT fire the over-conservative advisory."""
+        cls = f'{self._CLASS}_strict_high'
+        # 30 records, 27 hits -> rate exactly 0.90
+        for i in range(30):
+            actual = '2026-11-01' if i < 27 else '2027-02-01'
+            payload = self._payload(i, actual, {'p80_finish': '2026-12-01'})
+            payload['reference_class'] = cls
+            payload['project_id'] = f'PR22-{cls}-{i}'
+            client.post('/completion/register-outcome', json=payload)
+
+        report = client.get(
+            f'/completion/calibration-report?reference_class={cls}'
+        ).get_json()
+        rates = report['by_class'][cls]['hit_rates']
+        assert rates['p80']['rate'] == pytest.approx(0.9)
+        assert not any('over-conservative' in n for n in report['notes']), \
+            report['notes']
+
+    def test_mixed_percentile_records_have_independent_n(self, client):
+        """Two records: one carries the full p50/p80/p95 band, the
+        other carries only the required p80.  Each percentile counter
+        must reflect ONLY the records that supplied that percentile --
+        a missing field never inflates another percentile's n.
+
+        (``p80_finish`` is required by ``validate_outcome``, so the
+        narrowest record still carries it; the test exercises the
+        independence of p50 and p95 from p80's count.)
+        """
+        cls = f'{self._CLASS}_mixed'
+        # Record 0: full band.
+        p1 = {
+            'project_id': f'PR22-{cls}-0',
+            'reference_class': cls,
+            'predicted': {
+                'baseline_finish': '2026-06-01T00:00:00Z',
+                'p50_finish': '2026-09-01T00:00:00Z',
+                'p80_finish': '2026-12-01T00:00:00Z',
+                'p95_finish': '2027-03-01T00:00:00Z',
+            },
+            'actual': {'finish': '2026-08-01T00:00:00Z'},  # hits p50, p80, p95
+        }
+        # Record 1: only p80_finish (the minimum required band).
+        p2 = {
+            'project_id': f'PR22-{cls}-1',
+            'reference_class': cls,
+            'predicted': {
+                'baseline_finish': '2026-06-01T00:00:00Z',
+                'p80_finish': '2026-12-01T00:00:00Z',
+            },
+            'actual': {'finish': '2026-11-01T00:00:00Z'},  # hits p80
+        }
+        client.post('/completion/register-outcome', json=p1)
+        client.post('/completion/register-outcome', json=p2)
+        report = client.get(
+            f'/completion/calibration-report?reference_class={cls}'
+        ).get_json()
+        rates = report['by_class'][cls]['hit_rates']
+        # p80 counts BOTH records.
+        assert rates['p80']['n'] == 2, rates
+        assert rates['p80']['hits'] == 2
+        # p50 and p95 count only Record 0.
+        assert rates['p50']['n'] == 1, rates
+        assert rates['p95']['n'] == 1, rates
+        # p10 / p20 are not present in either record -> absent.
+        assert 'p10' not in rates and 'p20' not in rates
+
+    def test_baseline_only_record_creates_no_hit_rates(self, client):
+        """A record with neither p50/p80/p95 should not appear under
+        hit_rates at all (only the overrun-ratio path is exercised --
+        and even that needs a P80 anchor, so this record contributes
+        nothing).  Catches an off-by-one where an empty predicted
+        block could create a class entry with empty hit_rates."""
+        cls = f'{self._CLASS}_baseline_only'
+        p = {
+            'project_id': f'PR22-{cls}-0',
+            'reference_class': cls,
+            'predicted': {
+                'baseline_finish': '2026-06-01T00:00:00Z',
+                # P80 still required by validate_outcome, so we must
+                # include it -- but record a baseline-aligned P80 so
+                # the overrun-ratio path is degenerate.
+                'p80_finish': '2026-06-01T00:00:00Z',
+            },
+            'actual': {'finish': '2026-06-01T00:00:00Z'},
+        }
+        client.post('/completion/register-outcome', json=p)
+        report = client.get(
+            f'/completion/calibration-report?reference_class={cls}'
+        ).get_json()
+        # P80 still recorded (has the field); but P10/P20/P50/P95 are
+        # absent.
+        rates = report['by_class'][cls].get('hit_rates', {})
+        assert set(rates.keys()) == {'p80'}, rates
+
+    def test_hit_rates_isolated_per_reference_class(self, client):
+        """Multiple reference classes must each have their own
+        hit_rates block; a P80 hit in class A must not appear in class
+        B's counters."""
+        cls_a = f'{self._CLASS}_iso_a'
+        cls_b = f'{self._CLASS}_iso_b'
+        # Class A: 1 hit (actual before p80).
+        pa = self._payload(0, '2026-11-01', {'p80_finish': '2026-12-01'})
+        pa['reference_class'] = cls_a
+        pa['project_id'] = f'PR22-{cls_a}-0'
+        client.post('/completion/register-outcome', json=pa)
+        # Class B: 1 miss (actual after p80).
+        pb = self._payload(0, '2027-02-01', {'p80_finish': '2026-12-01'})
+        pb['reference_class'] = cls_b
+        pb['project_id'] = f'PR22-{cls_b}-0'
+        client.post('/completion/register-outcome', json=pb)
+
+        # Ask for the full report (no class filter); each class
+        # carries its own counters.
+        report = client.get('/completion/calibration-report').get_json()
+        assert report['by_class'][cls_a]['hit_rates']['p80']['hits'] == 1
+        assert report['by_class'][cls_b]['hit_rates']['p80']['hits'] == 0
+        assert report['by_class'][cls_a]['hit_rates']['p80']['n'] == 1
+        assert report['by_class'][cls_b]['hit_rates']['p80']['n'] == 1
+
+    def test_p80_well_calibrated_no_warning(self, client):
+        # 30 records, 24 hit before P80 (80 %) -- spot on the expected
+        # rate, no warning either side.
+        cls = f'{self._CLASS}_well_cal'
+        for i in range(30):
+            actual = '2026-11-01' if i < 24 else '2027-02-01'
+            payload = self._payload(i, actual, {'p80_finish': '2026-12-01'})
+            payload['reference_class'] = cls
+            payload['project_id'] = f'PR22-{cls}-{i}'
+            client.post('/completion/register-outcome', json=payload)
+
+        report = client.get(
+            f'/completion/calibration-report?reference_class={cls}'
+        ).get_json()
+        rates = report['by_class'][cls]['hit_rates']
+        assert rates['p80']['rate'] == pytest.approx(0.8)
+        assert not any('overconfident' in n or 'over-conservative' in n
+                       for n in report['notes']), report['notes']
+
+
 class TestOutcomeRedisFallback:
     """Locks the Copilot fix for completion/outcomes.py register_outcome
     and list_outcomes: when Redis is the primary store but raises mid-
@@ -1344,6 +1677,7 @@ class TestLowMaxMultiplierCap:
 
     def test_caps_are_non_decreasing_for_low_cap(self):
         import numpy as np
+
         from solver.stochastic import _compute_caps
 
         # risk ordering low -> high, durations uniform
@@ -1359,6 +1693,7 @@ class TestLowMaxMultiplierCap:
 
     def test_standard_tier_not_below_cap(self):
         import numpy as np
+
         from solver.stochastic import _compute_caps
 
         # All standard-tier (risk below fat_thresh)
@@ -1374,6 +1709,7 @@ class TestLowMaxMultiplierCap:
 
     def test_default_cap_behaviour_unchanged(self):
         import numpy as np
+
         from solver.stochastic import _compute_caps
 
         # Default path (no cap): std tier lerps 2->6, pareto lerps 4->10.
@@ -1492,8 +1828,10 @@ class TestRecoveryLagUnits:
 # =====================================================================
 
 from completion.recovery import (
-    run_recovery_options, classify_crash_profile,
-    RecoveryConfig, _compute_target,
+    RecoveryConfig,
+    _compute_target,
+    classify_crash_profile,
+    run_recovery_options,
 )
 
 
@@ -2041,7 +2379,7 @@ class TestStochasticTEAC:
         clamp identically.  Catches a future divergence if either side
         moves.
         """
-        from completion.monte_carlo import _TEAC_MIN_SPI, _TEAC_MAX_SPI
+        from completion.monte_carlo import _TEAC_MAX_SPI, _TEAC_MIN_SPI
         from evm.helpers import Bounds
         assert _TEAC_MIN_SPI == Bounds.MIN_SPI
         assert _TEAC_MAX_SPI == Bounds.MAX_SPI

@@ -20,10 +20,20 @@ Content-Type: application/json
 |---|---|---|
 | `status` | `string` | `"healthy"` or `"degraded"`. Degraded when Redis is configured but unreachable. |
 | `timestamp` | `string` | ISO 8601 UTC datetime (e.g., `"2024-06-15T14:30:00+00:00"`). |
+| `networkit_available` | `boolean` | `true` when the C++ NetworkKit acceleration is loaded.  Mirrored at `features.networkit` for backwards compatibility. |
 | `instance` | `object` | Azure instance metadata. |
 | `cache` | `object` | Cache subsystem status. |
 | `features` | `object` | Feature flags. |
 | `settings` | `object` | Runtime configuration values. |
+
+### Production gate: `PYTH_REQUIRE_NETWORKKIT`
+
+When `PYTH_REQUIRE_NETWORKKIT=true` is set in the environment and the
+NetworkKit wheel is unimportable, the app exits with status `78`
+(`EX_CONFIG`) at boot before any request is served.  The Azure load
+balancer then marks the instance unhealthy rather than routing traffic
+to the slower NetworkX-only path.  Default is unset, so dev / CI
+environments without the C++ wheel still boot and degrade silently.
 
 ### `instance`
 

@@ -1,0 +1,162 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# -----------------------------------------------------------------------------
+# Pyth-Sched-Analytics has been packaged as a flat layout (app.py +
+# blueprint packages) since inception.  The [project] block below is the
+# minimum metadata so tooling (ruff, mypy, pyright, coverage) can locate
+# the source root via standard PEP 621 discovery.  It is NOT used to
+# build a distributable wheel -- production deploys run app.py directly
+# under Gunicorn.
+# -----------------------------------------------------------------------------
+
+[project]
+name = "pyth-sched-analytics"
+version = "0.0.0"
+description = "Schedule dependency network analytics."
+requires-python = ">=3.12"
+
+[tool.setuptools]
+py-modules = ["app", "auth", "_cache_version", "multi_resolution_pipeline"]
+
+[tool.setuptools.packages.find]
+include = ["solver*", "completion*", "evm*", "paths*", "interface*"]
+exclude = ["tests*", "Reference*", "docs*"]
+
+# -----------------------------------------------------------------------------
+# Ruff
+# -----------------------------------------------------------------------------
+# Conservative initial gate.  Catches real bugs (F*) and import hygiene (I)
+# without forcing a sweeping cleanup PR for cosmetic issues.  Roadmap PR-5
+# follow-ups will progressively widen the rule set:
+#
+#   * E501 line-length is left unchecked for now -- 22 violations cluster
+#     in app.py / solver/models.py and need targeted manual line-breaks.
+#   * E402 module-level-import-not-at-top is per-file-ignored where the
+#     existing structure is load-bearing (see CLAUDE.md "Import Order Is
+#     Load-Bearing"); test files often have conditional imports.
+#   * E741 ambiguous-name (`l`, `I`) is scope-narrow cosmetic and tracked
+#     for a follow-up rename PR.
+#   * UP / B / SIM / RUF will land in a follow-up once the team is ready
+#     to autofix the typing modernisations (UP006 / UP045 / UP017).
+# -----------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [
+    "Reference",                  # vendored JS reference, not Python
+    "tests/diff_harness",         # JS subprocess harness, not Python
+    "docs/research/sketches",     # research scratch code (lambdas / casual imports OK)
+    ".venv",
+    "venv",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = [
+    "E501",   # line-too-long: 22 violations -- defer to manual line-break PR
+    "E741",   # ambiguous-variable-name (`l` etc.): cosmetic, defer to rename PR
+]
+
+[tool.ruff.lint.per-file-ignores]
+# app.py and route shells deliberately interleave imports with thread-limit
+# env-var setup (per CLAUDE.md "Import Order Is Load-Bearing") and
+# blueprint registrations.  Keep E402 silent in those files.
+"app.py" = ["E402"]
+# Test files use conditional imports based on availability of optional
+# extras, which trips E402.
+"tests/*" = ["E402"]
+# Route files import _cache_version near the top now (post PR-5 cleanup);
+# any residual E402s in the route files are blueprint-ordering artefacts.
+"completion/monte_carlo.py" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "app",
+    "auth",
+    "_cache_version",
+    "multi_resolution_pipeline",
+    "solver",
+    "completion",
+    "evm",
+    "paths",
+    "interface",
+]
+
+# -----------------------------------------------------------------------------
+# Bandit (static security scanner)
+# -----------------------------------------------------------------------------
+# CI runs `bandit -r . -c pyproject.toml` and fails on any unannotated
+# finding at MEDIUM severity or higher.  Existing intentional patterns
+# (host='0.0.0.0' on the dev server, defensive try/except in the
+# silhouette and cache-iteration loops) are annotated inline with
+# `# nosec <code>` plus a one-line rationale.  See PR-6 in
+# docs/roadmap-to-10.md for the override protocol.
+# -----------------------------------------------------------------------------
+
+[tool.bandit]
+exclude_dirs = ["tests", "Reference", ".venv", "venv"]
+skips = []  # No blanket skips -- annotate with `# nosec <code>` instead.
+
+# -----------------------------------------------------------------------------
+# Coverage
+# -----------------------------------------------------------------------------
+# CI runs `pytest --cov`; fail_under (below) gates merge.  Baseline as
+# of PR-7 is 84 % across production source only (8_273 statements,
+# 1_338 missed; tests excluded so the number reflects how well tests
+# cover the app rather than themselves).  Threshold is held one point
+# below to absorb routine refactors without ratcheting downward
+# unnoticed.  Bump protocol: any PR that raises coverage may also
+# raise `fail_under` by the floor of the new percentage minus one.
+# Lowering the threshold requires an explicit justification in the PR
+# description.
+# -----------------------------------------------------------------------------
+
+[tool.coverage.run]
+source = [
+    "app",
+    "auth",
+    "_cache_version",
+    "multi_resolution_pipeline",
+    "solver",
+    "completion",
+    "evm",
+    "paths",
+    "interface",
+]
+omit = [
+    "tests/*",
+    "Reference/*",
+    ".venv/*",
+    "venv/*",
+]
+
+[tool.coverage.report]
+# Copilot review finding #1: show_missing / skip_covered /
+# exclude_lines are coverage.py keys, not pytest options.  When
+# placed under [tool.pytest.ini_options] pytest emitted three
+# "Unknown config option" warnings on every CI run and coverage.py
+# silently ignored them.  Belongs HERE.
+fail_under = 83
+show_missing = false
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+
+# -----------------------------------------------------------------------------
+# pytest
+# -----------------------------------------------------------------------------
+# Custom markers must be registered or pytest emits PytestUnknownMarkWarning
+# (and treats them as typos in strict mode).  Add new markers here.
+# -----------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+markers = [
+    "determinism: locks numerical reproducibility on stochastic and deterministic endpoints (PR-12).  Filter with `pytest -m determinism` to run only this pack.",
+]

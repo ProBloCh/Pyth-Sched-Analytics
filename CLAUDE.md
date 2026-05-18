@@ -23,7 +23,7 @@ Deployed to Azure via GitHub Actions.
 **Tech stack:** Python 3.12, Flask, NetworkX + NetworkKit (C++ acceleration),
 NumPy, Pandas, scikit-learn, SciPy, Redis (optional caching).
 
-**Architecture:** `app.py` (~1,400 LOC) handles descriptive analytics.
+**Architecture:** `app.py` (~1,680 LOC) handles descriptive analytics.
 `multi_resolution_pipeline.py` (~335 LOC) handles hierarchical community
 detection.  `solver/` (10 modules, ~2,400 LOC) is a Flask Blueprint
 registered in `app.py` that provides three prescriptive endpoints plus a
@@ -74,7 +74,7 @@ matrix, and top-N highest-risk activities per hotspot for downstream
 LLM grounding.  Engine is pure pandas/numpy with no Flask deps;
 re-callable via `compute_interface_analytics`.
 
-Tests: **838 across 10 test files**, including JS-vs-Python diff
+Tests: **975 across 21 test files**, including JS-vs-Python diff
 harnesses (`tests/test_evm_diff.py` + `tests/diff_harness/run_js_evm.js`;
 `tests/test_paths_diff.py` + `tests/diff_harness/run_js_paths.js`;
 `tests/test_calendar_diff.py` + `tests/diff_harness/run_js_calendar.js`)
@@ -120,7 +120,7 @@ Maintain the existing simplicity. Don't add speculative complexity.
 
 ### 3. Surgical Changes
 
-Touch only what you must.  The test suite (157 tests) catches regressions,
+Touch only what you must.  The test suite (count above) catches regressions,
 but collateral damage in untested paths is still possible.
 
 - Don't "improve" adjacent code, comments, or formatting.
@@ -144,7 +144,7 @@ Define success criteria. Verify before declaring done.
   1. [Step] -> verify: [check]
   2. [Step] -> verify: [check]
 
-**Note:** The project has 157 automated tests (pytest).  Run with
+**Note:** The project has 975 automated tests (pytest).  Run with
 `python -m pytest tests/ -v`.  Verification means running the tests,
 checking endpoint responses, and reviewing outputs for correctness.
 When adding new features, add corresponding tests.
@@ -155,6 +155,9 @@ When adding new features, add corresponding tests.
 # Install dependencies
 pip install -r requirements.txt
 
+# Install dev dependencies (ruff, hypothesis, py-spy)
+pip install -r requirements-dev.txt
+
 # Run in debug mode (Flask dev server, port 5000)
 DEBUG=true python app.py
 
@@ -163,7 +166,38 @@ gunicorn --workers 2 --threads 2 --bind 0.0.0.0:8000 --timeout 120 app:app
 
 # Health check
 curl http://localhost:8000/health
+
+# Lint (matches CI gate; pyproject.toml owns the rule set)
+ruff check .
+
+# Static security scan (matches CI gate)
+bandit -r . -c pyproject.toml -ll
+
+# Dependency CVE scan (allowlisted advisories tracked in
+# docs/roadmap-to-10.md PR-6 follow-up)
+pip-audit -r requirements.txt
+
+# Test suite with coverage (CI gate; pyproject.toml owns fail_under)
+python -m pytest tests/ --cov --cov-report=term
+
+# Type check (non-blocking CI gate; pyrightconfig.json owns the rules)
+pyright
 ```
+
+### Bandit / pip-audit overrides
+
+`bandit` runs at MEDIUM severity (`-ll`) in CI.  Annotate intentional
+patterns inline with `# nosec <code> -- <one-line rationale>`.  Do not
+blanket-disable a file; do not use `skips` in `[tool.bandit]`.  See
+`completion/outcomes.py` and `app.py:1475` for examples.
+
+`pip-audit` allowlists are in
+`.github/workflows/main_python-sched-analytics.yml` as
+`--ignore-vuln <ID>` entries.  Each ID is paired with an upgrade entry
+in `docs/roadmap-to-10.md` PR-6 follow-up; an entry leaves the
+allowlist only when the corresponding runtime-package upgrade ships.
+Adding a new vulnerable dependency without first removing or pairing
+the advisory blocks merge.
 
 ## Project-Specific Rules
 
@@ -368,6 +402,17 @@ Response dicts are serialized with JSON into Redis (or LRU in-memory).
 Changing the structure of values returned by analytical functions can make
 cached entries incompatible — callers may get stale or malformed data until
 the cache expires or is flushed.
+
+**Cache key schema versioning (`_cache_version.py`).** Every cache key
+across all six blueprints (`app.py` `/graph-metrics`, `solver/`,
+`completion/`, `evm/`, `paths/`, `interface/`) is prefixed with
+`RESPONSE_SCHEMA_VERSION` from `_cache_version.py`. Bump the constant
+whenever a response shape changes (rename/remove/retype/re-nest a key,
+or change a value's meaning). Adding new keys at existing nesting
+levels does NOT require a bump. The bump format is `vMAJOR.MINOR.PATCH`;
+see the docstring in `_cache_version.py` for the protocol. Version
+parity across all six call sites is enforced by
+`tests/test_cache_versioning.py`.
 
 The `POST /graph-metrics` response is consumed by a frontend
 (`CommunityGroups.js`). Renaming or removing response keys is a breaking
@@ -671,11 +716,17 @@ image, gate it behind `EXTRAS=`.
      gives per-activity P20/P50/P80 finish dates but no TEAC view
      (no anchoring at activity-baseline-start).  Trivial extension
      when a customer asks for it.
-  5. **Calibration-loop integration.**  `response.teac` is not yet
-     read by `/completion/register-outcome` /
-     `/completion/calibration-report`; calibration today is on raw
-     finish dates, not on the TEAC band.  Useful for closing the
-     empirical loop but not required for the band itself.
+  5. **Calibration-loop integration (partially shipped).**
+     `/completion/register-outcome` accepts the full predicted band
+     (`p10_finish` / `p20_finish` / `p50_finish` / `p80_finish` /
+     `p95_finish`); `/completion/calibration-report` aggregates per-
+     percentile hit rates and emits a `[70 %, 90 %]` P80 advisory at
+     n >= 30.  See `docs/api/completion.md` "Per-percentile hit rates
+     (PR-22)".  **Still open:** the empirical-CDF transform that
+     remaps MC percentiles directly from the customer's accumulated
+     outcomes (closing the loop end-to-end) -- tracked as PR-22
+     follow-up in `docs/roadmap-to-10.md`.  Until then, the report
+     is informational; `percentile_factors` do not auto-update.
 - **Reference class integration:** The user's PMJ paper demonstrates RCF
   uplifts for O&G offshore projects (P10: 89% cost, 72% schedule).  The
   reference class dataset lives in a separate app; the solver should

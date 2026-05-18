@@ -25,10 +25,12 @@ Figures 15-17).
 
 import logging
 import time
+
 import numpy as np
+
+from .adjoints import compute_gradients
 from .dag import run_cpm
 from .objectives import compute_objectives
-from .adjoints import compute_gradients
 
 logger = logging.getLogger(__name__)
 

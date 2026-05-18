@@ -9,7 +9,9 @@ sorting is vectorised with numpy.
 
 import logging
 import time
+
 import numpy as np
+
 from .dag import build_dag
 from .models import SolverConfig, build_activity_params
 from .optimizer import optimize

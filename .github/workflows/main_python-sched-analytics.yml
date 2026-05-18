@@ -14,8 +14,97 @@ on:
   workflow_dispatch:
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dev tools
+        run: pip install -r requirements-dev.txt
+
+      - name: ruff check
+        run: ruff check .
+
+  typecheck:
+    runs-on: ubuntu-latest
+    # Non-blocking advisory gate.  See docs/typing-progress.md for the
+    # error-budget protocol.  We want the typecheck output visible in
+    # CI logs without showing a red ✗ on the PR while the basic-mode
+    # baseline shrinks.  The step exits 0 deliberately and surfaces
+    # the error count via a GitHub workflow annotation; CI flips to
+    # blocking (drop the `|| true`) once basic-mode reaches zero.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dev + runtime tools
+        # Both files: pyright with reportMissingImports=error needs the
+        # actual flask / numpy / scipy / pandas / redis packages installed
+        # so the basic-mode baseline reflects type errors, not import
+        # noise.  Copilot review finding #5.
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: pyright
+        run: |
+          set +e
+          pyright | tee pyright.out
+          STATUS=${PIPESTATUS[0]}
+          if [ "$STATUS" -ne 0 ]; then
+            COUNT=$(grep -oE '^[0-9]+ error' pyright.out | head -1 | awk '{print $1}')
+            echo "::warning title=pyright (advisory)::${COUNT:-unknown} basic-mode error(s); see docs/typing-progress.md"
+          fi
+          exit 0
+
+  security:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dev tools
+        run: pip install -r requirements-dev.txt
+
+      # Static security scan.  Existing intentional patterns annotated
+      # inline with `# nosec <code>`.  -ll = medium severity floor.
+      - name: bandit
+        run: bandit -r . -c pyproject.toml -ll
+
+      # Dependency CVE scan.  All advisories from the original
+      # PR-6 allowlist have shipped fixes; any NEW advisory failing
+      # the scan blocks merge.  When a new advisory is unavoidable
+      # (e.g. a fresh CVE before a fix is published), pair it with
+      # an upgrade entry in docs/roadmap-to-10.md PR-6 follow-up
+      # before adding a corresponding --ignore-vuln line here.
+      - name: pip-audit
+        # --strict matches the local verification command; required so
+        # skipped / unresolvable packages fail the gate the same way
+        # they fail locally.  Copilot review finding #15.
+        run: pip-audit -r requirements.txt --strict
+
   build:
     runs-on: ubuntu-latest
+    # Block deploy on security failure too -- previously build/deploy
+    # only required lint, so a CVE could ship.  Copilot review #14.
+    needs: [lint, security]
 
     steps:
       - uses: actions/checkout@v4
@@ -32,12 +121,31 @@ jobs:
       - name: Install dependencies
         run: |
           source venv/bin/activate
-          pip install -r requirements.txt
+          pip install -r requirements.txt -r requirements-dev.txt
 
-      - name: Run tests
+      - name: CLAUDE.md test-counter drift check
+        # PR-18.  Asserts the canonical test count + file count in
+        # CLAUDE.md match the live `pytest --collect-only` output and
+        # the test_*.py file count.  Fails the build on drift so the
+        # author can bump the counter in the same commit.
         run: |
           source venv/bin/activate
-          python -m pytest tests/ -v
+          python scripts/check_claude_md.py
+
+      - name: Run tests with coverage
+        # --cov-fail-under is read from pyproject.toml [tool.coverage.report].
+        # See docs/roadmap-to-10.md PR-7 for the threshold-bump protocol.
+        run: |
+          source venv/bin/activate
+          python -m pytest tests/ -v --cov --cov-report=term --cov-report=xml
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: warn
 
       - name: Zip artifact for deployment
         if: github.event_name == 'push'

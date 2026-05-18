@@ -25,7 +25,6 @@ from pathlib import Path
 
 import pytest
 
-
 HARNESS = Path(__file__).parent / 'diff_harness' / 'run_js_telemetry.js'
 
 NODE_BIN = shutil.which('node')

@@ -25,7 +25,6 @@ import pytest
 
 from evm.engine import run_evm_analysis
 
-
 HARNESS_DIR = Path(__file__).parent / 'diff_harness'
 JS_HARNESS = HARNESS_DIR / 'run_js_evm.js'
 
@@ -207,16 +206,19 @@ def test_predicted_dates_within_one_day(fixture_path):
     with open(fixture_path) as f:
         fixture = json.load(f)
     from evm.engine import _auto_complete_start_milestone
-    from evm.metrics import compute_evm_metrics
     from evm.forecast import (
-        compute_schedule_delay, find_frontier_nodes,
-        update_predicted_values, get_sector_schedule_overrun,
-    )
-    from evm.metrics import (
-        compute_bcws_hours, compute_bcwp_hours, compute_acwp,
-        compute_duration_weighted,
+        compute_schedule_delay,
+        find_frontier_nodes,
+        get_sector_schedule_overrun,
+        update_predicted_values,
     )
     from evm.helpers import safe_date
+    from evm.metrics import (
+        compute_acwp,
+        compute_bcwp_hours,
+        compute_bcws_hours,
+        compute_evm_metrics,
+    )
 
     nodes = _auto_complete_start_milestone(fixture['nodes'])
     nodes_actual = [dict(n) for n in nodes]

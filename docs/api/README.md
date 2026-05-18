@@ -50,6 +50,50 @@ from any consumer (MCP, agent, third-party).
 | `/evm/health` | GET | [evm.md](evm.md#get-evmhealth) | EVM module health check |
 | `/interface/health` | GET | [interface.md](interface.md#get-interfacehealth) | Interface module health check |
 
+## Authentication
+
+Every endpoint requires an `X-API-Key` header **except** for the
+following public surfaces:
+
+* `/health`, `/solver/health`, `/completion/health`, `/evm/health`,
+  `/paths/health`, `/interface/health` -- load-balancer health probes.
+* `/` -- service-discovery descriptor (returns `{"status":"ok", ...}`).
+* `/metrics` -- Prometheus scrape endpoint.  Has its own optional
+  `X-Metrics-Token` gate (`PYTH_METRICS_TOKEN` env var); when unset,
+  the endpoint is open (private-network scrape pattern).
+
+```
+curl -H 'X-API-Key: your-key-here' https://host/graph-metrics ...
+```
+
+Configuration env vars:
+
+| Var | When read | Effect |
+|---|---|---|
+| `PYTH_API_KEYS` | **Per request** | Comma-separated list of accepted keys.  Set in production. |
+| `PYTH_AUTH_DISABLED=true` | **Per request** | Bypass the gate entirely.  Local dev / CI only -- **never** set in production. |
+| `PYTH_CORS_ORIGINS` | **Startup only** | Comma-separated allowlist of CORS origins.  Empty = same-origin only.  The literal `*` opts back into wildcard CORS for local dev only.  Read once by Flask-CORS at boot; changes require a restart. |
+| `PYTH_METRICS_TOKEN` | **Per request** | If set, `/metrics` requires `X-Metrics-Token: <value>` (401 otherwise). |
+
+Failure modes (protected endpoints only):
+
+| Scenario | Status | Body |
+|---|---|---|
+| No `X-API-Key` and `PYTH_API_KEYS` set | 401 | `{"error":"unauthorized"}` |
+| Wrong `X-API-Key` | 401 | `{"error":"unauthorized"}` |
+| `PYTH_API_KEYS` empty/unset and auth not explicitly disabled | 503 | `{"error":"auth not configured", ...}` |
+
+The 503 ("auth not configured") path is intentional: a deploy that
+forgot to set `PYTH_API_KEYS` fails closed.  **Caveat:** `/health`
+is whitelisted and returns 200 regardless of auth state, so an LB
+health-only check WILL NOT catch a missing `PYTH_API_KEYS`.
+Operators must either monitor a protected endpoint OR read the
+`auth_configured` field on `/health` (which reflects whether
+`PYTH_API_KEYS` is populated).
+
+CORS preflights (`OPTIONS`) bypass the auth gate so browsers can
+negotiate cross-origin POSTs against an allowlisted origin.
+
 ## API Stability Rules
 
 1. **Adding keys is safe.**  Consumers must tolerate unknown keys.

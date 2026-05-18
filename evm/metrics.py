@@ -19,13 +19,17 @@ from __future__ import annotations
 
 import logging
 import math
-
 from datetime import timedelta
+
 import numpy as np
 
 from .helpers import (
-    Bounds, clamp, safe_date, convert_to_hours,
-    normalize_percent_complete, difference_in_calendar_days,
+    Bounds,
+    clamp,
+    convert_to_hours,
+    difference_in_calendar_days,
+    normalize_percent_complete,
+    safe_date,
 )
 
 logger = logging.getLogger(__name__)

@@ -18,10 +18,12 @@ import math
 import os
 
 import numpy as np
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, jsonify, request
 
-from .monte_carlo import run_completion_mc, CompletionMCConfig
-from .recovery import run_recovery_options, RecoveryConfig
+from _cache_version import RESPONSE_SCHEMA_VERSION
+
+from .monte_carlo import CompletionMCConfig, run_completion_mc
+from .recovery import RecoveryConfig, run_recovery_options
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +68,7 @@ def _cache():
 
 def _cache_key(prefix, data):
     raw = json.dumps(data, sort_keys=True, default=str)
-    return f"completion:{prefix}:{hashlib.sha256(raw.encode()).hexdigest()}"
+    return f"completion:{RESPONSE_SCHEMA_VERSION}:{prefix}:{hashlib.sha256(raw.encode()).hexdigest()}"
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +271,9 @@ def _validate_mc_config(data):
         # Try resolving the base eagerly so the user gets a clear error
         # at request time (not deep inside the MC).
         from solver.reference_classes import (
-            get_reference_class, suggest_reference_class, effective_registry,
+            effective_registry,
+            get_reference_class,
+            suggest_reference_class,
         )
         merged = effective_registry(custom_classes=custom)
         base_class = get_reference_class(overrides['base'], registry=merged)
@@ -286,7 +290,9 @@ def _validate_mc_config(data):
         if not isinstance(rc, str) or not rc:
             return 'config.reference_class must be a non-empty string'
         from solver.reference_classes import (
-            get_reference_class, suggest_reference_class, effective_registry,
+            effective_registry,
+            get_reference_class,
+            suggest_reference_class,
         )
         merged = effective_registry(custom_classes=custom)
         if get_reference_class(rc, registry=merged) is None:
@@ -528,7 +534,7 @@ def register_outcome_route():
         return jsonify({'error': 'Invalid or missing JSON body'}), 400
     if not isinstance(data, dict):
         return jsonify({'error': 'JSON root must be an object'}), 400
-    from .outcomes import validate_outcome, register_outcome
+    from .outcomes import register_outcome, validate_outcome
     errs = validate_outcome(data)
     if errs:
         return jsonify({'error': '; '.join(errs)}), 400
@@ -585,8 +591,11 @@ def reference_classes():
     if request.method == 'OPTIONS':
         return jsonify({'status': 'ok'})
     from solver.reference_classes import (
-        list_reference_classes, REFERENCE_CLASS_TIERS,
-        EXTERNAL_CLASS_TIERS, ALIASES, effective_registry,
+        ALIASES,
+        EXTERNAL_CLASS_TIERS,
+        REFERENCE_CLASS_TIERS,
+        effective_registry,
+        list_reference_classes,
     )
     # Don't leak the server filesystem path -- expose only whether an
     # external registry is configured.  The actual location is an

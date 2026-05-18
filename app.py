@@ -5,9 +5,14 @@ Includes: Redis caching, NetworkKit acceleration, sparse matrices,
 vectorized operations, and Python 3.12 optimizations
 """
 
-import os, json, logging, hashlib, time, gc
-from functools import lru_cache
+import gc
+import hashlib
+import json
+import logging
+import os
+import time
 from datetime import datetime, timezone
+from functools import lru_cache
 
 # Set BLAS threads to prevent CPU contention with Gunicorn
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -15,18 +20,17 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from werkzeug.exceptions import HTTPException
-
 import numpy as np
 import pandas as pd
+import redis
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import shortest_path
 from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
-from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import shortest_path
-import redis
+from werkzeug.exceptions import HTTPException
 
 # NetworkKit imports with fallback
 try:
@@ -37,6 +41,18 @@ try:
 except ImportError:
     _NK = False
     logging.warning("NetworkKit not available - falling back to NetworkX (slower)")
+
+# Production gate: a deploy that lost NetworkKit silently degrades
+# community detection / centrality timing.  When PYTH_REQUIRE_NETWORKKIT
+# is true, fail loudly at startup so the LB marks the instance bad
+# instead of routing traffic to a slower path.  Default off so dev /
+# test environments without the C++ wheel still boot.
+if not _NK and os.getenv("PYTH_REQUIRE_NETWORKKIT", "false").lower() == "true":
+    logging.critical(
+        "NetworkKit required but not importable; refusing to start.  "
+        "Either install networkit (see requirements.txt) or unset "
+        "PYTH_REQUIRE_NETWORKKIT.")
+    raise SystemExit(78)  # EX_CONFIG
 
 import networkx as nx  # Single canonical import
 
@@ -71,44 +87,77 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s » %(message)s"
 )
 
-# Enable CORS with explicit configuration
-CORS(app, 
-     resources={r"/*": {"origins": "*"}},
-     allow_headers=["Content-Type", "Authorization"],
+# Enable CORS with an explicit allowlist (PYTH_CORS_ORIGINS=a,b,c).
+# Empty/unset = same-origin only; the literal '*' opts into wildcard for
+# local dev only.  See auth.py for the loader.
+from auth import init_auth, load_cors_origins
+
+_cors_origins = load_cors_origins()
+CORS(app,
+     resources={r"/*": {"origins": _cors_origins}},
+     allow_headers=["Content-Type", "Authorization", "X-API-Key"],
      methods=["GET", "POST", "OPTIONS"])
+
+# Request IDs + structured JSON logging.  Registered BEFORE auth so
+# the request_id is stamped on g BEFORE the auth gate runs -- that way
+# a 401/503 response from the auth hook still carries X-Request-ID
+# and gets logged with the correlation field.  See observability.py.
+from observability import init_observability  # noqa: E402
+
+init_observability(app)
+
+# API-key gate.  Health endpoints stay public; everything else requires
+# X-API-Key when PYTH_API_KEYS is set.  See auth.py for the policy.
+init_auth(app)
+
+# Track which blueprints loaded successfully so /health can surface
+# silent-degradation issues (one blueprint package failing import
+# previously just logged a warning and went to /dev/null -- operators
+# had to wait for a request to that endpoint to discover the issue).
+_BLUEPRINTS_LOADED = {}
 
 try:
     from solver import solver_bp
     app.register_blueprint(solver_bp)
+    _BLUEPRINTS_LOADED['solver'] = True
 except Exception as _solver_err:
+    _BLUEPRINTS_LOADED['solver'] = False
     logging.warning("Solver package failed to load: %s. "
                     "Solver endpoints will be unavailable.", _solver_err)
 
 try:
     from completion import completion_bp
     app.register_blueprint(completion_bp)
+    _BLUEPRINTS_LOADED['completion'] = True
 except Exception as _completion_err:
+    _BLUEPRINTS_LOADED['completion'] = False
     logging.warning("Completion package failed to load: %s. "
                     "Completion endpoints will be unavailable.", _completion_err)
 
 try:
     from evm import evm_bp
     app.register_blueprint(evm_bp)
+    _BLUEPRINTS_LOADED['evm'] = True
 except Exception as _evm_err:
+    _BLUEPRINTS_LOADED['evm'] = False
     logging.warning("EVM package failed to load: %s. "
                     "EVM endpoints will be unavailable.", _evm_err)
 
 try:
     from paths import paths_bp
     app.register_blueprint(paths_bp)
+    _BLUEPRINTS_LOADED['paths'] = True
 except Exception as _paths_err:
+    _BLUEPRINTS_LOADED['paths'] = False
     logging.warning("Paths package failed to load: %s. "
                     "Path endpoints will be unavailable.", _paths_err)
 
 try:
     from interface import interface_bp
     app.register_blueprint(interface_bp)
+    _BLUEPRINTS_LOADED['interface'] = True
 except Exception as _interface_err:
+    _BLUEPRINTS_LOADED['interface'] = False
     logging.warning("Interface package failed to load: %s. "
                     "Interface endpoints will be unavailable.", _interface_err)
 
@@ -133,9 +182,28 @@ if REDIS_URL:
         redis_client = redis.Redis(connection_pool=redis_pool)
         redis_client.ping()
         logging.info("Redis cache connected successfully")
+        # A.LOW1: warn if the cache traverses cleartext.  Project
+        # graphs are sensitive customer data; production deploys
+        # should use rediss:// (or unix:// for sidecar) so traffic
+        # is TLS-encrypted.  This is informational, not blocking --
+        # operators may have a private VNet that justifies plaintext.
+        if not REDIS_URL.startswith(('rediss://', 'unix://')):
+            logging.warning(
+                "Redis configured with plaintext scheme (%s); customer "
+                "graph payloads will traverse the network unencrypted.  "
+                "Use rediss:// for TLS in production.",
+                REDIS_URL.split('://', 1)[0] + '://')
     except Exception as e:
         logging.warning(f"Redis connection failed: {e}. Falling back to in-memory cache.")
         redis_client = None
+
+# NOTE: the "service ready" log was previously emitted here, but
+# Flask routes defined by @app.route(...) decorators in the rest of
+# this module haven't yet been registered.  An operator seeing this
+# log at module-line 204 would think the service was ready while
+# /graph-metrics / /health / / wouldn't exist for a few more
+# milliseconds.  The signal now fires at the END of the module body
+# (after all route definitions), see below.  Copilot review #12.
 
 def get_cached_result(key):
     """Try Redis first, then fall back to LRU cache"""
@@ -164,7 +232,16 @@ def set_cached_result(key, value, ttl=None):
             # Log but don't fail the request on cache write errors
             if DEBUG:
                 logging.warning(f"Redis set failed: {e}")
-            # Continue without caching - the result is still valid
+            # Increment the error counter so silent serialisation
+            # failures (e.g. an un-serialisable type in the result)
+            # are observable in Prometheus.  Previously the except
+            # swallowed the error and silently degraded p99 under
+            # load with no operator-visible signal.  A.LOW2.
+            try:
+                from observability import _CACHE_EVENTS
+                _CACHE_EVENTS.labels(outcome='error').inc()
+            except Exception:  # nosec B110 -- metrics best-effort; the cache miss already non-fatal
+                pass
 
 ###############################################################################
 # Helpers                                                                     #
@@ -267,7 +344,8 @@ def calculate_critical_path(G):
     to NetworkX dag_longest_path if the solver import fails.
     """
     try:
-        from solver.dag import build_dag as _build_dag, get_critical_path_indices
+        from solver.dag import build_dag as _build_dag
+        from solver.dag import get_critical_path_indices
         cpm_nodes = [{'ID': str(nd), 'Duration': float(G.nodes[nd].get('duration', 1))}
                      for nd in G.nodes()]
         cpm_links = []
@@ -681,7 +759,7 @@ def _cluster_risk(df: pd.DataFrame):
                 sc = silhouette_score(feats, lbl)
                 if sc > best:
                     best, k = sc, c
-        except Exception:
+        except Exception:  # nosec B112 -- KMeans rejects degenerate cluster counts; skip and try next k
             continue
 
     k = min(k, max(1, n), unique_count)
@@ -1497,13 +1575,17 @@ def graph_metrics():
     
     if not nodes:
         return jsonify({'error': 'No nodes provided'}), 400
-    
-    # Generate cache key.  The v3 prefix prevents v2-cached responses
-    # (which lack the cycles_removed / warnings top-level fields added
-    # alongside the deterministic cycle-handling rewrite) from being
-    # served during a rolling deploy.
+
+    # Generate cache key.  Schema version pulled from _cache_version
+    # so a response-shape change automatically invalidates stale entries
+    # across all endpoints in lock-step.  The deterministic cycle-handling
+    # rewrite (main #26) added top-level cycles_removed / warnings keys
+    # plus altered existing values: bumping RESPONSE_SCHEMA_VERSION
+    # is what prevents pre-rewrite cached responses from being served
+    # during a rolling deploy.
+    from _cache_version import RESPONSE_SCHEMA_VERSION
     key = _sha([nodes, links])
-    redis_key = f"graph:v3:{key}"
+    redis_key = f"graph:{RESPONSE_SCHEMA_VERSION}:{key}"
     
     # Try Redis cache first
     cached_result = get_cached_result(redis_key)
@@ -1565,9 +1647,32 @@ def health():
     if REDIS_URL and not redis_ok:
         status = 'degraded'  # Redis is configured but not working
     
+    # Surface which blueprints loaded; a False here means an entire
+    # capability domain is unavailable (silent degradation that
+    # previously needed a route call to discover).
+    all_blueprints_ok = all(_BLUEPRINTS_LOADED.values())
+    if not all_blueprints_ok and status == 'healthy':
+        status = 'degraded'
+
+    # Surface auth-config state so an operator's LB / synthetic
+    # monitor can detect a missing PYTH_API_KEYS without needing to
+    # hit a protected endpoint.  Closes Copilot review finding #8:
+    # /health used to return 200 even when the fail-closed auth
+    # gate would 503 every real request.
+    auth_disabled = (
+        os.environ.get('PYTH_AUTH_DISABLED', '').strip().lower() == 'true'
+    )
+    api_keys_set = bool(os.environ.get('PYTH_API_KEYS', '').strip())
+    auth_configured = auth_disabled or api_keys_set
+    if not auth_configured and status == 'healthy':
+        status = 'degraded'
+
     health_status = {
         'status': status,
         'timestamp': datetime.now(timezone.utc).isoformat(),
+        'networkit_available': _NK,
+        'blueprints_loaded': dict(_BLUEPRINTS_LOADED),
+        'auth_configured': auth_configured,
         'instance': {
             'site': os.getenv("WEBSITE_SITE_NAME"),
             'instance_id': os.getenv("WEBSITE_INSTANCE_ID"),
@@ -1626,11 +1731,31 @@ def unhandled(e):
     logging.exception('Unhandled: %s', e)
     return jsonify({'error': str(e)}), 500
 
+# Service-ready signal.  Emitted at the END of the module body so
+# operators can distinguish "process started" from "app initialised,
+# all routes registered, all error handlers in place" -- previously
+# the only signal was the first request response (and an earlier
+# placement before route decorators that fired too soon).  All
+# structured fields are filterable for log queries / alerting.
+logging.info(
+    "service ready",
+    extra={
+        'event':                'service_ready',
+        'networkit_available':  _NK,
+        'redis_configured':     redis_client is not None,
+        'blueprints_loaded':    dict(_BLUEPRINTS_LOADED),
+        'all_blueprints_ok':    all(_BLUEPRINTS_LOADED.values()),
+        'route_count':          len(list(app.url_map.iter_rules())),
+    },
+)
+
 ###############################################################################
 # Local dev                                                                   #
 ###############################################################################
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    # Enable debug mode only in development
-    app.run(host='0.0.0.0', port=port, debug=DEBUG)
+    # Enable debug mode only in development.  Binding 0.0.0.0 is intentional:
+    # production deploys (Gunicorn under Azure App Service) bind the same
+    # interface inside their container.  See pyproject.toml [tool.bandit].
+    app.run(host='0.0.0.0', port=port, debug=DEBUG)  # nosec B104

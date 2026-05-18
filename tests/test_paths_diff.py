@@ -35,11 +35,10 @@ from pathlib import Path
 
 import pytest
 
-from solver.dag import build_dag
+from paths.distances import distances_to_end, distances_to_start
+from paths.driving_graph import DrivingGraphConfig, extract_driving_graph
 from paths.enumerate import find_all_paths
-from paths.distances import distances_to_start, distances_to_end
-from paths.driving_graph import extract_driving_graph, DrivingGraphConfig
-
+from solver.dag import build_dag
 
 HARNESS_DIR = Path(__file__).parent / 'diff_harness'
 JS_HARNESS = HARNESS_DIR / 'run_js_paths.js'

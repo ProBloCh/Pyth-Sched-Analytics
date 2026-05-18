@@ -9,16 +9,68 @@ corresponds to one API endpoint and returns a JSON-serialisable dict.
 import logging
 import time
 
-from .models import SolverConfig, ProjectContext, build_activity_params
-from .dag import build_dag, get_critical_path_indices
-from .objectives import compute_objectives
-from .adjoints import compute_gradients
-from .stochastic import run_ensemble
-from .optimizer import optimize, build_constraints_report
-from .pareto import run_pareto as _run_pareto
-from .analysis import compute_analysis
-from .calendar_map import map_makespan_to_date, _dominant_time_units
 from evm.helpers import working_hours_to_unit
+
+from .adjoints import compute_gradients
+from .analysis import compute_analysis
+from .calendar_map import _dominant_time_units, map_makespan_to_date
+from .dag import build_dag, get_critical_path_indices
+from .models import ProjectContext, SolverConfig, build_activity_params
+from .objectives import compute_objectives
+from .optimizer import build_constraints_report, optimize
+from .pareto import run_pareto as _run_pareto
+from .stochastic import run_ensemble
+
+
+def _optimizer_diagnostics(iterations, converged, max_iterations):
+    """Derive a structured diagnostics block from solver outputs.
+
+    Returns ``{iterations, max_iterations, converged, terminated_reason,
+    max_iter_hit}`` where ``terminated_reason`` is one of:
+
+    * ``'converged'``       -- ``converged is True``
+    * ``'max_iter_hit'``    -- iterations reached ``max_iterations``
+                               without converging.  Strong signal
+                               that the solver returned a suboptimal
+                               answer; consumers should retry with a
+                               higher max_iterations budget.
+    * ``'unknown'``         -- inner solver exited early for any
+                               other reason.
+    """
+    iterations = int(iterations)
+    max_iterations = int(max_iterations)
+    if converged:
+        reason = 'converged'
+    elif iterations >= max_iterations:
+        reason = 'max_iter_hit'
+    else:
+        reason = 'unknown'
+    return {
+        'iterations': iterations,
+        'max_iterations': max_iterations,
+        'converged': bool(converged),
+        'terminated_reason': reason,
+        'max_iter_hit': reason == 'max_iter_hit',
+    }
+
+
+def _emit_solver_metrics(endpoint, iterations, converged, max_iterations,
+                         n_mc_samples=None):
+    """Best-effort Prometheus emission.  Never raises -- a metrics
+    failure mid-request must not break the solver response.  The
+    debug log line ensures genuine bugs (not just prometheus
+    unavailability) are diagnosable in test or DEBUG environments
+    without breaking the request -- silent except: pass would hide
+    real issues like a typo in _optimizer_diagnostics."""
+    try:
+        from observability import record_mc_run, record_solver_run
+        diag = _optimizer_diagnostics(iterations, converged, max_iterations)
+        record_solver_run(endpoint, diag['iterations'],
+                          diag['terminated_reason'])
+        if n_mc_samples is not None:
+            record_mc_run(endpoint, int(n_mc_samples))
+    except Exception:  # nosec B110 -- metrics best-effort; never break the solver
+        logger.debug("solver metrics emission failed", exc_info=True)
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +231,9 @@ def run_optimize(nodes, links, solver_config_dict,
         'converged':         opt['converged'],
         'history':           opt['history'],
         'constraints':       opt.get('constraints'),
+        'optimizer_diagnostics': _optimizer_diagnostics(
+            opt['iterations'], opt['converged'], config.max_iterations,
+        ),
         'config': {
             'disciplines':   config.disciplines,
             'weights':       config.weights,
@@ -211,6 +266,15 @@ def run_optimize(nodes, links, solver_config_dict,
             'sra':                  stochastic.get('sra', {}),
             'cost_schedule_joint':  stochastic.get('cost_schedule_joint'),
         }
+
+    _emit_solver_metrics(
+        endpoint='optimize',
+        iterations=opt['iterations'],
+        converged=opt['converged'],
+        max_iterations=config.max_iterations,
+        n_mc_samples=(stochastic['n_samples']
+                      if stochastic else None),
+    )
 
     logger.info("Optimize done: %d iterations, converged=%s, "
                 "makespan=%.1f, %.1fms",
@@ -325,6 +389,7 @@ def _empty_optimize(disciplines, t0):
         'converged': True,
         'history': [],
         'constraints': None,
+        'optimizer_diagnostics': _optimizer_diagnostics(0, True, 0),
         'config': {'disciplines': disciplines, 'weights': {}},
         'computation_ms': round((time.time() - t0) * 1000, 1),
     }

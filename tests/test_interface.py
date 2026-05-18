@@ -14,12 +14,11 @@ Covers
 import pytest
 
 from interface.analytics import (
-    InterfaceConfig,
-    HotspotWeights,
-    compute_interface_analytics,
     UNASSIGNED_BUCKET,
+    HotspotWeights,
+    InterfaceConfig,
+    compute_interface_analytics,
 )
-
 
 # =====================================================================
 # Fixtures

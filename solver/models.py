@@ -5,8 +5,9 @@ Defines configuration, activity parameters, and project context.
 No external dependencies beyond numpy.
 """
 
-from dataclasses import dataclass, field
 import logging
+from dataclasses import dataclass, field
+
 import numpy as np
 
 logger = logging.getLogger(__name__)

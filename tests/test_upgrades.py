@@ -9,28 +9,26 @@ Tests for the analytical upgrades:
   - Sobol sample count matches requested M
 """
 
-import numpy as np
 import networkx as nx
+import numpy as np
 import pytest
-
-from solver.dag import build_dag, run_cpm
-from solver.models import SolverConfig, ProjectContext, build_activity_params
-from solver.optimizer import optimize
-from solver.pareto import run_pareto, filter_pareto_front
 from scipy.special import ndtri
-from solver.stochastic import (
-    run_ensemble,
-    _generate_samples,
-    _compute_raw_multipliers,
-    _triangular_ppf,
-    _bs_ppf,
-    _pareto_ppf,
-    _fat_tail_thresholds,
-    _tier_label,
-    _PARETO_OFFSET,
-)
-from multi_resolution_pipeline import run_multi_resolution
 
+from multi_resolution_pipeline import run_multi_resolution
+from solver.dag import build_dag, run_cpm
+from solver.models import ProjectContext, SolverConfig, build_activity_params
+from solver.optimizer import optimize
+from solver.pareto import filter_pareto_front, run_pareto
+from solver.stochastic import (
+    _bs_ppf,
+    _compute_raw_multipliers,
+    _fat_tail_thresholds,
+    _generate_samples,
+    _pareto_ppf,
+    _tier_label,
+    _triangular_ppf,
+    run_ensemble,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures

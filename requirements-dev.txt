@@ -21,3 +21,33 @@ py-spy==0.4.0
 # fixtures so structural invariants are exercised beyond the curated
 # fixtures.  See REMAINING_WORK 6.2.
 hypothesis==6.115.5
+
+# Linter + import sorter.  Configured in pyproject.toml with a
+# conservative E / F / I rule set.  CI runs `ruff check` on every push.
+# See docs/roadmap-to-10.md PR-5 for the rule-set widening plan.
+ruff==0.15.12
+
+# Static security scanner.  Configured in pyproject.toml [tool.bandit].
+# CI runs `bandit -r . -c pyproject.toml -ll` (medium+ severity) and
+# fails on any unannotated finding.  Intentional patterns annotate
+# inline with `# nosec <code>` plus rationale.
+bandit==1.9.4
+
+# Dependency CVE scanner.  CI runs against requirements.txt with
+# explicit allowlist for advisories pending the upgrade-deps PR.  Any
+# new advisory blocks merge.  See docs/roadmap-to-10.md PR-6 for the
+# allowlist semantics.
+pip-audit==2.10.0
+
+# Coverage instrumentation for pytest.  Configured in pyproject.toml
+# [tool.coverage.report] (fail_under = 83 as of PR-7; bump protocol
+# documented at that section in docs/roadmap-to-10.md).  CI runs
+# `pytest --cov`; the threshold is read from pyproject, not the CLI.
+pytest-cov==7.1.0
+
+# Static type checker.  Configured in pyrightconfig.json (basic mode
+# project-wide; strict for the modules listed in docs/typing-progress.md).
+# CI job is non-blocking initially -- the 239-error basic-mode baseline
+# shrinks via focused follow-up PRs, and CI starts blocking once that
+# count reaches zero.  See docs/roadmap-to-10.md PR-8.
+pyright==1.1.409

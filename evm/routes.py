@@ -16,7 +16,9 @@ import logging
 import math
 
 import numpy as np
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, jsonify, request
+
+from _cache_version import RESPONSE_SCHEMA_VERSION
 
 from .engine import run_evm_analysis
 
@@ -61,7 +63,7 @@ def _cache():
 
 def _cache_key(data):
     raw = json.dumps(data, sort_keys=True, default=str)
-    return f"evm:analyze:{hashlib.sha256(raw.encode()).hexdigest()}"
+    return f"evm:{RESPONSE_SCHEMA_VERSION}:analyze:{hashlib.sha256(raw.encode()).hexdigest()}"
 
 
 # ---------------------------------------------------------------------------
