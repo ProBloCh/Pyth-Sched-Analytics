@@ -67,6 +67,11 @@ _LOG_EXTRA_DENYLIST = frozenset({
     'authorization', 'x-api-key', 'x_api_key', 'apikey', 'api_key',
     'password', 'passwd', 'secret', 'token', 'cookie', 'session',
     'pyth_api_keys', 'pyth_metrics_token',
+    # Round-2 reviewer A nit: extend coverage to common OAuth /
+    # cloud-credential patterns that a careless caller might
+    # serialise to logs.
+    'bearer', 'jwt', 'refresh_token', 'access_token', 'id_token',
+    'private_key', 'client_secret', 'client_id',
 })
 
 # Dedicated registry so the /metrics output is deterministic in tests
@@ -395,7 +400,17 @@ def _access_log_level() -> int:
     raw = os.environ.get('PYTH_ACCESS_LOG_LEVEL', 'INFO').strip().upper()
     if raw == 'OFF':
         return logging.CRITICAL + 1  # nothing emits at this level
-    return getattr(logging, raw, logging.INFO)
+    resolved = getattr(logging, raw, None)
+    if not isinstance(resolved, int):
+        # Round-2 reviewer C nit: an unrecognised value previously fell
+        # back to INFO silently.  Log a warning so an operator typo
+        # ('WARN' vs 'WARNING', 'silent' vs 'OFF') is visible.
+        logging.warning(
+            "PYTH_ACCESS_LOG_LEVEL=%r is not a recognised level; "
+            "falling back to INFO.  Valid: DEBUG, INFO, WARNING, "
+            "ERROR, CRITICAL, OFF.", raw)
+        return logging.INFO
+    return resolved
 
 
 def init_observability(app: Flask) -> None:
