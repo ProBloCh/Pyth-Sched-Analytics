@@ -1,20 +1,23 @@
 """
 API key authentication + CORS allowlist.
 
-Wired in by ``init_auth(app)`` from ``app.py``.  Reads two env vars at
-request time (cheap, monkey-patchable from tests):
+Wired in by ``init_auth(app)`` from ``app.py``.  Read-time semantics
+differ by var (Copilot review finding #17):
 
-* ``PYTH_API_KEYS`` -- comma-separated list of accepted keys.  When empty
-  and auth is not explicitly disabled, every protected request is
-  refused with HTTP 503 -- fail-closed by design so a misconfigured
-  deploy is loud, not silently open.
-* ``PYTH_AUTH_DISABLED=true`` -- bypass the gate entirely.  Intended for
-  local dev and the test suite (set in ``tests/conftest.py``).  Never
-  set this in production.
-
-CORS origins come from ``PYTH_CORS_ORIGINS`` (comma-separated, or the
-literal ``*`` to opt back into the previous wildcard behaviour for
-local dev).  Empty / unset means same-origin only.
+* ``PYTH_API_KEYS`` -- comma-separated list of accepted keys.  Read
+  **per request** so an operator can rotate keys without a worker
+  restart (set, re-save, traffic hits the new key on the next
+  request).  When empty and auth is not explicitly disabled, every
+  protected request is refused with HTTP 503 -- fail-closed by
+  design so a misconfigured deploy is loud, not silently open.
+* ``PYTH_AUTH_DISABLED=true`` -- read **per request**; bypass the
+  gate entirely.  Intended for local dev and the test suite (set in
+  ``tests/conftest.py``).  Never set this in production.
+* ``PYTH_CORS_ORIGINS`` -- comma-separated allowlist, or the literal
+  ``*`` to opt back into the previous wildcard behaviour for local
+  dev.  Empty / unset means same-origin only.  Read **once at
+  startup** by ``load_cors_origins()`` (Flask-CORS resolves origins
+  at app-init time); a change requires a worker restart.
 """
 
 from __future__ import annotations

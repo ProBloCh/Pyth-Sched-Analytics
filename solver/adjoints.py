@@ -101,18 +101,19 @@ def resource_adj_dur(dag_state, params, project_ctx=None):
             "Skipping resource duration FD gradient (n=%d > %d)", n, _FD_MAX_N)
         return grad
 
-    # Re-entry guard: a sentinel on the dag_state itself (so we don't
-    # leak a module-level lock between unrelated states).  Detects
-    # both reentrancy on the same thread (programmer error) and
-    # concurrent invocation across threads (future parallelism).
-    if getattr(dag_state, '_in_resource_adj_dur', False):
+    # Atomic re-entry guard via threading.Lock + non-blocking acquire.
+    # The previous bool-sentinel had a TOCTOU window: two concurrent
+    # threads could both read False, both set True, both enter the
+    # mutating loop.  Lock.acquire(blocking=False) is atomic
+    # (Copilot review finding #9).  Per-state, so unrelated requests
+    # don't serialise through a module-level lock.
+    if not dag_state._resource_adj_dur_lock.acquire(blocking=False):
         raise RuntimeError(
             "resource_adj_dur() entered concurrently on the same DAGState "
-            "(in-progress flag still set).  Adjoint FD loop mutates "
-            "durations and is not re-entrant; the caller must serialise "
-            "or hand each thread a copy.  See CLAUDE.md 'Numerical "
-            "correctness in adjoints'.")
-    dag_state._in_resource_adj_dur = True
+            "(lock already held).  Adjoint FD loop mutates durations and "
+            "is not re-entrant; the caller must serialise or hand each "
+            "thread a copy.  See CLAUDE.md 'Numerical correctness in "
+            "adjoints'.")
     try:
         base_val = resource_objective(dag_state, params, project_ctx)
 
@@ -127,13 +128,13 @@ def resource_adj_dur(dag_state, params, project_ctx=None):
             scratch[i] = old
 
         # Restore original CPM state with the original array reference.
-        # Inside the try block so the guard stays set during the
+        # Inside the try block so the lock stays held during the
         # restoration -- a concurrent caller seeing the half-restored
         # state would otherwise observe garbage gradients.
         run_cpm(dag_state, original)
         return grad
     finally:
-        dag_state._in_resource_adj_dur = False
+        dag_state._resource_adj_dur_lock.release()
 
 
 def resource_adj_res(dag_state, params, project_ctx=None):

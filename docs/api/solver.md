@@ -343,6 +343,7 @@ Content-Type: application/json
 | `stochastic` | `object` | Conditional | Monte Carlo results on optimized state. **Present only when** `stochastic: true`. See [Stochastic](#stochastic). |
 | `constraints` | `object \| null` | Always | Per-constraint feasibility report at the **post-optimisation** state.  `null` when no `max_makespan` / `max_budget` was supplied or the bound couldn't be resolved; otherwise see [Constraints Report](#constraints-report). |
 | `calendar` | `object` | Conditional | Calendar mapping from final `makespan` to a real end date.  Same shape as the sensitivity-endpoint `calendar`.  See [Calendar Mapping](#calendar-mapping). |
+| `warnings` | `array<object>` | Conditional | Non-fatal advisory messages.  See [Hard Constraints](#hard-constraints) for the full list of warning codes. |
 
 ##### `optimizer_diagnostics`
 
@@ -358,7 +359,6 @@ The same diagnostic is emitted to Prometheus as
 `pyth_solver_iterations` (histogram) and
 `pyth_solver_terminations_total{reason}` (counter).  See
 [docs/observability.md](../observability.md).
-| `warnings` | `array<object>` | Conditional | Non-fatal advisory messages.  See [Hard Constraints](#hard-constraints) for the full list of warning codes. |
 
 #### Activity Change
 

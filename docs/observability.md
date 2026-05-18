@@ -156,12 +156,13 @@ scrape_configs:
   samples) -- only the aggregate `/solver/optimize` path is
   instrumented today.
 
-## What's NOT in PR-9 / PR-10
+## Known limitations
 
-* No solver / Monte-Carlo internal metrics (PR-11 in the roadmap).
 * No structured error logging on exceptions -- the existing
   `logger.exception()` calls work but their tracebacks land in the
   `exc_info` JSON field, not as structured stack frames.
 * `cache_hit` (the log field) and `cache_event` (the counter) are
-  opt-in per route.  Routes that set them today: none.  Wire as
-  needed.
+  opt-in per route.  No route sets them today; wire as needed.
+* No per-point Pareto-frontier metrics; only the aggregate
+  `/solver/optimize` (and `/completion/monte-carlo` MC sample count)
+  paths are instrumented.

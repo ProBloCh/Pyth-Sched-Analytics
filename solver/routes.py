@@ -229,10 +229,21 @@ def _fail_on_violation(data) -> bool:
     Lives at ``project_context.constraints.fail_on_violation`` -- next
     to the bounds it applies to.  Default ``False`` preserves the
     existing soft-penalty contract.
+
+    Coerces a real bool only -- a misformatted JSON client sending
+    ``"fail_on_violation": "false"`` (string) previously evaluated
+    truthy and triggered surprise 409s.  Strings are parsed via the
+    standard truthy literals; any other type defaults to False.
+    Copilot review finding #22.
     """
     pc = data.get('project_context') or {}
     cons = pc.get('constraints') or {}
-    return bool(cons.get('fail_on_violation', False))
+    value = cons.get('fail_on_violation', False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ('true', '1', 'yes', 'on')
+    return False
 
 
 def _violation_response(result):

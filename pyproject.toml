@@ -134,7 +134,20 @@ omit = [
 ]
 
 [tool.coverage.report]
+# Copilot review finding #1: show_missing / skip_covered /
+# exclude_lines are coverage.py keys, not pytest options.  When
+# placed under [tool.pytest.ini_options] pytest emitted three
+# "Unknown config option" warnings on every CI run and coverage.py
+# silently ignored them.  Belongs HERE.
 fail_under = 83
+show_missing = false
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
 
 # -----------------------------------------------------------------------------
 # pytest
@@ -146,12 +159,4 @@ fail_under = 83
 [tool.pytest.ini_options]
 markers = [
     "determinism: locks numerical reproducibility on stochastic and deterministic endpoints (PR-12).  Filter with `pytest -m determinism` to run only this pack.",
-]
-show_missing = false
-skip_covered = true
-exclude_lines = [
-    "pragma: no cover",
-    "raise NotImplementedError",
-    "if __name__ == .__main__.:",
-    "if TYPE_CHECKING:",
 ]

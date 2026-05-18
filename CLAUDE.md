@@ -74,7 +74,7 @@ matrix, and top-N highest-risk activities per hotspot for downstream
 LLM grounding.  Engine is pure pandas/numpy with no Flask deps;
 re-callable via `compute_interface_analytics`.
 
-Tests: **974 across 21 test files**, including JS-vs-Python diff
+Tests: **975 across 21 test files**, including JS-vs-Python diff
 harnesses (`tests/test_evm_diff.py` + `tests/diff_harness/run_js_evm.js`;
 `tests/test_paths_diff.py` + `tests/diff_harness/run_js_paths.js`;
 `tests/test_calendar_diff.py` + `tests/diff_harness/run_js_calendar.js`)
@@ -144,7 +144,7 @@ Define success criteria. Verify before declaring done.
   1. [Step] -> verify: [check]
   2. [Step] -> verify: [check]
 
-**Note:** The project has 974 automated tests (pytest).  Run with
+**Note:** The project has 975 automated tests (pytest).  Run with
 `python -m pytest tests/ -v`.  Verification means running the tests,
 checking endpoint responses, and reviewing outputs for correctness.
 When adding new features, add corresponding tests.

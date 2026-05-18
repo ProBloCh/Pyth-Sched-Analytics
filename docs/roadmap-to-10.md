@@ -367,7 +367,7 @@ on every solver response.
 
 ## Tier 3 — Test depth
 
-The 803-test suite is broad but has gaps in determinism, edge cases,
+The existing suite is broad but has gaps in determinism, edge cases,
 and load.
 
 ### PR-12 · Determinism guard tests (S, test confidence)

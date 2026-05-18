@@ -32,8 +32,23 @@ CACHE_KEY_SITES = [
 
 
 @pytest.fixture
-def reload_with_version(monkeypatch):
-    """Reload _cache_version + the dependent modules with a fresh version string."""
+def reload_with_version(monkeypatch, request):
+    """Reload _cache_version + the dependent modules with a fresh version
+    string.  Restores them to the real ``RESPONSE_SCHEMA_VERSION`` value
+    at teardown so subsequent tests in the same process don't observe
+    a stale ``'v2.0.0'`` baked into the reloaded route modules.
+    Copilot review finding #20.
+    """
+    def _restore():
+        # monkeypatch already restored the constant; re-reload the
+        # route modules so their import-by-value of
+        # RESPONSE_SCHEMA_VERSION reverts to the real value.
+        for mod_path, _, _ in CACHE_KEY_SITES:
+            if mod_path in sys.modules:
+                importlib.reload(sys.modules[mod_path])
+
+    request.addfinalizer(_restore)
+
     def _reload(version: str):
         import _cache_version
         monkeypatch.setattr(_cache_version, 'RESPONSE_SCHEMA_VERSION', version)

@@ -137,7 +137,10 @@ _SOLVER_TERMINATIONS = Counter(
 
 _MC_SAMPLES = Histogram(
     'pyth_mc_samples',
-    'Monte Carlo sample count per stochastic solver / completion run.',
+    'Monte Carlo sample count per run.  Emitted from /solver/optimize '
+    '(endpoint="optimize") when solver_config.stochastic=true, and '
+    'from /completion/monte-carlo (endpoint="completion") on every '
+    'call.',
     labelnames=('endpoint',),
     buckets=(1, 10, 32, 100, 256, 1000),
     registry=_REGISTRY,
@@ -240,10 +243,15 @@ class _JsonFormatter(logging.Formatter):
         }
         # Any non-reserved attribute stamped on the record (via
         # logger.info(..., extra={...}) or our filter) becomes a
-        # top-level JSON key.
+        # top-level JSON key.  Apply the denylist HERE in addition to
+        # the filter -- a direct logger.info(..., extra={'authorization':
+        # 'leaked'}) call skips the filter's g.log_extras path entirely
+        # but is still caught here.  Copilot review finding #6.
         for k, v in record.__dict__.items():
             if k in self._RESERVED or k.startswith('_'):
                 continue
+            if k.lower() in _LOG_EXTRA_DENYLIST:
+                v = '<redacted>'
             if k not in payload:
                 payload[k] = v
         if record.exc_info:

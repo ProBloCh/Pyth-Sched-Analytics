@@ -638,9 +638,11 @@ class TestBugfixRegressions:
     def test_resource_adj_dur_raises_on_concurrent_reentry(
         self, diamond_schedule, diamond_metadata,
     ):
-        """A.MED1 (round-2 fix): re-entering resource_adj_dur on the
-        same DAGState raises immediately instead of silently
-        corrupting ES/EF via the FD loop's mid-mutation window.
+        """Round-2 + Copilot finding #9: re-entering resource_adj_dur
+        on the same DAGState raises immediately via the atomic
+        threading.Lock.acquire(blocking=False) guard, instead of
+        silently corrupting ES/EF via the FD loop's mid-mutation
+        window.
 
         Today no in-process caller is re-entrant; this guards
         against a future parallelism PR (e.g. Pareto sweep
@@ -654,17 +656,19 @@ class TestBugfixRegressions:
         params = build_activity_params(nodes, diamond_metadata)
 
         # Simulate a concurrent thread already inside the FD loop.
-        state._in_resource_adj_dur = True
+        assert state._resource_adj_dur_lock.acquire(blocking=False)
         try:
             with pytest.raises(RuntimeError, match='concurrently'):
                 resource_adj_dur(state, params)
         finally:
-            state._in_resource_adj_dur = False
+            state._resource_adj_dur_lock.release()
 
-        # After clearing the flag, the next call must succeed --
+        # After releasing the lock, the next call must succeed --
         # the guard is per-state, not sticky.
         resource_adj_dur(state, params)
-        assert state._in_resource_adj_dur is False
+        # And the lock must be released after a normal-completion call.
+        assert state._resource_adj_dur_lock.acquire(blocking=False)
+        state._resource_adj_dur_lock.release()
 
     def test_quality_gradient_zero_baseline_activity(self):
         """Activities with baseline_duration=0 must have zero quality

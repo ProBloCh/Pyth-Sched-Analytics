@@ -96,24 +96,33 @@ def test_optimize_response_includes_diagnostics_block(client):
 
 
 def test_max_iter_hit_signaled_under_budget(client):
-    """A deliberately tight max_iterations budget on a non-trivial
-    chain triggers the max_iter_hit flag.
+    """A deliberately tight max_iterations budget combined with an
+    impossible convergence_threshold triggers the max_iter_hit flag.
 
     This is the load-bearing assertion -- the whole point of PR-11
     is making "the solver ran out of budget" visible to consumers.
+    The convergence_threshold=1e-30 floor + max_iterations=1 ceiling
+    guarantees non-convergence regardless of fixture choice (Copilot
+    review finding #21: the prior conditional assertion passed
+    vacuously whenever the solver converged in one step).
     """
     resp = client.post(
         '/solver/optimize',
-        json=_chain_payload({'max_iterations': 1}),
+        json=_chain_payload({
+            'max_iterations': 1,
+            'convergence_threshold': 1e-30,
+        }),
     )
     assert resp.status_code == 200
     body = resp.get_json()
     diag = body['optimizer_diagnostics']
-    # At max_iterations=1, on this chain, the solver cannot reach
-    # convergence -- diag.max_iter_hit is the signal.
-    if not diag['converged']:
-        assert diag['max_iter_hit'] is True
-        assert diag['terminated_reason'] == 'max_iter_hit'
+    # Hard assertion: the budget MUST be exhausted.  If this fails,
+    # either the fixture is too easy (force a non-trivial setup) or
+    # the diagnostics block stopped reporting max_iter_hit (regression).
+    assert diag['converged'] is False, (
+        f'Expected non-convergence at threshold=1e-30, got {diag}')
+    assert diag['max_iter_hit'] is True
+    assert diag['terminated_reason'] == 'max_iter_hit'
 
 
 def test_empty_dag_diagnostics_block():

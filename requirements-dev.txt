@@ -40,8 +40,9 @@ bandit==1.9.4
 pip-audit==2.10.0
 
 # Coverage instrumentation for pytest.  Configured in pyproject.toml
-# [tool.coverage.*]; CI runs `pytest --cov --cov-fail-under=89`.  See
-# docs/roadmap-to-10.md PR-7 for the threshold-bump protocol.
+# [tool.coverage.report] (fail_under = 83 as of PR-7; bump protocol
+# documented at that section in docs/roadmap-to-10.md).  CI runs
+# `pytest --cov`; the threshold is read from pyproject, not the CLI.
 pytest-cov==7.1.0
 
 # Static type checker.  Configured in pyrightconfig.json (basic mode

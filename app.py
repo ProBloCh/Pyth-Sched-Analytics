@@ -197,20 +197,13 @@ if REDIS_URL:
         logging.warning(f"Redis connection failed: {e}. Falling back to in-memory cache.")
         redis_client = None
 
-# Service-ready signal.  Emitted at the END of boot so operators can
-# distinguish "process started" from "app initialised and ready to
-# serve" -- previously the only signal was the first request response.
-# All structured fields are filterable for log queries / alerting.
-logging.info(
-    "service ready",
-    extra={
-        'event':                'service_ready',
-        'networkit_available':  _NK,
-        'redis_configured':     redis_client is not None,
-        'blueprints_loaded':    dict(_BLUEPRINTS_LOADED),
-        'all_blueprints_ok':    all(_BLUEPRINTS_LOADED.values()),
-    },
-)
+# NOTE: the "service ready" log was previously emitted here, but
+# Flask routes defined by @app.route(...) decorators in the rest of
+# this module haven't yet been registered.  An operator seeing this
+# log at module-line 204 would think the service was ready while
+# /graph-metrics / /health / / wouldn't exist for a few more
+# milliseconds.  The signal now fires at the END of the module body
+# (after all route definitions), see below.  Copilot review #12.
 
 def get_cached_result(key):
     """Try Redis first, then fall back to LRU cache"""
@@ -1661,11 +1654,25 @@ def health():
     if not all_blueprints_ok and status == 'healthy':
         status = 'degraded'
 
+    # Surface auth-config state so an operator's LB / synthetic
+    # monitor can detect a missing PYTH_API_KEYS without needing to
+    # hit a protected endpoint.  Closes Copilot review finding #8:
+    # /health used to return 200 even when the fail-closed auth
+    # gate would 503 every real request.
+    auth_disabled = (
+        os.environ.get('PYTH_AUTH_DISABLED', '').strip().lower() == 'true'
+    )
+    api_keys_set = bool(os.environ.get('PYTH_API_KEYS', '').strip())
+    auth_configured = auth_disabled or api_keys_set
+    if not auth_configured and status == 'healthy':
+        status = 'degraded'
+
     health_status = {
         'status': status,
         'timestamp': datetime.now(timezone.utc).isoformat(),
         'networkit_available': _NK,
         'blueprints_loaded': dict(_BLUEPRINTS_LOADED),
+        'auth_configured': auth_configured,
         'instance': {
             'site': os.getenv("WEBSITE_SITE_NAME"),
             'instance_id': os.getenv("WEBSITE_INSTANCE_ID"),
@@ -1723,6 +1730,24 @@ def handle_http_exception(e):
 def unhandled(e):
     logging.exception('Unhandled: %s', e)
     return jsonify({'error': str(e)}), 500
+
+# Service-ready signal.  Emitted at the END of the module body so
+# operators can distinguish "process started" from "app initialised,
+# all routes registered, all error handlers in place" -- previously
+# the only signal was the first request response (and an earlier
+# placement before route decorators that fired too soon).  All
+# structured fields are filterable for log queries / alerting.
+logging.info(
+    "service ready",
+    extra={
+        'event':                'service_ready',
+        'networkit_available':  _NK,
+        'redis_configured':     redis_client is not None,
+        'blueprints_loaded':    dict(_BLUEPRINTS_LOADED),
+        'all_blueprints_ok':    all(_BLUEPRINTS_LOADED.values()),
+        'route_count':          len(list(app.url_map.iter_rules())),
+    },
+)
 
 ###############################################################################
 # Local dev                                                                   #

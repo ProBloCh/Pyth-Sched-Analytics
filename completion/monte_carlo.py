@@ -1402,6 +1402,18 @@ def run_completion_mc(nodes, links, status_date,
         'teac':                       teac_block,
         'computation_ms': round((time.time() - t0) * 1000, 1),
     }
+
+    # Emit pyth_mc_samples for /completion/monte-carlo too -- the
+    # metric's help text covers "completion runs" and previously only
+    # /solver/optimize emitted, leaving an empty 'completion' series.
+    # Copilot review finding #11.  Best-effort; metrics failure must
+    # not break the response.
+    try:
+        from observability import record_mc_run
+        record_mc_run('completion', int(M_actual))
+    except Exception:  # nosec B110 -- metrics best-effort
+        pass
+
     return result
 
 

@@ -50,8 +50,12 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Install dev tools
-        run: pip install -r requirements-dev.txt
+      - name: Install dev + runtime tools
+        # Both files: pyright with reportMissingImports=error needs the
+        # actual flask / numpy / scipy / pandas / redis packages installed
+        # so the basic-mode baseline reflects type errors, not import
+        # noise.  Copilot review finding #5.
+        run: pip install -r requirements.txt -r requirements-dev.txt
 
       - name: pyright
         run: |
@@ -91,11 +95,16 @@ jobs:
       # an upgrade entry in docs/roadmap-to-10.md PR-6 follow-up
       # before adding a corresponding --ignore-vuln line here.
       - name: pip-audit
-        run: pip-audit -r requirements.txt
+        # --strict matches the local verification command; required so
+        # skipped / unresolvable packages fail the gate the same way
+        # they fail locally.  Copilot review finding #15.
+        run: pip-audit -r requirements.txt --strict
 
   build:
     runs-on: ubuntu-latest
-    needs: lint
+    # Block deploy on security failure too -- previously build/deploy
+    # only required lint, so a CVE could ship.  Copilot review #14.
+    needs: [lint, security]
 
     steps:
       - uses: actions/checkout@v4

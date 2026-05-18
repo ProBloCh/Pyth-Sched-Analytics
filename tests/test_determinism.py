@@ -1,10 +1,10 @@
 """
 Determinism guard tests (PR-12 / Tier 3).
 
-The stochastic endpoints (/solver/optimize stochastic, /solver/sensitivity
-stochastic, /solver/pareto, /completion/monte-carlo) use Sobol QMC
-with ``seed=42`` hardcoded in ``solver/stochastic.py``.  This file
-locks the contract: identical input -> byte-identical numeric output.
+The stochastic endpoints (/solver/optimize stochastic, /solver/pareto,
+/completion/monte-carlo) use Sobol QMC with ``seed=42`` hardcoded in
+``solver/stochastic.py``.  This file locks the contract: identical
+input -> byte-identical numeric output.
 
 A scientific service that can't reproduce its own forecasts on the
 same input is suspect.  Without these tests, a refactor that
@@ -15,10 +15,13 @@ through review.
 Numeric fields normalised:
 * Floats are compared via ``pytest.approx`` (tolerates last-bit
   drift from BLAS reorderings on Sobol-derived intermediates).
-* Lists are compared element-wise after sorting where the order is
-  not load-bearing (e.g. activity orderings indexed by ID).
-* Non-numeric / metadata fields (``computation_ms``, ``timestamp``,
-  ``cache_hit``, ``cache_key``) are stripped before comparison.
+* Lists are compared element-wise in their existing order (order is
+  treated as part of the contract -- a refactor that returns
+  activities in a different order is a behaviour change worth
+  flagging, not silently smoothing over).
+* Non-numeric / metadata fields (``computation_ms``,
+  ``processing_time``, ``timestamp``, ``cache_hit``, ``cache_key``,
+  ``cache_event``, ``request_id``) are stripped before comparison.
 
 @pytest.mark.determinism filter lets CI scope to just this pack.
 """
@@ -168,6 +171,26 @@ def test_solver_optimize_stochastic_deterministic(client, diamond_dag):
         _strip(r1.get('stochastic')),
         _strip(r2.get('stochastic')),
     ), 'Stochastic ensemble is non-deterministic'
+
+
+@pytest.mark.determinism
+def test_solver_pareto_deterministic(client, diamond_dag):
+    """/solver/pareto sweeps the Tchebycheff frontier -- each point's
+    optimisation is L-BFGS-B (deterministic), so the assembled
+    frontier must reproduce on identical input.  Closes Copilot
+    review finding #19 -- /pareto was documented as in scope above
+    but not actually exercised."""
+    payload = {
+        **diamond_dag,
+        'solver_config': {
+            'max_iterations': 5,
+            'pareto_vectors': 3,
+        },
+    }
+    r1 = client.post('/solver/pareto', json=payload).get_json()
+    r2 = client.post('/solver/pareto', json=payload).get_json()
+    assert _approx_equal(_strip(r1), _strip(r2)), (
+        '/solver/pareto is non-deterministic on identical input')
 
 
 @pytest.mark.determinism
