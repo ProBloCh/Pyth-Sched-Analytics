@@ -78,7 +78,19 @@ _FD_MAX_N = 500  # skip O(n^2) FD loop for graphs above this size
 
 
 def resource_adj_dur(dag_state, params, project_ctx=None):
-    """dResourcePenalty/dd_i via forward finite differences."""
+    """dResourcePenalty/dd_i via forward finite differences.
+
+    NOT thread-safe on a shared ``dag_state``: mutates ``durations``
+    inside the FD loop and relies on ``run_cpm``'s aliasing contract
+    (CLAUDE.md "Numerical correctness in adjoints").  Today's callers
+    construct a fresh ``DAGState`` per request so the in-process
+    risk is zero, but a future Pareto parallelism PR that hands the
+    same state to multiple threads would silently corrupt ES/EF
+    mid-read.  The re-entry guard below raises immediately if any
+    other thread is already inside the FD loop on the same state,
+    forcing the caller to either copy or serialise rather than
+    silently observing garbage gradients.
+    """
     from .objectives import resource_objective
 
     n = dag_state.n
@@ -88,21 +100,40 @@ def resource_adj_dur(dag_state, params, project_ctx=None):
         logging.getLogger(__name__).info(
             "Skipping resource duration FD gradient (n=%d > %d)", n, _FD_MAX_N)
         return grad
-    base_val = resource_objective(dag_state, params, project_ctx)
 
-    original = dag_state.durations          # save reference (may alias params.durations)
-    scratch = original.copy()
-    for i in range(n):
-        old = scratch[i]
-        scratch[i] = old + _FD_EPS
-        run_cpm(dag_state, scratch)
-        grad[i] = (resource_objective(dag_state, params, project_ctx)
-                    - base_val) / _FD_EPS
-        scratch[i] = old
+    # Re-entry guard: a sentinel on the dag_state itself (so we don't
+    # leak a module-level lock between unrelated states).  Detects
+    # both reentrancy on the same thread (programmer error) and
+    # concurrent invocation across threads (future parallelism).
+    if getattr(dag_state, '_in_resource_adj_dur', False):
+        raise RuntimeError(
+            "resource_adj_dur() entered concurrently on the same DAGState "
+            "(in-progress flag still set).  Adjoint FD loop mutates "
+            "durations and is not re-entrant; the caller must serialise "
+            "or hand each thread a copy.  See CLAUDE.md 'Numerical "
+            "correctness in adjoints'.")
+    dag_state._in_resource_adj_dur = True
+    try:
+        base_val = resource_objective(dag_state, params, project_ctx)
 
-    # Restore original CPM state with the original array reference
-    run_cpm(dag_state, original)
-    return grad
+        original = dag_state.durations          # save reference (may alias params.durations)
+        scratch = original.copy()
+        for i in range(n):
+            old = scratch[i]
+            scratch[i] = old + _FD_EPS
+            run_cpm(dag_state, scratch)
+            grad[i] = (resource_objective(dag_state, params, project_ctx)
+                        - base_val) / _FD_EPS
+            scratch[i] = old
+
+        # Restore original CPM state with the original array reference.
+        # Inside the try block so the guard stays set during the
+        # restoration -- a concurrent caller seeing the half-restored
+        # state would otherwise observe garbage gradients.
+        run_cpm(dag_state, original)
+        return grad
+    finally:
+        dag_state._in_resource_adj_dur = False
 
 
 def resource_adj_res(dag_state, params, project_ctx=None):

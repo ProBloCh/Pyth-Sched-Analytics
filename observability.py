@@ -57,6 +57,18 @@ _VALID_REQUEST_ID = re.compile(r'^[A-Za-z0-9._:-]{1,128}$')
 _REQUEST_LOGGER_NAME = 'pyth.request'
 _METRICS_PATH = '/metrics'
 
+# Sensitive field names that must NEVER appear in log records, even
+# if a route inadvertently stashes them on flask.g.log_extras.  The
+# filter below redacts these regardless of casing.  Defense in depth
+# -- routes shouldn't be stuffing request bodies into log_extras in
+# the first place, but a single buggy line shouldn't leak secrets
+# across every subsequent log query.  A.LOW3.
+_LOG_EXTRA_DENYLIST = frozenset({
+    'authorization', 'x-api-key', 'x_api_key', 'apikey', 'api_key',
+    'password', 'passwd', 'secret', 'token', 'cookie', 'session',
+    'pyth_api_keys', 'pyth_metrics_token',
+})
+
 # Dedicated registry so the /metrics output is deterministic in tests
 # (the default process_collector / platform_collector add hostname /
 # pid labels that change between runs).
@@ -183,6 +195,13 @@ class _RequestContextFilter(logging.Filter):
             extras = None
         if isinstance(extras, dict):
             for k, v in extras.items():
+                if k.lower() in _LOG_EXTRA_DENYLIST:
+                    # Redact rather than skip so the operator knows
+                    # a sensitive field was attempted (telling them
+                    # to fix the call site).
+                    if not hasattr(record, k):
+                        setattr(record, k, '<redacted>')
+                    continue
                 if not hasattr(record, k):
                     setattr(record, k, v)
         return True
@@ -357,10 +376,34 @@ def _metrics_endpoint():
     return Response(body, mimetype=CONTENT_TYPE_LATEST)
 
 
+def _access_log_level() -> int:
+    """Resolve the per-request access log level.
+
+    The root logger handles application logs at INFO (or DEBUG when
+    Flask debug is on).  The per-request access log (one line per
+    request) is on its own logger so operators can dial it down
+    independently -- under high RPS the access log dwarfs the
+    application log, and Azure App Service log streaming can choke
+    on the volume.
+
+    PYTH_ACCESS_LOG_LEVEL accepts any of: DEBUG / INFO / WARNING /
+    ERROR / OFF.  OFF disables the access log entirely (request_id
+    still round-trips on headers and stamps onto application logs,
+    just no per-request line).  Default INFO matches the pre-existing
+    behaviour.
+    """
+    raw = os.environ.get('PYTH_ACCESS_LOG_LEVEL', 'INFO').strip().upper()
+    if raw == 'OFF':
+        return logging.CRITICAL + 1  # nothing emits at this level
+    return getattr(logging, raw, logging.INFO)
+
+
 def init_observability(app: Flask) -> None:
     """Register the JSON formatter, request-ID hooks, and /metrics route."""
     level = logging.DEBUG if app.debug else logging.INFO
     _install_root_logger(level)
+    access_log_level = _access_log_level()
+    logging.getLogger(_REQUEST_LOGGER_NAME).setLevel(access_log_level)
     app.before_request(_before_request)
     app.after_request(_after_request)
     app.add_url_rule(
@@ -374,6 +417,7 @@ def init_observability(app: Flask) -> None:
         extra={
             'json_logs': _json_logs_enabled(),
             'request_logger': _REQUEST_LOGGER_NAME,
+            'access_log_level': logging.getLevelName(access_log_level),
             'metrics_path': _METRICS_PATH,
             'metrics_token_required': bool(
                 os.environ.get('PYTH_METRICS_TOKEN', '').strip()

@@ -110,38 +110,54 @@ init_observability(app)
 # X-API-Key when PYTH_API_KEYS is set.  See auth.py for the policy.
 init_auth(app)
 
+# Track which blueprints loaded successfully so /health can surface
+# silent-degradation issues (one blueprint package failing import
+# previously just logged a warning and went to /dev/null -- operators
+# had to wait for a request to that endpoint to discover the issue).
+_BLUEPRINTS_LOADED = {}
+
 try:
     from solver import solver_bp
     app.register_blueprint(solver_bp)
+    _BLUEPRINTS_LOADED['solver'] = True
 except Exception as _solver_err:
+    _BLUEPRINTS_LOADED['solver'] = False
     logging.warning("Solver package failed to load: %s. "
                     "Solver endpoints will be unavailable.", _solver_err)
 
 try:
     from completion import completion_bp
     app.register_blueprint(completion_bp)
+    _BLUEPRINTS_LOADED['completion'] = True
 except Exception as _completion_err:
+    _BLUEPRINTS_LOADED['completion'] = False
     logging.warning("Completion package failed to load: %s. "
                     "Completion endpoints will be unavailable.", _completion_err)
 
 try:
     from evm import evm_bp
     app.register_blueprint(evm_bp)
+    _BLUEPRINTS_LOADED['evm'] = True
 except Exception as _evm_err:
+    _BLUEPRINTS_LOADED['evm'] = False
     logging.warning("EVM package failed to load: %s. "
                     "EVM endpoints will be unavailable.", _evm_err)
 
 try:
     from paths import paths_bp
     app.register_blueprint(paths_bp)
+    _BLUEPRINTS_LOADED['paths'] = True
 except Exception as _paths_err:
+    _BLUEPRINTS_LOADED['paths'] = False
     logging.warning("Paths package failed to load: %s. "
                     "Path endpoints will be unavailable.", _paths_err)
 
 try:
     from interface import interface_bp
     app.register_blueprint(interface_bp)
+    _BLUEPRINTS_LOADED['interface'] = True
 except Exception as _interface_err:
+    _BLUEPRINTS_LOADED['interface'] = False
     logging.warning("Interface package failed to load: %s. "
                     "Interface endpoints will be unavailable.", _interface_err)
 
@@ -166,9 +182,35 @@ if REDIS_URL:
         redis_client = redis.Redis(connection_pool=redis_pool)
         redis_client.ping()
         logging.info("Redis cache connected successfully")
+        # A.LOW1: warn if the cache traverses cleartext.  Project
+        # graphs are sensitive customer data; production deploys
+        # should use rediss:// (or unix:// for sidecar) so traffic
+        # is TLS-encrypted.  This is informational, not blocking --
+        # operators may have a private VNet that justifies plaintext.
+        if not REDIS_URL.startswith(('rediss://', 'unix://')):
+            logging.warning(
+                "Redis configured with plaintext scheme (%s); customer "
+                "graph payloads will traverse the network unencrypted.  "
+                "Use rediss:// for TLS in production.",
+                REDIS_URL.split('://', 1)[0] + '://')
     except Exception as e:
         logging.warning(f"Redis connection failed: {e}. Falling back to in-memory cache.")
         redis_client = None
+
+# Service-ready signal.  Emitted at the END of boot so operators can
+# distinguish "process started" from "app initialised and ready to
+# serve" -- previously the only signal was the first request response.
+# All structured fields are filterable for log queries / alerting.
+logging.info(
+    "service ready",
+    extra={
+        'event':                'service_ready',
+        'networkit_available':  _NK,
+        'redis_configured':     redis_client is not None,
+        'blueprints_loaded':    dict(_BLUEPRINTS_LOADED),
+        'all_blueprints_ok':    all(_BLUEPRINTS_LOADED.values()),
+    },
+)
 
 def get_cached_result(key):
     """Try Redis first, then fall back to LRU cache"""
@@ -197,7 +239,16 @@ def set_cached_result(key, value, ttl=None):
             # Log but don't fail the request on cache write errors
             if DEBUG:
                 logging.warning(f"Redis set failed: {e}")
-            # Continue without caching - the result is still valid
+            # Increment the error counter so silent serialisation
+            # failures (e.g. an un-serialisable type in the result)
+            # are observable in Prometheus.  Previously the except
+            # swallowed the error and silently degraded p99 under
+            # load with no operator-visible signal.  A.LOW2.
+            try:
+                from observability import _CACHE_EVENTS
+                _CACHE_EVENTS.labels(outcome='error').inc()
+            except Exception:  # nosec B110 -- metrics best-effort; the cache miss already non-fatal
+                pass
 
 ###############################################################################
 # Helpers                                                                     #
@@ -1603,10 +1654,18 @@ def health():
     if REDIS_URL and not redis_ok:
         status = 'degraded'  # Redis is configured but not working
     
+    # Surface which blueprints loaded; a False here means an entire
+    # capability domain is unavailable (silent degradation that
+    # previously needed a route call to discover).
+    all_blueprints_ok = all(_BLUEPRINTS_LOADED.values())
+    if not all_blueprints_ok and status == 'healthy':
+        status = 'degraded'
+
     health_status = {
         'status': status,
         'timestamp': datetime.now(timezone.utc).isoformat(),
         'networkit_available': _NK,
+        'blueprints_loaded': dict(_BLUEPRINTS_LOADED),
         'instance': {
             'site': os.getenv("WEBSITE_SITE_NAME"),
             'instance_id': os.getenv("WEBSITE_INSTANCE_ID"),

@@ -635,6 +635,37 @@ class TestBugfixRegressions:
         assert state.durations is original_ref
         np.testing.assert_array_equal(state.durations, original_ref)
 
+    def test_resource_adj_dur_raises_on_concurrent_reentry(
+        self, diamond_schedule, diamond_metadata,
+    ):
+        """A.MED1 (round-2 fix): re-entering resource_adj_dur on the
+        same DAGState raises immediately instead of silently
+        corrupting ES/EF via the FD loop's mid-mutation window.
+
+        Today no in-process caller is re-entrant; this guards
+        against a future parallelism PR (e.g. Pareto sweep
+        parallel evaluation) that would hand the same state to
+        multiple threads.
+        """
+        import pytest
+
+        nodes, links = diamond_schedule
+        state, _ = build_dag(nodes, links)
+        params = build_activity_params(nodes, diamond_metadata)
+
+        # Simulate a concurrent thread already inside the FD loop.
+        state._in_resource_adj_dur = True
+        try:
+            with pytest.raises(RuntimeError, match='concurrently'):
+                resource_adj_dur(state, params)
+        finally:
+            state._in_resource_adj_dur = False
+
+        # After clearing the flag, the next call must succeed --
+        # the guard is per-state, not sticky.
+        resource_adj_dur(state, params)
+        assert state._in_resource_adj_dur is False
+
     def test_quality_gradient_zero_baseline_activity(self):
         """Activities with baseline_duration=0 must have zero quality
         gradient (the objective contribution is identically zero).

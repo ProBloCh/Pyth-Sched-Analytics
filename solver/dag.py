@@ -32,6 +32,13 @@ class DAGState:
         'pred_edges', 'succ_edges',
         'durations', 'ES', 'EF', 'LS', 'LF', 'TF',
         'critical_mask', 'makespan',
+        # PR round-2 fix: re-entry guard set by
+        # solver/adjoints.py::resource_adj_dur so a future
+        # parallelism PR that hands the same state to multiple
+        # threads raises immediately instead of silently corrupting
+        # ES/EF mid-FD-loop.  CLAUDE.md "Numerical correctness in
+        # adjoints" documents the underlying contract.
+        '_in_resource_adj_dur',
     )
 
     def __init__(self, n, topo_order, pred, succ, durations,
@@ -44,6 +51,7 @@ class DAGState:
         self.pred_edges = pred_edges if pred_edges else [[] for _ in range(n)]
         self.succ_edges = succ_edges if succ_edges else [[] for _ in range(n)]
         self.durations = durations
+        self._in_resource_adj_dur = False
         self.ES = np.zeros(n, dtype=np.float64)
         self.EF = np.zeros(n, dtype=np.float64)
         self.LS = np.zeros(n, dtype=np.float64)

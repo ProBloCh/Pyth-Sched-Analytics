@@ -313,6 +313,100 @@ def test_cache_event_counter_increments_on_opt_in():
     assert after == before + 1
 
 
+# ---------------------------------------------------------------------------
+# Round-2 review fixes.
+# ---------------------------------------------------------------------------
+
+def test_health_surfaces_loaded_blueprints(client):
+    """C-RED2: /health reports which blueprint packages loaded.  An
+    operator can grep for `blueprints_loaded.solver=false` to discover
+    silent degradation immediately after deploy instead of waiting
+    for the first request to that endpoint."""
+    body = client.get('/health').get_json()
+    assert 'blueprints_loaded' in body
+    bp = body['blueprints_loaded']
+    # Every blueprint reports a bool; in test envs all should be True.
+    for name in ('solver', 'completion', 'evm', 'paths', 'interface'):
+        assert name in bp, f'/health missing blueprint {name!r}'
+        assert isinstance(bp[name], bool), f'{name} is not bool: {bp[name]!r}'
+
+
+def test_log_extras_denylist_redacts_secrets():
+    """A.LOW3: keys in _LOG_EXTRA_DENYLIST are redacted from log
+    records even if a route stuffs them onto g.log_extras.  Defense
+    in depth: routes shouldn't ship secrets to logs, but a single
+    buggy line shouldn't leak across every subsequent log query."""
+    from flask import g
+
+    from observability import _RequestContextFilter
+
+    with app.test_request_context('/whatever'):
+        g.request_id = 'rid'
+        g.log_extras = {
+            'authorization': 'Bearer leaked-token',
+            'X-API-Key': 'leaked-key',  # case-insensitive
+            'password': 'hunter2',
+            'safe_field': 'visible',
+        }
+        rec = logging.LogRecord('test', logging.INFO, '', 0, 'm', (), None)
+        _RequestContextFilter().filter(rec)
+        assert getattr(rec, 'authorization', None) == '<redacted>'
+        assert getattr(rec, 'X-API-Key', None) == '<redacted>'
+        assert getattr(rec, 'password', None) == '<redacted>'
+        assert getattr(rec, 'safe_field', None) == 'visible'
+
+
+def test_access_log_level_off_resolves_above_critical(monkeypatch):
+    """C-YELLOW2: PYTH_ACCESS_LOG_LEVEL=OFF resolves to a level
+    above CRITICAL so no record passes the filter (high-RPS escape
+    hatch).  Other valid values resolve to the stdlib levels."""
+    from observability import _access_log_level
+
+    monkeypatch.setenv('PYTH_ACCESS_LOG_LEVEL', 'OFF')
+    assert _access_log_level() > logging.CRITICAL
+
+    monkeypatch.setenv('PYTH_ACCESS_LOG_LEVEL', 'WARNING')
+    assert _access_log_level() == logging.WARNING
+
+    monkeypatch.setenv('PYTH_ACCESS_LOG_LEVEL', 'DEBUG')
+    assert _access_log_level() == logging.DEBUG
+
+    monkeypatch.delenv('PYTH_ACCESS_LOG_LEVEL', raising=False)
+    assert _access_log_level() == logging.INFO  # default
+
+
+def test_access_log_level_off_silences_request_log():
+    """When the access logger's level is OFF, no per-request line
+    emits.  Drives the side-effect directly rather than reinitialising
+    the Flask app (Flask 3 forbids before_request after first request).
+    Bypasses pytest caplog because caplog.set_level would override
+    the logger's level, defeating the test."""
+    class _Capture(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    cap = _Capture()
+    cap.setLevel(logging.DEBUG)
+    access_logger = logging.getLogger('pyth.request')
+    access_logger.addHandler(cap)
+    saved_level = access_logger.level
+    try:
+        access_logger.setLevel(logging.CRITICAL + 1)  # OFF
+
+        app.config['TESTING'] = True
+        app.test_client().get('/health')
+
+        assert not cap.records, (
+            f'Access log emitted despite OFF level: {[r.getMessage() for r in cap.records]}')
+    finally:
+        access_logger.setLevel(saved_level)
+        access_logger.removeHandler(cap)
+
+
 def test_cache_event_counter_ignores_unknown_outcome():
     """A route that sets a typo'd ``g.cache_event`` does NOT silently
     create a new label dimension -- the outcome label is closed."""

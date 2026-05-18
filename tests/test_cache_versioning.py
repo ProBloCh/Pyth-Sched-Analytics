@@ -87,18 +87,36 @@ def test_cache_key_stable_within_version(mod_path, attr, call):
     assert call(fn, payload) == call(fn, payload)
 
 
-def test_graph_metrics_cache_key_includes_schema_version():
-    """The /graph-metrics path in app.py uses the same version constant."""
+def test_graph_metrics_cache_key_includes_schema_version(monkeypatch):
+    """The /graph-metrics path in app.py uses the same version
+    constant.  Captures the actual cache key the handler constructs
+    by intercepting ``get_cached_result`` -- catches the contract
+    behaviourally rather than via fragile source-string regex (a
+    refactor that extracts the key into a helper would now still
+    pass for the right reason).
+    """
     import _cache_version
-    # We can't easily isolate the redis_key construction from the
-    # endpoint handler, but we can assert the prefix string format
-    # matches what the handler builds.
-    expected_prefix = f"graph:{_cache_version.RESPONSE_SCHEMA_VERSION}:"
-    # Read the constructed prefix back from app.py source as a safety
-    # net -- a refactor that drops the version prefix should fail this.
-    import app
-    src = open(app.__file__).read()
-    assert expected_prefix.split(':')[0] + ':{RESPONSE_SCHEMA_VERSION}:' in src or \
-           'f"graph:{RESPONSE_SCHEMA_VERSION}:' in src, (
-        'app.py /graph-metrics cache key no longer references '
-        'RESPONSE_SCHEMA_VERSION')
+    import app as app_mod
+
+    captured_keys = []
+
+    def fake_get_cached_result(key):
+        captured_keys.append(key)
+        return None  # force the handler to run the full analyse path
+
+    monkeypatch.setattr(app_mod, 'get_cached_result', fake_get_cached_result)
+    app_mod.app.config['TESTING'] = True
+    client = app_mod.app.test_client()
+    resp = client.post(
+        '/graph-metrics',
+        json={'nodes': [{'ID': 'A', 'Duration': 1}], 'links': []},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert captured_keys, 'get_cached_result was not invoked'
+    key = captured_keys[0]
+    assert _cache_version.RESPONSE_SCHEMA_VERSION in key, (
+        f'/graph-metrics cache key {key!r} does not embed the '
+        f'schema version {_cache_version.RESPONSE_SCHEMA_VERSION!r}')
+    assert key.startswith(f'graph:{_cache_version.RESPONSE_SCHEMA_VERSION}:'), (
+        f'/graph-metrics cache key {key!r} is not in the expected '
+        f'graph:<version>:<digest> shape')
